@@ -23,7 +23,7 @@ extern "C" EXPORT_API void run_forward_pass(const float* host_X, const float* ho
     cudaMalloc(&d_W, bytes);
     cudaMalloc(&d_Y, bytes);
 
-    // STEP 2: The PCIe Transfer! (The bottleneck we discussed earlier)
+    // STEP 2: The PCIe Transfer
     // Copy the BatchPayload from standard CPU RAM to the newly allocated VRAM
     cudaMemcpy(d_X, host_X, bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_W, host_W, bytes, cudaMemcpyHostToDevice);

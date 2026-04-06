@@ -9,8 +9,6 @@ fn main() {
     // 1. Tell Cargo where to find the .lib file for compile-time linking
     println!("cargo:rustc-link-search=native={}", engine_build_dir.display());
     println!("cargo:rustc-link-lib=engine");
-
-    // --- THE CI AUTOMATION FIX ---
     
     // 2. Cargo gives us an environment variable called OUT_DIR 
     // (e.g., target/debug/build/manager-xxxx/out)

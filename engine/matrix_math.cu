@@ -1,6 +1,6 @@
 #include <cuda_runtime.h>
 
-// We define our tile size (16x16 is the standard hardware sweet spot)
+// We define our tile size (16x16)
 #define TILE_SIZE 16
 
 // ---------------------------------------------------------
