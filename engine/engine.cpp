@@ -2,11 +2,18 @@
 #include <vector>
 #include <cuda_runtime.h>
 
+// 1. Cross-platform Export Macro
+#ifdef _WIN32
+    #define EXPORT_API __declspec(dllexport)
+#else
+    #define EXPORT_API
+#endif
+
 // 1. Forward declaration so C++ knows the CUDA function exists in the .cu file
 void launch_tiled_matmul(const float* d_X, const float* d_W, float* d_Y, int N);
 
 // 2. The main function we will eventually expose to Rust via FFI
-extern "C" void run_forward_pass(const float* host_X, const float* host_W, float* host_Y, int N) {
+extern "C" EXPORT_API void run_forward_pass(const float* host_X, const float* host_W, float* host_Y, int N) {
     size_t bytes = N * N * sizeof(float);
     float *d_X, *d_W, *d_Y;
 

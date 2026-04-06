@@ -15,3 +15,9 @@ set_target_properties(engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # 4. Link the CUDA runtime so our C++ code can use cudaMemcpy
 target_link_libraries(engine PRIVATE CUDA::cudart)
+
+# Build a small test executable
+add_executable(test_engine test.cpp)
+
+# Link it to our shared library
+target_link_libraries(test_engine PRIVATE engine)
