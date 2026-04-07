@@ -1,4 +1,17 @@
 use tokio::sync::{mpsc, oneshot};
+use serde::{Deserialize, Serialize};
+
+// What the user sends us via HTTP POST: {"prompt": "Hello GPU"}
+#[derive(Deserialize)]
+pub struct ApiRequest {
+    pub prompt: String,
+}
+
+// What we send back: {"answer": [4.0, 4.0, 10.0, 8.0]}
+#[derive(Serialize)]
+pub struct ApiResponse {
+    pub answer: Vec<f32>,
+}
 
 // This is what sits inside our MPSC queue
 pub struct UserRequest {
