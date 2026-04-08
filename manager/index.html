@@ -43,9 +43,12 @@
     </style>
 </head>
 <body>
-    <header>
+<header>
         <div>Mini Inference Engine</div>
-        <div class="status">🟢 VRAM Loaded</div>
+        <div style="display: flex; gap: 15px;">
+            <select id="chat-model-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
+            <select id="compressor-model-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
+        </div>
     </header>
     
     <div id="chat-container">
@@ -64,10 +67,24 @@
         const sendBtn = document.getElementById('send-btn');
         const typingIndicator = document.getElementById('typing-indicator');
 
-        // STATE: We hold the entire conversation memory in the browser
-        let chatHistory = [
-            { role: "system", content: "You are a helpful and concise AI assistant." }
-        ];
+        let chatHistory = [];
+
+        window.onload = async () => {
+            const res = await fetch('/models');
+            const models = await res.json();
+            
+            const chatSelect = document.getElementById('chat-model-select');
+            const compSelect = document.getElementById('compressor-model-select');
+
+            models.forEach(m => {
+                if (m.roles.includes("GeneralChat") || m.roles.includes("CodeSpecialist")) {
+                    chatSelect.add(new Option(`Chat: ${m.name}`, m.id));
+                }
+                if (m.roles.includes("ContextCompressor")) {
+                    compSelect.add(new Option(`Compressor: ${m.name}`, m.id));
+                }
+            });
+        };
 
         inputField.addEventListener('input', function() {
             this.style.height = 'auto';
@@ -86,7 +103,6 @@
             const text = inputField.value.trim();
             if (!text) return;
 
-            // 1. Add user message to UI and History State
             appendMessage(text, true);
             chatHistory.push({ role: "user", content: text });
             
@@ -96,23 +112,29 @@
             typingIndicator.style.display = 'block';
 
             try {
+                // Grab the IDs from the UI dropdowns
+                const chatModelId = document.getElementById('chat-model-select').value;
+                const compModelId = document.getElementById('compressor-model-select').value;
+
                 const response = await fetch('/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ messages: chatHistory }) // Send the whole array
+                    body: JSON.stringify({ 
+                        chat_model_id: chatModelId,
+                        compressor_model_id: compModelId,
+                        messages: chatHistory 
+                    })
                 });
                 
                 const data = await response.json();
                 typingIndicator.style.display = 'none';
                 
-                // 2. Add AI response to UI and History State
                 appendMessage(data.answer, false);
                 chatHistory.push({ role: "assistant", content: data.answer });
 
             } catch (err) {
                 typingIndicator.style.display = 'none';
                 appendMessage("Error: Failed to connect to engine.", false);
-                // If it fails, pop the user message off so they can try again
                 chatHistory.pop(); 
             }
             sendBtn.disabled = false;
