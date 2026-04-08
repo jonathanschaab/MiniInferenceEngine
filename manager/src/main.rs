@@ -48,23 +48,17 @@ async fn handle_generate(
     Json(payload): Json<ApiRequest>,
 ) -> Json<ApiResponse> {
     
-    // A. Create the unique return pipe for this specific user
     let (response_tx, response_rx) = oneshot::channel();
 
-    // B. Package the payload and the return pipe together
     let request = UserRequest {
         prompt: payload.prompt,
         responder: response_tx,
     };
 
-    // C. Shove it into the global queue
-    // We ignore the error here for simplicity, but eventually we
-    // should return a 503 HTTP status if the queue is completely full.
     let _ = state.queue_tx.send(request).await;
 
-    // D. The thread "goes to sleep" here, freeing up the CPU until the GPU finishes!
-    let math_answer = response_rx.await.unwrap_or_else(|_| vec![]);
+    // If the GPU thread crashes or drops the pipe, we return a fallback String.
+    let generated_text = response_rx.await.unwrap_or_else(|_| "Error: GPU pipeline disconnected".to_string());
 
-    // E. Return the JSON to the user
-    Json(ApiResponse { answer: math_answer })
+    Json(ApiResponse { answer: generated_text })
 }
