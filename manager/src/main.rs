@@ -1,6 +1,7 @@
 use axum::{
     extract::State,
-    routing::post,
+    response::Html,
+    routing::{get, post},
     Json, Router,
 };
 use std::sync::Arc;
@@ -17,6 +18,10 @@ struct AppState {
     queue_tx: mpsc::Sender<UserRequest>,
 }
 
+async fn serve_ui() -> Html<&'static str> {
+    Html(include_str!("../index.html"))
+}
+
 #[tokio::main]
 async fn main() {
     // 2. Initialize our Async Queue
@@ -30,8 +35,8 @@ async fn main() {
     // 4. Create the shared state for the web framework
     let shared_state = Arc::new(AppState { queue_tx });
 
-    // 5. Build the Axum API Router
     let app = Router::new()
+        .route("/", get(serve_ui))
         .route("/generate", post(handle_generate))
         .with_state(shared_state);
 
@@ -51,7 +56,7 @@ async fn handle_generate(
     let (response_tx, response_rx) = oneshot::channel();
 
     let request = UserRequest {
-        prompt: payload.prompt,
+        messages: payload.messages,
         responder: response_tx,
     };
 
