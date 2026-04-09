@@ -260,34 +260,27 @@ fn load_engine(model_id: &str, device: &Device) -> Result<(DynamicModel, Tokeniz
     Ok((model, tokenizer, Some(file)))
 }
 
-fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, max_tokens: usize) -> String {
-    let mut tokens = tokenizer.encode(prompt, true).unwrap().get_ids().to_vec();
+fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, max_tokens: usize) -> Result<String, String> {
+    let mut tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
     let prompt_length = tokens.len();
     let mut logits_processor = LogitsProcessor::new(299792458, None, None);
 
-    // --- THE VRAM SAVER: CHUNKED PREFILL ---
-    // Instead of computing attention for all tokens at once, we feed them in blocks
-    // to build the KV cache progressively without CuBLAS workspace spikes.
     let prefill_chunk_size = 256; 
     let mut current_pos = 0;
 
     println!("🔋 Prefilling {} tokens into KV Cache...", tokens.len());
     
-    // We prefill everything EXCEPT the very last token
     if tokens.len() > 1 {
         while current_pos < tokens.len() - 1 {
             let chunk_size = (tokens.len() - 1 - current_pos).min(prefill_chunk_size);
             let chunk = &tokens[current_pos..current_pos + chunk_size];
             
-            let input_tensor = Tensor::new(chunk, device)
-                .unwrap()
-                .unsqueeze(0)
-                .unwrap()
-                .contiguous()
-                .unwrap();
+            // Map tensor creation and reshaping errors
+            let input_tensor = Tensor::new(chunk, device).map_err(|e| e.to_string())?
+                .unsqueeze(0).map_err(|e| e.to_string())?
+                .contiguous().map_err(|e| e.to_string())?;
 
-            // Run the math just to fill the KV Cache (we ignore the output logits here)
-            let _ = model.forward(&input_tensor, current_pos).unwrap();
+            let _ = model.forward(&input_tensor, current_pos).map_err(|e| e.to_string())?;
             current_pos += chunk_size;
         }
     }
@@ -295,38 +288,27 @@ fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, 
     println!("⚡ Generation started...");
 
     for index in 0..max_tokens {
-        // Step 1: Send the un-processed tail of the prompt (usually 1 token), 
-        // then step by 1 token for all future loops.
         let context_size = if index == 0 { tokens.len() - current_pos } else { 1 };
         let start_pos = tokens.len().saturating_sub(context_size);
         
-        // Input MUST be 2D: [batch_size, seq_len]
-        let input_tensor = Tensor::new(&tokens[start_pos..], device)
-            .unwrap()
-            .unsqueeze(0)
-            .unwrap()
-            .contiguous()
-            .unwrap();
+        let input_tensor = Tensor::new(&tokens[start_pos..], device).map_err(|e| e.to_string())?
+            .unsqueeze(0).map_err(|e| e.to_string())?
+            .contiguous().map_err(|e| e.to_string())?;
 
-        // Run the GPU Math for the final token(s) to get the actual predictions
-        let logits = model.forward(&input_tensor, start_pos).unwrap();
-
+        let logits = model.forward(&input_tensor, start_pos).map_err(|e| e.to_string())?;
         drop(input_tensor);
 
-        // Squeeze the batch dimension to get a pure 1D array of probabilities
-        let next_token_logits = logits.squeeze(0).unwrap();
-
-        // Pick the actual next word ID
-        let next_token = logits_processor.sample(&next_token_logits).unwrap();
+        let next_token_logits = logits.squeeze(0).map_err(|e| e.to_string())?;
+        let next_token = logits_processor.sample(&next_token_logits).map_err(|e| e.to_string())?;
+        
         tokens.push(next_token);
 
-        // Stop if we hit EOS tokens for Llama 2/3, Qwen, or ChatML
         if next_token == 2 || next_token == 151645 || next_token == 151643 || next_token == 128001 || next_token == 128009 { 
             break; 
         }
     }
     
-    tokenizer.decode(&tokens[prompt_length..], true).unwrap()
+    tokenizer.decode(&tokens[prompt_length..], true).map_err(|e| e.to_string())
 }
 
 fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, device: &Device, target_len: usize, max_chunk_size: usize) -> Result<String, String> {
@@ -359,7 +341,7 @@ fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, devi
             }
         }
 
-        token_scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        token_scores.sort_by(|a, b| b.2.total_cmp(&a.2));
         
         if token_scores.len() > target_len {
             token_scores.truncate(target_len);
@@ -389,100 +371,136 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
 
     println!("⚙️  ORCHESTRATOR ONLINE: Waiting for requests...");
 
-    while let Some(request) = receiver.recv().await {
+    // We label the loop 'main so we can `continue` it from anywhere
+    'main: while let Some(request) = receiver.recv().await {
         println!("📥 Processing new chat request...");
 
-        // --- PREVENT CRASH ON EMPTY MESSAGES ---
         let last_message = match request.messages.last() {
             Some(msg) => msg.clone(),
             None => {
                 println!("⚠️ Rejected request: No messages provided.");
                 let _ = request.responder.send("Server Error: Request contained no messages.".to_string());
-                continue;
+                continue 'main;
             }
         };
 
-        // Hot-Swap to the requested Chat Model
         if active_model_id != request.chat_model_id {
             println!("🔄 Swapping VRAM to {}...", request.chat_model_id);
             drop(active_model.take()); 
             drop(active_tokenizer.take()); 
             drop(_active_file.take()); 
             
-            // --- CHAT MODEL LOAD ---
             let (m, t, f) = match load_engine(&request.chat_model_id, &device) {
                 Ok(engine) => engine,
                 Err(e) => {
                     println!("❌ Chat model load failed: {}", e);
                     let _ = request.responder.send(format!("Server Error: Failed to load chat model: {}", e));
-                    continue;
+                    continue 'main;
                 }
             };
             
             active_model = Some(m); active_tokenizer = Some(t); _active_file = f; 
             active_model_id = request.chat_model_id.clone();
 
-            let config = get_model_registry().into_iter().find(|c| c.id == active_model_id).unwrap();
+            // Safe registry lookup
+            let config = match get_model_registry().into_iter().find(|c| c.id == active_model_id) {
+                Some(c) => c,
+                None => {
+                    let _ = request.responder.send("Server Error: Active model missing from registry.".to_string());
+                    continue 'main;
+                }
+            };
             active_max_context = config.max_context_len;
             println!("✅ Model limits established. Max context window: {}", active_max_context);
         }
 
         let mut formatted_prompt = format_chat(&request.messages);
-        let token_count = active_tokenizer.as_ref().unwrap().encode(formatted_prompt.clone(), true).unwrap().get_ids().len();
+        
+        // Safe Tokenizer Encode
+        let token_count = match active_tokenizer.as_ref().unwrap().encode(formatted_prompt.clone(), true) {
+            Ok(enc) => enc.get_ids().len(),
+            Err(e) => {
+                let _ = request.responder.send(format!("Server Error: Tokenization failed: {}", e));
+                continue 'main;
+            }
+        };
 
-        // The Dynamic Auto-Compressor Intercept
         let compression_threshold = (active_max_context as f32 * 0.80) as usize;
 
         if token_count > compression_threshold {
             if let Some((used_start, total)) = get_vram_info(0) { 
                 println!("📊 VRAM before compressor: {:.2}GB / {:.2}GB", 
-                    used_start as f32 / 1024.0 / 1024.0 / 1024.0, 
-                    total as f32 / 1024.0 / 1024.0 / 1024.0);
-            } else {
-                println!("🖥️ Running in CPU fallback mode. VRAM tracking disabled.");
+                    used_start as f32 / 1024.0_f32.powi(3), 
+                    total as f32 / 1024.0_f32.powi(3));
             }
 
-            // --- COMPRESSOR LOAD ---
             let (mut comp_m, comp_t, _comp_f) = match load_engine(&request.compressor_model_id, &device) {
                 Ok(engine) => engine,
                 Err(e) => {
-                    println!("❌ Compressor load failed: {}", e);
                     let _ = request.responder.send(format!("Server Error: Failed to load compressor: {}", e));
-                    continue;
+                    continue 'main;
                 }
             };
             
-            let comp_config = get_model_registry().into_iter()
-                .find(|c| c.id == request.compressor_model_id)
-                .unwrap();
+            let comp_config = match get_model_registry().into_iter().find(|c| c.id == request.compressor_model_id) {
+                Some(c) => c,
+                None => {
+                    let _ = request.responder.send("Server Error: Compressor missing from registry.".to_string());
+                    continue 'main;
+                }
+            };
             
             let target_budget = (active_max_context as f32 * 0.2) as usize; 
 
             let summary = match &comp_m {
                 DynamicModel::XLMRoberta(_) => {
-                    println!("✂️ Running Extractive Compression (True LLMLingua-2)...");
-                    
                     match compress_text(&formatted_prompt, &comp_m, &comp_t, &device, target_budget, comp_config.max_context_len) {
                         Ok(compressed) => compressed,
                         Err(e) => {
-                            println!("❌ Compression failed: {}", e);
                             let _ = request.responder.send(format!("Server Error: Context compression failed: {}", e));
-                            continue;
+                            continue 'main;
                         }
                     }
                 },
                 _ => {
-                    println!("🧠 Running Rolling Abstractive Compression (Qwen Agent)...");
-                    let mut current_tokens = comp_t.encode(formatted_prompt.clone(), true).unwrap().get_ids().to_vec();
+                    let mut current_tokens = match comp_t.encode(formatted_prompt.clone(), true) {
+                        Ok(enc) => enc.get_ids().to_vec(),
+                        Err(e) => {
+                            let _ = request.responder.send(format!("Server Error: Compressor encode failed: {}", e));
+                            continue 'main;
+                        }
+                    };
+                    
                     let safe_input_limit = comp_config.max_context_len.saturating_sub(600); 
 
                     while current_tokens.len() > target_budget {
                         let chunk_end = current_tokens.len().min(safe_input_limit);
-                        let chunk_text = comp_t.decode(&current_tokens[0..chunk_end], true).unwrap();
+                        
+                        let chunk_text = match comp_t.decode(&current_tokens[0..chunk_end], true) {
+                            Ok(text) => text,
+                            Err(e) => {
+                                let _ = request.responder.send(format!("Server Error: Chunk decode failed: {}", e));
+                                continue 'main; // Jumps cleanly out of the nested loop to the next user request!
+                            }
+                        };
+
                         let compression_prompt = format!("<|user|>\nSummarize history compactly:\n{}</s>\n<|assistant|>\n", chunk_text);
                         
-                        let summary_text = generate_text(&compression_prompt, &mut comp_m, &comp_t, &device, 400);
-                        let summary_tokens = comp_t.encode(summary_text, true).unwrap().get_ids().to_vec();
+                        let summary_text = match generate_text(&compression_prompt, &mut comp_m, &comp_t, &device, 400) {
+                            Ok(text) => text,
+                            Err(e) => {
+                                let _ = request.responder.send(format!("Server Error: Generation failed: {}", e));
+                                continue 'main;
+                            }
+                        };
+
+                        let summary_tokens = match comp_t.encode(summary_text, true) {
+                            Ok(enc) => enc.get_ids().to_vec(),
+                            Err(e) => {
+                                let _ = request.responder.send(format!("Server Error: Summary tokenization failed: {}", e));
+                                continue 'main;
+                            }
+                        };
 
                         let mut next_tokens = summary_tokens;
                         next_tokens.extend_from_slice(&current_tokens[chunk_end..]);
@@ -490,18 +508,26 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
                         if next_tokens.len() >= current_tokens.len() { break; }
                         current_tokens = next_tokens;
                     }
-                    comp_t.decode(&current_tokens, true).unwrap()
+                    
+                    match comp_t.decode(&current_tokens, true) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            let _ = request.responder.send(format!("Server Error: Final decode failed: {}", e));
+                            continue 'main;
+                        }
+                    }
                 }
             };
 
-            drop(comp_t); 
-            drop(_comp_f);
-            drop(comp_m);
+            drop(comp_t); drop(_comp_f); drop(comp_m);
 
             if let Some((used_end, total)) = get_vram_info(0) {
                 if (used_end as f32 / total as f32) > 0.85 {
                     println!("🧹 Threshold met. Syncing hardware...");
-                    device.synchronize().unwrap();
+                    // Gracefully log sync failures instead of crashing
+                    if let Err(e) = device.synchronize() {
+                        println!("⚠️ Warning: Hardware VRAM sync failed: {}", e);
+                    }
                 }
             }
             
@@ -512,7 +538,15 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
         }
 
         println!("📥 Processing prompt...");
-        let answer = generate_text(&formatted_prompt, active_model.as_mut().unwrap(), active_tokenizer.as_ref().unwrap(), &device, 500);
-        let _ = request.responder.send(answer.trim().to_string());
+        // Handle the Result from our newly updated generate_text function
+        match generate_text(&formatted_prompt, active_model.as_mut().unwrap(), active_tokenizer.as_ref().unwrap(), &device, 500) {
+            Ok(answer) => {
+                let _ = request.responder.send(answer.trim().to_string());
+            },
+            Err(e) => {
+                println!("❌ Generation Error: {}", e);
+                let _ = request.responder.send(format!("Server Error: Generation failed: {}", e));
+            }
+        }
     }
 }
