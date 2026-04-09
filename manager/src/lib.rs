@@ -11,13 +11,14 @@ use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::generation::LogitsProcessor;
 use nvml_wrapper::Nvml;
 
-pub fn get_vram_info() -> (u64, u64) {
-    let nvml = Nvml::init().expect("Failed to initialize NVML");
-    let device = nvml.device_by_index(0).expect("No GPU found");
-    let info = device.memory_info().expect("Could not get memory info");
+pub fn get_vram_info(device_index: u32) -> Option<(u64, u64)> {
+    // Fail gracefully at each step if hardware is missing or incompatible
+    let nvml = Nvml::init().ok()?;
+    let device = nvml.device_by_index(device_index).ok()?;
+    let info = device.memory_info().ok()?;
     
     // Returns (Used, Total) in bytes
-    (info.used, info.total)
+    Some((info.used, info.total))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -70,7 +71,12 @@ impl DynamicModel {
         match self {
             Self::Llama(m) => m.forward(x, start_pos),
             Self::Qwen2(m) => m.forward(x, start_pos),
-            Self::XLMRoberta(_) => panic!("Token Classifiers cannot be used in a generative loop!"),
+            Self::XLMRoberta(_) => {
+                // Return a structured error instead of blowing up the application
+                Err(candle_core::Error::Msg(
+                    "Token Classifiers (like RoBERTa) cannot be used in a generative loop!".to_string()
+                ))
+            }
         }
     }
 }
@@ -200,9 +206,11 @@ fn format_chat(messages: &[Message]) -> String {
 }
 
 // THE SNAPSHOT LOADER: This function returns the mapped File so the OS keeps it alive in RAM!
-fn load_engine(model_id: &str, device: &Device) -> (DynamicModel, Tokenizer, Option<std::fs::File>) {
-    let config = get_model_registry().into_iter().find(|c| c.id == model_id).unwrap();
-    let api = Api::new().unwrap();
+fn load_engine(model_id: &str, device: &Device) -> Result<(DynamicModel, Tokenizer, Option<std::fs::File>), String> {
+    let config = get_model_registry().into_iter().find(|c| c.id == model_id)
+        .ok_or_else(|| format!("Model ID {} not found in registry", model_id))?; // Graceful missing config
+    
+    let api = Api::new().map_err(|e| e.to_string())?;
 
     if config.filename.ends_with(".safetensors") {
         let repo = api.model(config.repo);
@@ -227,24 +235,25 @@ fn load_engine(model_id: &str, device: &Device) -> (DynamicModel, Tokenizer, Opt
         let model = ExtractiveCompressor::load(vb, &conf).unwrap();
         let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
 
-        return (DynamicModel::XLMRoberta(model), tokenizer, None);
+        return Ok((DynamicModel::XLMRoberta(model), tokenizer, None));
     }
 
     // --- PATH B: GENERATIVE MODELS (GGUF) ---
-    let weights_path = api.model(config.repo).get(&config.filename).unwrap();
-    let tokenizer_path = api.model(config.tokenizer_repo).get("tokenizer.json").unwrap();
+    let weights_path = api.model(config.repo).get(&config.filename).map_err(|e| e.to_string())?;
+    let tokenizer_path = api.model(config.tokenizer_repo).get("tokenizer.json").map_err(|e| e.to_string())?;
 
-    let mut file = std::fs::File::open(&weights_path).unwrap();
-    let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
+    let mut file = std::fs::File::open(&weights_path).map_err(|e| e.to_string())?;
+    let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut file).map_err(|e| e.to_string())?;
     
     let model = match config.arch {
-        ModelArch::Llama => DynamicModel::Llama(LlamaWeights::from_gguf(gguf_content, &mut file, device).unwrap()),
-        ModelArch::Qwen2 => DynamicModel::Qwen2(Qwen2Weights::from_gguf(gguf_content, &mut file, device).unwrap()),
-        _ => panic!("Unsupported GGUF architecture"),
+        ModelArch::Llama => DynamicModel::Llama(LlamaWeights::from_gguf(gguf_content, &mut file, device).map_err(|e| e.to_string())?),
+        ModelArch::Qwen2 => DynamicModel::Qwen2(Qwen2Weights::from_gguf(gguf_content, &mut file, device).map_err(|e| e.to_string())?),
+        _ => return Err(format!("Unsupported GGUF architecture for model: {}", config.id)), // <-- The Fix
     };
 
-    let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
-    (model, tokenizer, Some(file))
+    let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| e.to_string())?;
+    
+    Ok((model, tokenizer, Some(file)))
 }
 
 fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, max_tokens: usize) -> String {
@@ -388,7 +397,8 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
             drop(active_tokenizer.take()); 
             drop(_active_file.take()); 
             
-            let (m, t, f) = load_engine(&request.chat_model_id, &device);
+            let (m, t, f) = load_engine(&request.chat_model_id, &device)
+                .expect("Failed to load chat model check the registry!");
             
             active_model = Some(m); active_tokenizer = Some(t); _active_file = f; 
             active_model_id = request.chat_model_id.clone();
@@ -406,13 +416,17 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
 
         if token_count > compression_threshold {
             // 1. Get telemetry BEFORE loading the model
-            let (used_start, total) = get_vram_info();
-            println!("📊 VRAM before compressor: {:.2}GB / {:.2}GB", 
-                used_start as f32 / 1024.0 / 1024.0 / 1024.0, 
-                total as f32 / 1024.0 / 1024.0 / 1024.0);
+            if let Some((used_start, total)) = get_vram_info(0) { // Pass index 0 (or make this a config variable later)
+                println!("📊 VRAM before compressor: {:.2}GB / {:.2}GB", 
+                    used_start as f32 / 1024.0 / 1024.0 / 1024.0, 
+                    total as f32 / 1024.0 / 1024.0 / 1024.0);
+            } else {
+                println!("🖥️ Running in CPU fallback mode. VRAM tracking disabled.");
+            }
 
             // 2. Load the compressor
-            let (mut comp_m, comp_t, _comp_f) = load_engine(&request.compressor_model_id, &device);
+            let (mut comp_m, comp_t, _comp_f) = load_engine(&request.compressor_model_id, &device)
+                .expect("Failed to load compressor model, check the registry!");
             
             let comp_config = get_model_registry().into_iter()
                 .find(|c| c.id == request.compressor_model_id)
@@ -454,10 +468,11 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
             drop(_comp_f);
             drop(comp_m);
 
-            let (used_end, _) = get_vram_info();
-            if (used_end as f32 / total as f32) > 0.85 {
-                println!("🧹 Threshold met. Syncing hardware...");
-                device.synchronize().unwrap();
+            if let Some((used_end, total)) = get_vram_info(0) {
+                if (used_end as f32 / total as f32) > 0.85 {
+                    println!("🧹 Threshold met. Syncing hardware...");
+                    device.synchronize().unwrap();
+                }
             }
             
             println!("🔄 Resuming Chat...");
