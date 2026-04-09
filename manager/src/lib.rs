@@ -111,7 +111,7 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             repo: "QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF".to_string(),
             tokenizer_repo: "NousResearch/Meta-Llama-3.1-8B-Instruct".to_string(),
             filename: "Meta-Llama-3.1-8B-Instruct.Q4_K_M.gguf".to_string(), 
-            max_context_len: 8192, roles: vec![ModelRole::GeneralChat],
+            max_context_len: 128000, roles: vec![ModelRole::GeneralChat],
             arch: ModelArch::Llama,
             compression_dtype: None
         },
@@ -122,7 +122,7 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             repo: "bartowski/Qwen2.5-14B-Instruct-GGUF".to_string(), 
             tokenizer_repo: "Qwen/Qwen2.5-14B-Instruct".to_string(),
             filename: "Qwen2.5-14B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 4096, 
+            max_context_len: 131072, 
             roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
             arch: ModelArch::Qwen2,
             compression_dtype: None
@@ -132,7 +132,8 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             repo: "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF".to_string(), 
             tokenizer_repo: "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
             filename: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 4096, roles: vec![ModelRole::CodeSpecialist],
+            max_context_len: 131072,
+            roles: vec![ModelRole::CodeSpecialist],
             arch: ModelArch::Qwen2,
             compression_dtype: None
         },
@@ -164,7 +165,7 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".to_string(), 
             tokenizer_repo: "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
             filename: "qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(), 
-            max_context_len: 16384, 
+            max_context_len: 32768, 
             roles: vec![ModelRole::ContextCompressor],
             arch: ModelArch::Qwen2,
             compression_dtype: None
@@ -208,18 +209,20 @@ fn format_chat(messages: &[Message]) -> String {
 // THE SNAPSHOT LOADER: This function returns the mapped File so the OS keeps it alive in RAM!
 fn load_engine(model_id: &str, device: &Device) -> Result<(DynamicModel, Tokenizer, Option<std::fs::File>), String> {
     let config = get_model_registry().into_iter().find(|c| c.id == model_id)
-        .ok_or_else(|| format!("Model ID {} not found in registry", model_id))?; // Graceful missing config
+        .ok_or_else(|| format!("Model ID {} not found in registry", model_id))?; 
     
     let api = Api::new().map_err(|e| e.to_string())?;
 
     if config.filename.ends_with(".safetensors") {
         let repo = api.model(config.repo);
-        let weights_path = repo.get(&config.filename).unwrap();
-        let config_path = repo.get("config.json").unwrap();
-        let tokenizer_path = api.model(config.tokenizer_repo).get("tokenizer.json").unwrap();
+        
+        // --- Safetensors IO wrapped in Results ---
+        let weights_path = repo.get(&config.filename).map_err(|e| format!("Missing weights: {}", e))?;
+        let config_path = repo.get("config.json").map_err(|e| format!("Missing config.json: {}", e))?;
+        let tokenizer_path = api.model(config.tokenizer_repo).get("tokenizer.json").map_err(|e| format!("Missing tokenizer: {}", e))?;
 
-        let config_str = std::fs::read_to_string(config_path).unwrap();
-        let conf: BertConfig = serde_json::from_str(&config_str).unwrap();
+        let config_str = std::fs::read_to_string(config_path).map_err(|e| format!("Failed to read config: {}", e))?;
+        let conf: BertConfig = serde_json::from_str(&config_str).map_err(|e| format!("Bad config JSON: {}", e))?;
         
         let dtype = match config.compression_dtype {
             Some(CompressionDType::F16) => candle_core::DType::F16,
@@ -229,11 +232,12 @@ fn load_engine(model_id: &str, device: &Device) -> Result<(DynamicModel, Tokeniz
         println!("💎 Loading Safetensors instantly via Mmap...");
         
         let vb = unsafe { 
-            VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, device).unwrap() 
+            VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, device)
+                .map_err(|e| format!("Safetensors Mmap failed: {}", e))? 
         };
 
-        let model = ExtractiveCompressor::load(vb, &conf).unwrap();
-        let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
+        let model = ExtractiveCompressor::load(vb, &conf).map_err(|e| format!("Extractive load failed: {}", e))?;
+        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| format!("Tokenizer load failed: {}", e))?;
 
         return Ok((DynamicModel::XLMRoberta(model), tokenizer, None));
     }
@@ -248,7 +252,7 @@ fn load_engine(model_id: &str, device: &Device) -> Result<(DynamicModel, Tokeniz
     let model = match config.arch {
         ModelArch::Llama => DynamicModel::Llama(LlamaWeights::from_gguf(gguf_content, &mut file, device).map_err(|e| e.to_string())?),
         ModelArch::Qwen2 => DynamicModel::Qwen2(Qwen2Weights::from_gguf(gguf_content, &mut file, device).map_err(|e| e.to_string())?),
-        _ => return Err(format!("Unsupported GGUF architecture for model: {}", config.id)), // <-- The Fix
+        _ => return Err(format!("Unsupported GGUF architecture for model: {}", config.id)),
     };
 
     let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| e.to_string())?;
@@ -325,25 +329,26 @@ fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, 
     tokenizer.decode(&tokens[prompt_length..], true).unwrap()
 }
 
-fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, device: &Device, target_len: usize) -> String {
+fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, device: &Device, target_len: usize) -> Result<String, String> {
     if let DynamicModel::XLMRoberta(m) = model {
-        let tokens = tokenizer.encode(prompt, true).unwrap().get_ids().to_vec();
+        let tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
         
-        // Store a tuple: (original_index, token_id, keep_score)
         let mut token_scores: Vec<(usize, u32, f32)> = Vec::new(); 
         let mut global_idx = 0;
 
         println!("✂️ Slicing {} tokens into 500-token chunks for RoBERTa...", tokens.len());
 
         for chunk in tokens.chunks(500) {
-            let input_tensor = Tensor::new(chunk, device).unwrap().unsqueeze(0).unwrap();
-            let logits = m.forward(&input_tensor).unwrap();
-            let logits = logits.squeeze(0).unwrap(); 
+            let input_tensor = Tensor::new(chunk, device).map_err(|e| e.to_string())?
+                .unsqueeze(0).map_err(|e| e.to_string())?;
+                
+            let logits = m.forward(&input_tensor).map_err(|e| e.to_string())?;
+            let logits = logits.squeeze(0).map_err(|e| e.to_string())?; 
 
-            let probabilities = candle_nn::ops::softmax(&logits, 1).unwrap();
+            let probabilities = candle_nn::ops::softmax(&logits, 1).map_err(|e| e.to_string())?;
             
-            let probs_f32 = probabilities.to_dtype(candle_core::DType::F32).unwrap();
-            let probs_vec = probs_f32.to_vec2::<f32>().unwrap();
+            let probs_f32 = probabilities.to_dtype(candle_core::DType::F32).map_err(|e| e.to_string())?;
+            let probs_vec = probs_f32.to_vec2::<f32>().map_err(|e| e.to_string())?;
 
             for (i, token) in chunk.iter().enumerate() {
                 let keep_probability = probs_vec[i][1];
@@ -352,28 +357,22 @@ fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, devi
             }
         }
 
-        // --- THE BUDGET CONSTRAINT MATH ---
-        // 1. Sort all tokens by their importance score (Highest score first)
         token_scores.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         
-        // 2. Sever the lowest-scoring tokens until we fit exactly inside the budget
         if token_scores.len() > target_len {
             token_scores.truncate(target_len);
         }
 
-        // 3. Re-sort the surviving tokens by their original index so the grammar makes sense again
         token_scores.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // 4. Extract just the token IDs
         let kept_tokens: Vec<u32> = token_scores.into_iter().map(|(_, token, _)| token).collect();
 
-        // Decode back to text
-        let compressed_text = tokenizer.decode(&kept_tokens, true).unwrap();
+        let compressed_text = tokenizer.decode(&kept_tokens, true).map_err(|e| e.to_string())?;
         println!("✅ Extractive compression complete. Shrunk from {} to {} tokens.", tokens.len(), kept_tokens.len());
         
-        compressed_text
+        Ok(compressed_text)
     } else {
-        panic!("compress_text must be used with a Token Classifier!");
+        Err("compress_text must be used with a Token Classifier!".to_string())
     }
 }
 
@@ -389,16 +388,34 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
     println!("⚙️  ORCHESTRATOR ONLINE: Waiting for requests...");
 
     while let Some(request) = receiver.recv().await {
-        
-        // 1. Hot-Swap to the requested Chat Model
+        println!("📥 Processing new chat request...");
+
+        // --- PREVENT CRASH ON EMPTY MESSAGES ---
+        let last_message = match request.messages.last() {
+            Some(msg) => msg.clone(),
+            None => {
+                println!("⚠️ Rejected request: No messages provided.");
+                let _ = request.responder.send("Server Error: Request contained no messages.".to_string());
+                continue;
+            }
+        };
+
+        // Hot-Swap to the requested Chat Model
         if active_model_id != request.chat_model_id {
             println!("🔄 Swapping VRAM to {}...", request.chat_model_id);
             drop(active_model.take()); 
             drop(active_tokenizer.take()); 
             drop(_active_file.take()); 
             
-            let (m, t, f) = load_engine(&request.chat_model_id, &device)
-                .expect("Failed to load chat model check the registry!");
+            // --- CHAT MODEL LOAD ---
+            let (m, t, f) = match load_engine(&request.chat_model_id, &device) {
+                Ok(engine) => engine,
+                Err(e) => {
+                    println!("❌ Chat model load failed: {}", e);
+                    let _ = request.responder.send(format!("Server Error: Failed to load chat model: {}", e));
+                    continue;
+                }
+            };
             
             active_model = Some(m); active_tokenizer = Some(t); _active_file = f; 
             active_model_id = request.chat_model_id.clone();
@@ -411,12 +428,11 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
         let mut formatted_prompt = format_chat(&request.messages);
         let token_count = active_tokenizer.as_ref().unwrap().encode(formatted_prompt.clone(), true).unwrap().get_ids().len();
 
-        // 2. The Dynamic Auto-Compressor Intercept
+        // The Dynamic Auto-Compressor Intercept
         let compression_threshold = (active_max_context as f32 * 0.80) as usize;
 
         if token_count > compression_threshold {
-            // 1. Get telemetry BEFORE loading the model
-            if let Some((used_start, total)) = get_vram_info(0) { // Pass index 0 (or make this a config variable later)
+            if let Some((used_start, total)) = get_vram_info(0) { 
                 println!("📊 VRAM before compressor: {:.2}GB / {:.2}GB", 
                     used_start as f32 / 1024.0 / 1024.0 / 1024.0, 
                     total as f32 / 1024.0 / 1024.0 / 1024.0);
@@ -424,9 +440,15 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
                 println!("🖥️ Running in CPU fallback mode. VRAM tracking disabled.");
             }
 
-            // 2. Load the compressor
-            let (mut comp_m, comp_t, _comp_f) = load_engine(&request.compressor_model_id, &device)
-                .expect("Failed to load compressor model, check the registry!");
+            // --- COMPRESSOR LOAD ---
+            let (mut comp_m, comp_t, _comp_f) = match load_engine(&request.compressor_model_id, &device) {
+                Ok(engine) => engine,
+                Err(e) => {
+                    println!("❌ Compressor load failed: {}", e);
+                    let _ = request.responder.send(format!("Server Error: Failed to load compressor: {}", e));
+                    continue;
+                }
+            };
             
             let comp_config = get_model_registry().into_iter()
                 .find(|c| c.id == request.compressor_model_id)
@@ -437,8 +459,16 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
             let summary = match &comp_m {
                 DynamicModel::XLMRoberta(_) => {
                     println!("✂️ Running Extractive Compression (True LLMLingua-2)...");
-                    // Pass by reference
-                    compress_text(&formatted_prompt, &comp_m, &comp_t, &device, target_budget)
+                    
+                    // --- MATH HANDLING ---
+                    match compress_text(&formatted_prompt, &comp_m, &comp_t, &device, target_budget) {
+                        Ok(compressed) => compressed,
+                        Err(e) => {
+                            println!("❌ Compression failed: {}", e);
+                            let _ = request.responder.send(format!("Server Error: Context compression failed: {}", e));
+                            continue;
+                        }
+                    }
                 },
                 _ => {
                     println!("🧠 Running Rolling Abstractive Compression (Qwen Agent)...");
@@ -463,7 +493,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
                 }
             };
 
-            // 3. Clean up and check if sync is needed
             drop(comp_t); 
             drop(_comp_f);
             drop(comp_m);
@@ -477,7 +506,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
             
             println!("🔄 Resuming Chat...");
             let mut new_messages = vec![Message { role: "system".to_string(), content: format!("Compressed Context:\n{}", summary.trim()) }];
-            new_messages.push(request.messages.last().unwrap().clone());
+            new_messages.push(last_message);
             formatted_prompt = format_chat(&new_messages);
         }
 
