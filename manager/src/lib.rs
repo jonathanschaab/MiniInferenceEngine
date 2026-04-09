@@ -143,7 +143,7 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(), 
             tokenizer_repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
             filename: "model.safetensors".to_string(), 
-            max_context_len: 16384, 
+            max_context_len: 512, 
             roles: vec![ModelRole::ContextCompressor],
             arch: ModelArch::XLMRoberta,
             compression_dtype: Some(CompressionDType::F16)
@@ -154,7 +154,7 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(), 
             tokenizer_repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
             filename: "model.safetensors".to_string(), 
-            max_context_len: 16384, 
+            max_context_len: 512, 
             roles: vec![ModelRole::ContextCompressor],
             arch: ModelArch::XLMRoberta,
             compression_dtype: Some(CompressionDType::F32)
@@ -329,16 +329,18 @@ fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, 
     tokenizer.decode(&tokens[prompt_length..], true).unwrap()
 }
 
-fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, device: &Device, target_len: usize) -> Result<String, String> {
+fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, device: &Device, target_len: usize, max_chunk_size: usize) -> Result<String, String> {
     if let DynamicModel::XLMRoberta(m) = model {
         let tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
         
         let mut token_scores: Vec<(usize, u32, f32)> = Vec::new(); 
         let mut global_idx = 0;
 
-        println!("✂️ Slicing {} tokens into 500-token chunks for RoBERTa...", tokens.len());
+        // Make the print statement dynamic
+        println!("✂️ Slicing {} tokens into {}-token chunks for RoBERTa...", tokens.len(), max_chunk_size);
 
-        for chunk in tokens.chunks(500) {
+        // Replace the hardcoded 500 with the config variable
+        for chunk in tokens.chunks(max_chunk_size) {
             let input_tensor = Tensor::new(chunk, device).map_err(|e| e.to_string())?
                 .unsqueeze(0).map_err(|e| e.to_string())?;
                 
@@ -460,8 +462,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
                 DynamicModel::XLMRoberta(_) => {
                     println!("✂️ Running Extractive Compression (True LLMLingua-2)...");
                     
-                    // --- MATH HANDLING ---
-                    match compress_text(&formatted_prompt, &comp_m, &comp_t, &device, target_budget) {
+                    match compress_text(&formatted_prompt, &comp_m, &comp_t, &device, target_budget, comp_config.max_context_len) {
                         Ok(compressed) => compressed,
                         Err(e) => {
                             println!("❌ Compression failed: {}", e);
