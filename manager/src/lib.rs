@@ -10,6 +10,18 @@ use candle_transformers::models::quantized_llama::ModelWeights as LlamaWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::generation::LogitsProcessor;
 use nvml_wrapper::Nvml;
+use std::sync::{Arc, Mutex};
+
+// The thread-safe status object we will share between the web server and the engine
+#[derive(Serialize, Clone, Default, Debug)]
+pub struct EngineStatus {
+    pub active_chat_model_id: Option<String>,
+    pub last_compressor_model_id: Option<String>,
+}
+
+pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'_, EngineStatus> {
+    status.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn get_vram_info(device_index: u32) -> Option<(u64, u64)> {
     // Fail gracefully at each step if hardware is missing or incompatible
@@ -127,7 +139,7 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             arch: ModelArch::Qwen2,
             compression_dtype: None
         },
-ModelConfig { 
+        ModelConfig { 
             id: "qwen-coder-14b".to_string(), 
             name: "Qwen2.5 Coder (14B)".to_string(),
             repo: "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF".to_string(), 
@@ -372,7 +384,7 @@ fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, devi
     }
 }
 
-pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
+pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status: Arc<Mutex<EngineStatus>>) {
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
     
     let mut active_model_id = String::new();
@@ -383,7 +395,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
 
     println!("⚙️  ORCHESTRATOR ONLINE: Waiting for requests...");
 
-    // We label the loop 'main so we can `continue` it from anywhere
     'main: while let Some(request) = receiver.recv().await {
         println!("📥 Processing new chat request...");
 
@@ -396,6 +407,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
             }
         };
 
+        // 1. Hot-Swap to the requested Chat Model
         if active_model_id != request.chat_model_id {
             println!("🔄 Swapping VRAM to {}...", request.chat_model_id);
             drop(active_model.take()); 
@@ -414,7 +426,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
             active_model = Some(m); active_tokenizer = Some(t); _active_file = f; 
             active_model_id = request.chat_model_id.clone();
 
-            // Safe registry lookup
             let config = match get_model_registry().into_iter().find(|c| c.id == active_model_id) {
                 Some(c) => c,
                 None => {
@@ -424,11 +435,15 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
             };
             active_max_context = config.max_context_len;
             println!("✅ Model limits established. Max context window: {}", active_max_context);
+
+            {
+                let mut current_status = lock_status(&status);
+                current_status.active_chat_model_id = Some(active_model_id.clone());
+            }
         }
 
         let mut formatted_prompt = format_chat(&request.messages);
         
-        // Safe Tokenizer Encode
         let token_count = match active_tokenizer.as_ref().unwrap().encode(formatted_prompt.clone(), true) {
             Ok(enc) => enc.get_ids().len(),
             Err(e) => {
@@ -450,7 +465,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
                 Ok(engine) => engine,
                 Err(e) => {
                     let _ = request.responder.send(format!("Server Error: Failed to load compressor: {}", e));
-                    continue 'main;
+                    continue 'main; 
                 }
             };
             
@@ -461,6 +476,11 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
                     continue 'main;
                 }
             };
+
+            {
+                let mut current_status = lock_status(&status);
+                current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
+            }
             
             let target_budget = (active_max_context as f32 * 0.2) as usize; 
 
@@ -492,7 +512,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
                             Ok(text) => text,
                             Err(e) => {
                                 let _ = request.responder.send(format!("Server Error: Chunk decode failed: {}", e));
-                                continue 'main; // Jumps cleanly out of the nested loop to the next user request!
+                                continue 'main; 
                             }
                         };
 
@@ -536,7 +556,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
             if let Some((used_end, total)) = get_vram_info(0) {
                 if (used_end as f32 / total as f32) > 0.85 {
                     println!("🧹 Threshold met. Syncing hardware...");
-                    // Gracefully log sync failures instead of crashing
                     if let Err(e) = device.synchronize() {
                         println!("⚠️ Warning: Hardware VRAM sync failed: {}", e);
                     }
@@ -550,7 +569,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
         }
 
         println!("📥 Processing prompt...");
-        // Handle the Result from our newly updated generate_text function
         match generate_text(&formatted_prompt, active_model.as_mut().unwrap(), active_tokenizer.as_ref().unwrap(), &device, 500) {
             Ok(answer) => {
                 let _ = request.responder.send(answer.trim().to_string());

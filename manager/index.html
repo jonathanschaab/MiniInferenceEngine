@@ -69,22 +69,59 @@
 
         let chatHistory = [];
 
-        window.onload = async () => {
-            const res = await fetch('/models');
-            const models = await res.json();
-            
-            const chatSelect = document.getElementById('chat-model-select');
-            const compSelect = document.getElementById('compressor-model-select');
+        window.onload = initializeUI;
 
-            models.forEach(m => {
-                if (m.roles.includes("GeneralChat") || m.roles.includes("CodeSpecialist")) {
-                    chatSelect.add(new Option(`Chat: ${m.name}`, m.id));
+        async function initializeUI() {
+            try {
+                const results = await Promise.allSettled([
+                    fetch('/api/status').then(res => res.json()),
+                    fetch('/api/models').then(res => res.json())
+                ]);
+
+                const statusResult = results[0];
+                const modelsResult = results[1];
+
+                let models = [];
+                if (modelsResult.status === 'fulfilled') {
+                    models = modelsResult.value;
+                } else {
+                    console.error("Critical: Failed to fetch models.", modelsResult.reason);
+                    appendMessage("System Error: Could not connect to the model registry.", false);
+                    return; 
                 }
-                if (m.roles.includes("ContextCompressor")) {
-                    compSelect.add(new Option(`Compressor: ${m.name}`, m.id));
+
+                let status = {};
+                if (statusResult.status === 'fulfilled') {
+                    status = statusResult.value;
+                } else {
+                    console.warn("Engine status unavailable. Falling back to defaults.");
                 }
-            });
-        };
+
+                const chatSelect = document.getElementById('chat-model-select');
+                const compSelect = document.getElementById('compressor-model-select');
+
+                chatSelect.innerHTML = '';
+                compSelect.innerHTML = '';
+
+                models.forEach(m => {
+                    if (m.roles.includes("GeneralChat") || m.roles.includes("CodeSpecialist")) {
+                        chatSelect.add(new Option(`Chat: ${m.name}`, m.id));
+                    }
+                    if (m.roles.includes("ContextCompressor")) {
+                        compSelect.add(new Option(`Compressor: ${m.name}`, m.id));
+                    }
+                });
+
+                if (status.active_chat_model_id) {
+                    chatSelect.value = status.active_chat_model_id;
+                }
+                if (status.last_compressor_model_id) {
+                    compSelect.value = status.last_compressor_model_id;
+                }
+            } catch (err) {
+                console.error("Failed to execute UI initialization:", err);
+            }
+        }
 
         inputField.addEventListener('input', function() {
             this.style.height = 'auto';
@@ -116,7 +153,7 @@
                 const chatModelId = document.getElementById('chat-model-select').value;
                 const compModelId = document.getElementById('compressor-model-select').value;
 
-                const response = await fetch('/generate', {
+                const response = await fetch('/api/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ 
