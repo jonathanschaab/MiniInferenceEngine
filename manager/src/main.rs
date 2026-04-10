@@ -52,7 +52,7 @@ async fn handle_generate(
 }
 
 async fn get_status(Extension(status): Extension<Arc<Mutex<EngineStatus>>>) -> Json<EngineStatus> {
-    let current_status = status.lock().unwrap().clone();
+    let current_status = status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
     Json(current_status)
 }
 

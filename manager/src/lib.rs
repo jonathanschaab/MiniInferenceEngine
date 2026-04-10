@@ -431,11 +431,11 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
             };
             active_max_context = config.max_context_len;
             println!("✅ Model limits established. Max context window: {}", active_max_context);
-        }
 
-        {
-            let mut current_status = status.lock().unwrap();
-            current_status.active_chat_model_id = Some(active_model_id.clone());
+            {
+                let mut current_status = status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                current_status.active_chat_model_id = Some(active_model_id.clone());
+            }
         }
 
         let mut formatted_prompt = format_chat(&request.messages);
@@ -474,7 +474,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
             };
 
             {
-                let mut current_status = status.lock().unwrap();
+                let mut current_status = status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
             }
             
