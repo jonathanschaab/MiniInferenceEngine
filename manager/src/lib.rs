@@ -403,12 +403,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
             }
         };
 
-        {
-            let mut current_status = status.lock().unwrap();
-            current_status.active_chat_model_id = Some(request.chat_model_id.clone());
-            current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
-        }
-
+        // 1. Hot-Swap to the requested Chat Model
         if active_model_id != request.chat_model_id {
             println!("🔄 Swapping VRAM to {}...", request.chat_model_id);
             drop(active_model.take()); 
@@ -420,6 +415,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                 Err(e) => {
                     println!("❌ Chat model load failed: {}", e);
                     let _ = request.responder.send(format!("Server Error: Failed to load chat model: {}", e));
+                    // The loop safely continues, and the global status remains untouched
                     continue 'main;
                 }
             };
@@ -427,7 +423,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
             active_model = Some(m); active_tokenizer = Some(t); _active_file = f; 
             active_model_id = request.chat_model_id.clone();
 
-            // Safe registry lookup
             let config = match get_model_registry().into_iter().find(|c| c.id == active_model_id) {
                 Some(c) => c,
                 None => {
@@ -439,9 +434,13 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
             println!("✅ Model limits established. Max context window: {}", active_max_context);
         }
 
+        {
+            let mut current_status = status.lock().unwrap();
+            current_status.active_chat_model_id = Some(active_model_id.clone());
+        }
+
         let mut formatted_prompt = format_chat(&request.messages);
         
-        // Safe Tokenizer Encode
         let token_count = match active_tokenizer.as_ref().unwrap().encode(formatted_prompt.clone(), true) {
             Ok(enc) => enc.get_ids().len(),
             Err(e) => {
@@ -463,7 +462,8 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                 Ok(engine) => engine,
                 Err(e) => {
                     let _ = request.responder.send(format!("Server Error: Failed to load compressor: {}", e));
-                    continue 'main;
+                    // Safely aborts compression without dirtying the status
+                    continue 'main; 
                 }
             };
             
@@ -474,6 +474,11 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                     continue 'main;
                 }
             };
+
+            {
+                let mut current_status = status.lock().unwrap();
+                current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
+            }
             
             let target_budget = (active_max_context as f32 * 0.2) as usize; 
 
@@ -505,7 +510,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                             Ok(text) => text,
                             Err(e) => {
                                 let _ = request.responder.send(format!("Server Error: Chunk decode failed: {}", e));
-                                continue 'main; // Jumps cleanly out of the nested loop to the next user request!
+                                continue 'main; 
                             }
                         };
 
@@ -549,7 +554,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
             if let Some((used_end, total)) = get_vram_info(0) {
                 if (used_end as f32 / total as f32) > 0.85 {
                     println!("🧹 Threshold met. Syncing hardware...");
-                    // Gracefully log sync failures instead of crashing
                     if let Err(e) = device.synchronize() {
                         println!("⚠️ Warning: Hardware VRAM sync failed: {}", e);
                     }
@@ -563,7 +567,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
         }
 
         println!("📥 Processing prompt...");
-        // Handle the Result from our newly updated generate_text function
         match generate_text(&formatted_prompt, active_model.as_mut().unwrap(), active_tokenizer.as_ref().unwrap(), &device, 500) {
             Ok(answer) => {
                 let _ = request.responder.send(answer.trim().to_string());
