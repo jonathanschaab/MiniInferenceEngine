@@ -415,7 +415,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                 Err(e) => {
                     println!("❌ Chat model load failed: {}", e);
                     let _ = request.responder.send(format!("Server Error: Failed to load chat model: {}", e));
-                    // The loop safely continues, and the global status remains untouched
                     continue 'main;
                 }
             };
@@ -462,7 +461,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                 Ok(engine) => engine,
                 Err(e) => {
                     let _ = request.responder.send(format!("Server Error: Failed to load compressor: {}", e));
-                    // Safely aborts compression without dirtying the status
                     continue 'main; 
                 }
             };
