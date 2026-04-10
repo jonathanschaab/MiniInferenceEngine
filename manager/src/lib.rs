@@ -13,10 +13,14 @@ use nvml_wrapper::Nvml;
 use std::sync::{Arc, Mutex};
 
 // The thread-safe status object we will share between the web server and the engine
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Clone, Default, Debug)]
 pub struct EngineStatus {
     pub active_chat_model_id: Option<String>,
     pub last_compressor_model_id: Option<String>,
+}
+
+pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'_, EngineStatus> {
+    status.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub fn get_vram_info(device_index: u32) -> Option<(u64, u64)> {
@@ -433,7 +437,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
             println!("✅ Model limits established. Max context window: {}", active_max_context);
 
             {
-                let mut current_status = status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut current_status = lock_status(&status);
                 current_status.active_chat_model_id = Some(active_model_id.clone());
             }
         }
@@ -474,7 +478,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
             };
 
             {
-                let mut current_status = status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut current_status = lock_status(&status);
                 current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
             }
             

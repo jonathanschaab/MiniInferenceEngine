@@ -2,18 +2,19 @@ use axum::{
     extract::State,
     response::Html,
     routing::{get, post},
-    Json, Router, Extension,
+    Json, Router,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 use manager::{
-    get_model_registry, run_batcher_loop, ApiRequest, ApiResponse, ModelConfig, UserRequest, EngineStatus
+    get_model_registry, run_batcher_loop, ApiRequest, ApiResponse, ModelConfig, UserRequest, EngineStatus, lock_status
 };
 
 // State to share the transmitter queue across web requests
 pub struct AppState {
     pub queue_tx: mpsc::Sender<UserRequest>,
+    pub engine_status: Arc<Mutex<EngineStatus>>,
 }
 
 // Route 1: Serve the HTML UI
@@ -51,8 +52,8 @@ async fn handle_generate(
     Json(ApiResponse { answer: generated_text })
 }
 
-async fn get_status(Extension(status): Extension<Arc<Mutex<EngineStatus>>>) -> Json<EngineStatus> {
-    let current_status = status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
+    let current_status = lock_status(&state.engine_status).clone();
     Json(current_status)
 }
 
@@ -70,7 +71,10 @@ async fn main() {
         run_batcher_loop(rx, status_for_batcher).await;
     });
 
-    let shared_state = Arc::new(AppState { queue_tx: tx });
+    let shared_state = Arc::new(AppState { 
+        queue_tx: tx,
+        engine_status 
+    });
 
     // Build the Axum web server routes
     let app = Router::new()
@@ -78,7 +82,6 @@ async fn main() {
         .route("/api/models", get(get_models))
         .route("/api/generate", post(handle_generate))
         .route("/api/status", get(get_status))
-        .layer(Extension(engine_status))
         .with_state(shared_state);
 
     // Start listening on port 3000
