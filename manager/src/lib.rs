@@ -127,14 +127,26 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             arch: ModelArch::Qwen2,
             compression_dtype: None
         },
-        ModelConfig { 
-            id: "strand-rust-14b".to_string(), name: "Strand Rust Coder (14B)".to_string(),
+ModelConfig { 
+            id: "qwen-coder-14b".to_string(), 
+            name: "Qwen2.5 Coder (14B)".to_string(),
             repo: "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF".to_string(), 
             tokenizer_repo: "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
             filename: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 131072,
+            max_context_len: 131072, // Qwen2.5 base supports up to 131k
             roles: vec![ModelRole::CodeSpecialist],
             arch: ModelArch::Qwen2,
+            compression_dtype: None
+        },
+        ModelConfig { 
+            id: "strand-rust-14b".to_string(), 
+            name: "Strand Rust Coder (14B)".to_string(),
+            repo: "mradermacher/Strand-Rust-Coder-14B-v1-GGUF".to_string(), 
+            tokenizer_repo: "Fortytwo-Network/Strand-Rust-Coder-14B-v1".to_string(),
+            filename: "Strand-Rust-Coder-14B-v1.Q4_K_M.gguf".to_string(), 
+            max_context_len: 32768, // The Strand fine-tune caps optimal context at 32k
+            roles: vec![ModelRole::CodeSpecialist],
+            arch: ModelArch::Qwen2, // Strand is built on top of the Qwen2 architecture
             compression_dtype: None
         },
         ModelConfig { 
