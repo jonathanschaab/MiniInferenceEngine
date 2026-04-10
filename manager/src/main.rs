@@ -2,14 +2,13 @@ use axum::{
     extract::State,
     response::Html,
     routing::{get, post},
-    Json, Router,
+    Json, Router, Extension,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
-// Import exactly what we need from our library (lib.rs)
 use manager::{
-    get_model_registry, run_batcher_loop, ApiRequest, ApiResponse, ModelConfig, UserRequest
+    get_model_registry, run_batcher_loop, ApiRequest, ApiResponse, ModelConfig, UserRequest, EngineStatus
 };
 
 // State to share the transmitter queue across web requests
@@ -52,14 +51,23 @@ async fn handle_generate(
     Json(ApiResponse { answer: generated_text })
 }
 
+async fn get_status(Extension(status): Extension<Arc<Mutex<EngineStatus>>>) -> Json<EngineStatus> {
+    let current_status = status.lock().unwrap().clone();
+    Json(current_status)
+}
+
 #[tokio::main]
 async fn main() {
     // Create the async channel for the GPU queue
     let (tx, rx) = mpsc::channel(32);
 
+    // 2. Initialize the shared state BEFORE spawning the background thread
+    let engine_status = Arc::new(Mutex::new(EngineStatus::default()));
+    let status_for_batcher = engine_status.clone();
+
     // Boot up the GPU Orchestrator in the background
     tokio::spawn(async move {
-        run_batcher_loop(rx).await;
+        run_batcher_loop(rx, status_for_batcher).await;
     });
 
     let shared_state = Arc::new(AppState { queue_tx: tx });
@@ -67,8 +75,10 @@ async fn main() {
     // Build the Axum web server routes
     let app = Router::new()
         .route("/", get(serve_ui))
-        .route("/models", get(get_models))
-        .route("/generate", post(handle_generate))
+        .route("/api/models", get(get_models))
+        .route("/api/generate", post(handle_generate))
+        .route("/api/status", get(get_status))
+        .layer(Extension(engine_status))
         .with_state(shared_state);
 
     // Start listening on port 3000

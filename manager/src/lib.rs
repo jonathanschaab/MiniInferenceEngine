@@ -10,6 +10,14 @@ use candle_transformers::models::quantized_llama::ModelWeights as LlamaWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::generation::LogitsProcessor;
 use nvml_wrapper::Nvml;
+use std::sync::{Arc, Mutex};
+
+// The thread-safe status object we will share between the web server and the engine
+#[derive(Serialize, Clone, Default)]
+pub struct EngineStatus {
+    pub active_chat_model_id: Option<String>,
+    pub last_compressor_model_id: Option<String>,
+}
 
 pub fn get_vram_info(device_index: u32) -> Option<(u64, u64)> {
     // Fail gracefully at each step if hardware is missing or incompatible
@@ -127,7 +135,7 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             arch: ModelArch::Qwen2,
             compression_dtype: None
         },
-ModelConfig { 
+        ModelConfig { 
             id: "qwen-coder-14b".to_string(), 
             name: "Qwen2.5 Coder (14B)".to_string(),
             repo: "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF".to_string(), 
@@ -372,7 +380,7 @@ fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, devi
     }
 }
 
-pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
+pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status: Arc<Mutex<EngineStatus>>) {
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
     
     let mut active_model_id = String::new();
@@ -383,7 +391,6 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
 
     println!("⚙️  ORCHESTRATOR ONLINE: Waiting for requests...");
 
-    // We label the loop 'main so we can `continue` it from anywhere
     'main: while let Some(request) = receiver.recv().await {
         println!("📥 Processing new chat request...");
 
@@ -395,6 +402,12 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>) {
                 continue 'main;
             }
         };
+
+        {
+            let mut current_status = status.lock().unwrap();
+            current_status.active_chat_model_id = Some(request.chat_model_id.clone());
+            current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
+        }
 
         if active_model_id != request.chat_model_id {
             println!("🔄 Swapping VRAM to {}...", request.chat_model_id);
