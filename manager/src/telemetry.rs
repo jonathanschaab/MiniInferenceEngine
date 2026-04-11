@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs;
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LoadMetric {
@@ -24,11 +25,13 @@ pub struct TelemetryStore {
     pub generations: Vec<GenerationMetric>,
     #[serde(skip)]
     pub unsaved_events: usize,
+    #[serde(skip)]
+    pub writer_tx: Option<UnboundedSender<String>>,
 }
 
 impl Default for TelemetryStore {
     fn default() -> Self {
-        Self { loads: Vec::new(), generations: Vec::new(), unsaved_events: 0 }
+        Self { loads: Vec::new(), generations: Vec::new(), unsaved_events: 0, writer_tx: None }
     }
 }
 
@@ -43,9 +46,16 @@ impl TelemetryStore {
 
     pub fn save_to_disk(&self) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            tokio::spawn(async move {
-                let _ = tokio::fs::write("stats.json", json).await;
-            });
+            if let Some(tx) = &self.writer_tx {
+                // Send payload to the dedicated writer task (Thread-safe & Ordered!)
+                let _ = tx.send(json); 
+            } else {
+                // FAIL LOUDLY: Include the exact payload that is being dropped!
+                eprintln!(
+                    "⚠️ [TELEMETRY FAULT] Writer channel missing! Dropping metric payload to prevent disk I/O race conditions. Check channel initialization in main.rs.\nDropped Payload:\n{}", 
+                    json
+                );
+            }
         }
     }
 

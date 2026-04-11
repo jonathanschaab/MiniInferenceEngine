@@ -26,6 +26,11 @@ pub struct ApiRequest {
     pub messages: Vec<Message>,
 }
 
+#[derive(Deserialize)]
+pub struct BenchmarkRequest {
+    pub models: Vec<String>,
+}
+
 #[derive(Serialize)]
 pub struct ApiResponse {
     pub answer: String,

@@ -14,6 +14,21 @@
         th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #313244; }
         th { background: #11111b; font-weight: bold; color: #89b4fa; }
         .chart-container { background: #181825; padding: 20px; border-radius: 8px; margin-bottom: 30px; height: 400px; }
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.7); display: none; justify-content: center; align-items: center; z-index: 1000;
+        }
+        .modal-content {
+            background: #1e1e2e; padding: 20px; border-radius: 8px; width: 450px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+        .modal-content h2 { margin-top: 0; border-bottom: 1px solid #45475a; padding-bottom: 10px; }
+        .model-list { max-height: 300px; overflow-y: auto; margin-bottom: 20px; background: #11111b; padding: 10px; border-radius: 4px; }
+        .model-item { display: flex; align-items: center; margin-bottom: 8px; font-size: 0.95em; }
+        .model-item input { margin-right: 10px; transform: scale(1.2); }
+        .modal-actions { display: flex; justify-content: space-between; }
+        .btn-cancel { background: #45475a; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
+        .btn-run { background: #a6e3a1; color: #11111b; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -21,7 +36,7 @@
         <h1>Model Telemetry & Benchmarks</h1>
         <div>
             <button onclick="window.location.href='/'" style="background: #45475a; color: white; margin-right: 10px;">Back to Chat</button>
-            <button id="benchmark-btn" onclick="triggerCollection()">▶ Run Benchmark Suite</button>
+            <button id="benchmark-btn" onclick="openBenchmarkModal()">▶ Run Benchmark Suite</button>
         </div>
     </header>
 
@@ -50,13 +65,79 @@
         <canvas id="tokenChart"></canvas>
     </div>
 
+    <div id="benchmark-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Select Models to Benchmark</h2>
+            <div id="model-checkbox-list" class="model-list">
+                </div>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+                <button class="btn-run" onclick="submitBenchmark()">Run Selected</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const colorPalette = ['#89b4fa', '#f38ba8', '#a6e3a1', '#f9e2af', '#cba6f7', '#94e2d5'];
 
-        async function triggerCollection() {
-            if(confirm("This will lock the GPU for several minutes. Continue?")) {
-                await fetch('/api/stats/collect', { method: 'POST' });
-                alert("Benchmark suite started in the background. Refresh this page in a few minutes to see updated graphs.");
+        async function openBenchmarkModal() {
+            if (isBenchmarking) {
+                alert("A benchmark is already running!");
+                return;
+            }
+
+            try {
+                // Fetch the current roster
+                const res = await fetch('/api/models');
+                const models = await res.json();
+                
+                const listDiv = document.getElementById('model-checkbox-list');
+                listDiv.innerHTML = ''; // Clear previous list
+                
+                models.forEach(m => {
+                    listDiv.innerHTML += `
+                        <label class="model-item">
+                            <input type="checkbox" value="${m.id}" checked>
+                            ${m.name} <span style="color: #6c7086; margin-left: 5px;">(${m.arch})</span>
+                        </label>
+                    `;
+                });
+                
+                // Show the modal
+                document.getElementById('benchmark-modal').style.display = 'flex';
+            } catch (e) {
+                console.error("Failed to load models for modal", e);
+                alert("Failed to fetch model registry.");
+            }
+        }
+
+        function closeModal() {
+            document.getElementById('benchmark-modal').style.display = 'none';
+        }
+
+        async function submitBenchmark() {
+            // Gather all checked boxes
+            const checkboxes = document.querySelectorAll('#model-checkbox-list input:checked');
+            const selectedModels = Array.from(checkboxes).map(cb => cb.value);
+
+            if (selectedModels.length === 0) {
+                alert("Please select at least one model to benchmark.");
+                return;
+            }
+
+            closeModal();
+
+            // Fire the updated POST request
+            const res = await fetch('/api/stats/collect', { 
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ models: selectedModels })
+            });
+
+            if (res.status === 409) {
+                alert("A benchmark is already running in the background!");
+            } else {
+                checkStatus(); // Instantly lock the UI
             }
         }
 
@@ -213,19 +294,6 @@
 
         // Poll the server every 2 seconds
         setInterval(checkStatus, 2000);
-
-        // Update the trigger function to handle the new 409 Conflict status
-        async function triggerCollection() {
-            if(confirm("This will lock the GPU for several minutes. Continue?")) {
-                const res = await fetch('/api/stats/collect', { method: 'POST' });
-                if (res.status === 409) {
-                    alert("A benchmark is already running in the background!");
-                } else {
-                    // Instantly update the UI without waiting for the next 2-second poll
-                    checkStatus(); 
-                }
-            }
-        }
 
         // Call checkStatus immediately on load alongside the dashboard
         window.onload = () => {

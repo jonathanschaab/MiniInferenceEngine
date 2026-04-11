@@ -11,7 +11,7 @@ use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 
 use manager::{
-    get_model_registry, run_batcher_loop, ApiRequest, ApiResponse, ModelConfig, UserRequest, EngineStatus, lock_status, TelemetryStore, Message, ModelRole
+    get_model_registry, run_batcher_loop, ApiRequest, ApiResponse, ModelConfig, UserRequest, EngineStatus, lock_status, TelemetryStore, Message, ModelRole, BenchmarkRequest
 };
 
 // State to share the transmitter queue across web requests
@@ -63,7 +63,7 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
 }
 
 // The Automated Benchmark Trigger
-async fn trigger_benchmark(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn trigger_benchmark(State(state): State<Arc<AppState>>, Json(payload): Json<BenchmarkRequest>) -> impl IntoResponse {
     // Check if a benchmark is already running
     {
         let mut status = lock_status(&state.engine_status);
@@ -76,20 +76,32 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>) -> impl IntoRespo
 
     let queue_tx = state.queue_tx.clone();
     let engine_status = state.engine_status.clone(); // Clone the Arc so the background thread can reset it
+    let selected_models = payload.models;
     
     tokio::spawn(async move {
         println!("🚀 Starting Automated Benchmark Suite...");
-        let registry = get_model_registry();
+        let full_registry = get_model_registry();
         
-        let default_compressor = registry.iter()
+        let default_compressor = full_registry.iter()
             .find(|m| m.roles.contains(&ModelRole::ContextCompressor))
             .map(|m| m.id.clone())
             .unwrap_or_else(|| "llmlingua-2-f16".to_string());
 
-        let default_chat = registry.iter()
+        let default_chat = full_registry.iter()
             .find(|m| m.roles.contains(&ModelRole::GeneralChat))
             .map(|m| m.id.clone())
             .unwrap_or_else(|| "qwen-2.5-7b".to_string());
+
+        let registry: Vec<ModelConfig> = full_registry.into_iter()
+            .filter(|m| selected_models.contains(&m.id))
+            .collect();
+
+        if registry.is_empty() {
+            println!("⚠️ Benchmark aborted: No valid models selected.");
+            let mut status = lock_status(&engine_status);
+            status.benchmark_running = false;
+            return;
+        }
 
         let _ = tokio::fs::create_dir_all("benchmark_prompts").await;
 
@@ -97,6 +109,14 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>) -> impl IntoRespo
         println!("🌱 Verifying benchmark prompt files...");
 
         let hf_api = Api::new().expect("Failed to initialize Hugging Face API");
+        
+        // FIX 1: Hoist the Tokenizer initialization outside the loop!
+        let mut qwen_tokenizer = None;
+        if let Ok(tokenizer_path) = hf_api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string()).get("tokenizer.json") {
+            if let Ok(tokenizer) = Tokenizer::from_file(tokenizer_path) {
+                qwen_tokenizer = Some(tokenizer);
+            }
+        }
         
         let mut all_sizes = std::collections::HashSet::new();
         for model in registry.iter() {
@@ -136,19 +156,17 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>) -> impl IntoRespo
 
                     if let Ok(generated_seed) = seed_rx.await {
                         if !generated_seed.starts_with("Server Error") {
-                            if let Ok(tokenizer_path) = hf_api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string()).get("tokenizer.json") {
-                                if let Ok(tokenizer) = Tokenizer::from_file(tokenizer_path) {
-                                    if let Ok(encoding) = tokenizer.encode(generated_seed.clone(), true) {
-                                        let token_len = encoding.get_ids().len();
-                                        let margin = (size as f32 * 0.35) as usize;
-                                        
-                                        if token_len >= size.saturating_sub(margin) && token_len <= size + margin {
-                                            final_content = generated_seed;
-                                            should_save = true;
-                                            println!("✅ Generated {} tokens (within 35% of {}). Saving.", token_len, size);
-                                        } else {
-                                            println!("⚠️ Generation missed margin: {} tokens (target {}).", token_len, size);
-                                        }
+                            if let Some(tokenizer) = &qwen_tokenizer {
+                                if let Ok(encoding) = tokenizer.encode(generated_seed.clone(), true) {
+                                    let token_len = encoding.get_ids().len();
+                                    let margin = (size as f32 * 0.35) as usize;
+                                    
+                                    if token_len >= size.saturating_sub(margin) && token_len <= size + margin {
+                                        final_content = generated_seed;
+                                        should_save = true;
+                                        println!("✅ Generated {} tokens (within 35% of {}). Saving.", token_len, size);
+                                    } else {
+                                        println!("⚠️ Generation missed margin: {} tokens (target {}).", token_len, size);
                                     }
                                 }
                             }
@@ -165,45 +183,44 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     
                     let mut current_tokens = 0;
                     let mut counter = 0;
-
                     let mut chunk_buffer = String::with_capacity(8192);
 
-                    if let Ok(tokenizer_path) = hf_api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string()).get("tokenizer.json") {
-                        if let Ok(tokenizer) = Tokenizer::from_file(tokenizer_path) {
-                            
-                            // Initialize current_tokens with the header size
-                            if let Ok(enc) = tokenizer.encode(synthetic_data.clone(), true) {
-                                current_tokens = enc.get_ids().len();
-                            }
-
-                            while current_tokens < size {
-                                let ev = events[counter % events.len()];
-                                let st = statuses[(counter / 3) % statuses.len()];
-                                let session_id = uuid::Uuid::new_v4();
-                                
-                                let log_line = format!(
-                                    "[2026-04-11T11:36:{:02}Z] SESSION: {} | EVENT: {} | STATUS: {} | LATENCY: {}ms | ALLOC: {}KB\n",
-                                    counter % 60, session_id, ev, st, (counter * 7) % 300, (counter * 13) % 2048
-                                );
-                                
-                                synthetic_data.push_str(&log_line);
-                                chunk_buffer.push_str(&log_line);
-                                
-                                if counter % 50 == 0 {
-                                    if let Ok(enc) = tokenizer.encode(chunk_buffer.clone(), false) {
-                                        current_tokens += enc.get_ids().len();
-                                    }
-                                    chunk_buffer.clear(); // Empty the buffer for the next 50 iterations
-                                }
-                                counter += 1;
-                            }
-                            
-                            let final_encoding = tokenizer.encode(synthetic_data, true).unwrap();
-                            let exact_slice = &final_encoding.get_ids()[0..size];
-                            final_content = tokenizer.decode(exact_slice, true).unwrap();
-                            should_save = true;
-                            println!("✅ Successfully synthesized exactly {} unique tokens.", size);
+                    if let Some(tokenizer) = &qwen_tokenizer {
+                        
+                        if let Ok(enc) = tokenizer.encode(synthetic_data.as_str(), true) {
+                            current_tokens = enc.get_ids().len();
                         }
+
+                        while current_tokens < size {
+                            let ev = events[counter % events.len()];
+                            let st = statuses[(counter / 3) % statuses.len()];
+                            let session_id = uuid::Uuid::new_v4();
+                            
+                            let log_line = format!(
+                                "[2026-04-11T11:36:{:02}Z] SESSION: {} | EVENT: {} | STATUS: {} | LATENCY: {}ms | ALLOC: {}KB\n",
+                                counter % 60, session_id, ev, st, (counter * 7) % 300, (counter * 13) % 2048
+                            );
+                            
+                            synthetic_data.push_str(&log_line);
+                            chunk_buffer.push_str(&log_line);
+                            
+                            if counter % 50 == 0 {
+                                if let Ok(enc) = tokenizer.encode(chunk_buffer.as_str(), false) {
+                                    current_tokens += enc.get_ids().len();
+                                }
+                                chunk_buffer.clear(); 
+                            }
+                            counter += 1;
+                        }
+                        
+                        let final_encoding = tokenizer.encode(synthetic_data, true).unwrap();
+                        
+                        let safe_size = size.min(final_encoding.get_ids().len());
+                        let exact_slice = &final_encoding.get_ids()[0..safe_size];
+                        
+                        final_content = tokenizer.decode(exact_slice, true).unwrap();
+                        should_save = true;
+                        println!("✅ Successfully synthesized exactly {} unique tokens.", safe_size);
                     }
                 }
 
@@ -299,7 +316,19 @@ async fn main() {
     // 2. Initialize the shared state BEFORE spawning the background thread
     let engine_status = Arc::new(Mutex::new(EngineStatus::default()));
     let status_for_batcher = engine_status.clone();
-    let telemetry = Arc::new(Mutex::new(TelemetryStore::load_from_disk()));
+
+    let (telemetry_tx, mut telemetry_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        // This loop processes writes one-at-a-time, perfectly preventing race conditions
+        while let Some(json) = telemetry_rx.recv().await {
+            let _ = tokio::fs::write("stats.json", json).await;
+        }
+    });
+
+    let mut store = TelemetryStore::load_from_disk();
+    store.writer_tx = Some(telemetry_tx); // Wire the channel into the store
+    let telemetry = Arc::new(Mutex::new(store));
+
     let telemetry_for_batcher = telemetry.clone();
 
     // Boot up the GPU Orchestrator in the background
