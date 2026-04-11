@@ -95,6 +95,8 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>) -> impl IntoRespo
 
         // --- GENERATE REALISTIC PROMPTS ---
         println!("🌱 Verifying benchmark prompt files...");
+
+        let hf_api = Api::new().expect("Failed to initialize Hugging Face API");
         
         let mut all_sizes = std::collections::HashSet::new();
         for model in registry.iter() {
@@ -134,20 +136,18 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>) -> impl IntoRespo
 
                     if let Ok(generated_seed) = seed_rx.await {
                         if !generated_seed.starts_with("Server Error") {
-                            if let Ok(api) = Api::new() {
-                                if let Ok(tokenizer_path) = api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string()).get("tokenizer.json") {
-                                    if let Ok(tokenizer) = Tokenizer::from_file(tokenizer_path) {
-                                        if let Ok(encoding) = tokenizer.encode(generated_seed.clone(), true) {
-                                            let token_len = encoding.get_ids().len();
-                                            let margin = (size as f32 * 0.35) as usize;
-                                            
-                                            if token_len >= size.saturating_sub(margin) && token_len <= size + margin {
-                                                final_content = generated_seed;
-                                                should_save = true;
-                                                println!("✅ Generated {} tokens (within 35% of {}). Saving.", token_len, size);
-                                            } else {
-                                                println!("⚠️ Generation missed margin: {} tokens (target {}).", token_len, size);
-                                            }
+                            if let Ok(tokenizer_path) = hf_api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string()).get("tokenizer.json") {
+                                if let Ok(tokenizer) = Tokenizer::from_file(tokenizer_path) {
+                                    if let Ok(encoding) = tokenizer.encode(generated_seed.clone(), true) {
+                                        let token_len = encoding.get_ids().len();
+                                        let margin = (size as f32 * 0.35) as usize;
+                                        
+                                        if token_len >= size.saturating_sub(margin) && token_len <= size + margin {
+                                            final_content = generated_seed;
+                                            should_save = true;
+                                            println!("✅ Generated {} tokens (within 35% of {}). Saving.", token_len, size);
+                                        } else {
+                                            println!("⚠️ Generation missed margin: {} tokens (target {}).", token_len, size);
                                         }
                                     }
                                 }
@@ -166,33 +166,43 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>) -> impl IntoRespo
                     let mut current_tokens = 0;
                     let mut counter = 0;
 
-                    if let Ok(api) = Api::new() {
-                        if let Ok(tokenizer_path) = api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string()).get("tokenizer.json") {
-                            if let Ok(tokenizer) = Tokenizer::from_file(tokenizer_path) {
-                                while current_tokens < size {
-                                    let ev = events[counter % events.len()];
-                                    let st = statuses[(counter / 3) % statuses.len()];
-                                    let session_id = uuid::Uuid::new_v4();
-                                    
-                                    synthetic_data.push_str(&format!(
-                                        "[2026-04-11T11:36:{:02}Z] SESSION: {} | EVENT: {} | STATUS: {} | LATENCY: {}ms | ALLOC: {}KB\n",
-                                        counter % 60, session_id, ev, st, (counter * 7) % 300, (counter * 13) % 2048
-                                    ));
-                                    
-                                    if counter % 50 == 0 {
-                                        if let Ok(enc) = tokenizer.encode(synthetic_data.clone(), true) {
-                                            current_tokens = enc.get_ids().len();
-                                        }
-                                    }
-                                    counter += 1;
-                                }
-                                
-                                let final_encoding = tokenizer.encode(synthetic_data, true).unwrap();
-                                let exact_slice = &final_encoding.get_ids()[0..size];
-                                final_content = tokenizer.decode(exact_slice, true).unwrap();
-                                should_save = true;
-                                println!("✅ Successfully synthesized exactly {} unique tokens.", size);
+                    let mut chunk_buffer = String::with_capacity(8192);
+
+                    if let Ok(tokenizer_path) = hf_api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string()).get("tokenizer.json") {
+                        if let Ok(tokenizer) = Tokenizer::from_file(tokenizer_path) {
+                            
+                            // Initialize current_tokens with the header size
+                            if let Ok(enc) = tokenizer.encode(synthetic_data.clone(), true) {
+                                current_tokens = enc.get_ids().len();
                             }
+
+                            while current_tokens < size {
+                                let ev = events[counter % events.len()];
+                                let st = statuses[(counter / 3) % statuses.len()];
+                                let session_id = uuid::Uuid::new_v4();
+                                
+                                let log_line = format!(
+                                    "[2026-04-11T11:36:{:02}Z] SESSION: {} | EVENT: {} | STATUS: {} | LATENCY: {}ms | ALLOC: {}KB\n",
+                                    counter % 60, session_id, ev, st, (counter * 7) % 300, (counter * 13) % 2048
+                                );
+                                
+                                synthetic_data.push_str(&log_line);
+                                chunk_buffer.push_str(&log_line);
+                                
+                                if counter % 50 == 0 {
+                                    if let Ok(enc) = tokenizer.encode(chunk_buffer.clone(), false) {
+                                        current_tokens += enc.get_ids().len();
+                                    }
+                                    chunk_buffer.clear(); // Empty the buffer for the next 50 iterations
+                                }
+                                counter += 1;
+                            }
+                            
+                            let final_encoding = tokenizer.encode(synthetic_data, true).unwrap();
+                            let exact_slice = &final_encoding.get_ids()[0..size];
+                            final_content = tokenizer.decode(exact_slice, true).unwrap();
+                            should_save = true;
+                            println!("✅ Successfully synthesized exactly {} unique tokens.", size);
                         }
                     }
                 }

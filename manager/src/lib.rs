@@ -1,5 +1,6 @@
-use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
@@ -10,74 +11,14 @@ use candle_transformers::models::quantized_llama::ModelWeights as LlamaWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::generation::LogitsProcessor;
 use nvml_wrapper::Nvml;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
-use std::fs;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct LoadMetric {
-    pub timestamp: u64,
-    pub model_id: String,
-    pub load_time_ms: u128,
-}
+pub mod telemetry;
+pub mod types;
+pub mod registry;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct GenerationMetric {
-    pub timestamp: u64,
-    pub model_id: String,
-    pub prompt_chars: usize,
-    pub prompt_tokens: usize,
-    pub generation_time_ms: u128,
-}
-
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
-pub struct TelemetryStore {
-    pub loads: Vec<LoadMetric>,
-    pub generations: Vec<GenerationMetric>,
-}
-
-impl TelemetryStore {
-    pub fn load_from_disk() -> Self {
-        if let Ok(data) = fs::read_to_string("stats.json") {
-            serde_json::from_str(&data).unwrap_or_default()
-        } else {
-            Self::default()
-        }
-    }
-
-    pub fn save_to_disk(&self) {
-        // Serialize synchronously (CPU bound, very fast)
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            // Spawn a detached background task for the I/O (Disk bound, slow)
-            tokio::spawn(async move {
-                let _ = tokio::fs::write("stats.json", json).await;
-            });
-        }
-    }
-
-    pub fn record_load(&mut self, model_id: String, load_time_ms: u128) {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        self.loads.push(LoadMetric { timestamp, model_id, load_time_ms });
-        self.save_to_disk();
-    }
-
-    pub fn record_generation(&mut self, model_id: String, prompt_chars: usize, prompt_tokens: usize, generation_time_ms: u128) {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        self.generations.push(GenerationMetric { timestamp, model_id, prompt_chars, prompt_tokens, generation_time_ms });
-        self.save_to_disk();
-    }
-}
-// The thread-safe status object we will share between the web server and the engine
-#[derive(Serialize, Clone, Default, Debug)]
-pub struct EngineStatus {
-    pub active_chat_model_id: Option<String>,
-    pub last_compressor_model_id: Option<String>,
-    pub benchmark_running: bool,
-}
-
-pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'_, EngineStatus> {
-    status.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+pub use telemetry::*;
+pub use types::*;
+pub use registry::*;
 
 pub fn get_vram_info(device_index: u32) -> Option<(u64, u64, u64)> {
     let nvml = Nvml::init().ok()?;
@@ -94,19 +35,6 @@ fn estimate_bytes_per_token(arch: &ModelArch, params_billions: f32) -> usize {
         ModelArch::Llama if params_billions < 10.0 => 125_000, // ~125KB for 8B
         _ => 100_000,                                          // Fallback
     }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub enum CompressionDType {
-    F32,
-    F16,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub enum ModelArch {
-    Llama,
-    Qwen2,
-    XLMRoberta,
 }
 
 pub struct ExtractiveCompressor {
@@ -154,166 +82,6 @@ impl DynamicModel {
             }
         }
     }
-}
-
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
-pub enum ModelRole {
-    GeneralChat,
-    ContextCompressor,
-    CodeSpecialist,
-    ToolCaller,
-    Reasoning,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    pub id: String,
-    pub name: String,
-    pub repo: String,
-    pub tokenizer_repo: String,
-    pub filename: String,
-    pub max_context_len: usize,
-    pub roles: Vec<ModelRole>,
-    pub arch: ModelArch,
-    pub compression_dtype: Option<CompressionDType>, // Only for Safetensors models
-    pub parameters_billions: f32, 
-    pub size_on_disk_gb: f32,
-}
-
-// Expose the registry so the web server can send it to the UI
-pub fn get_model_registry() -> Vec<ModelConfig> {
-    vec![
-        ModelConfig { 
-            id: "llama-3.1-8b".to_string(), name: "Llama 3.1 (8B)".to_string(),
-            repo: "QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF".to_string(),
-            tokenizer_repo: "NousResearch/Meta-Llama-3.1-8B-Instruct".to_string(),
-            filename: "Meta-Llama-3.1-8B-Instruct.Q4_K_M.gguf".to_string(), 
-            max_context_len: 128000, roles: vec![ModelRole::GeneralChat],
-            arch: ModelArch::Llama,
-            compression_dtype: None,
-            parameters_billions: 8.0,
-            size_on_disk_gb: 4.58,
-        },
-        ModelConfig { 
-            id: "qwen-2.5-7b".to_string(), 
-            name: "Qwen 2.5 (7B)".to_string(),
-            // Point to the unified community repo instead of the split official repo
-            repo: "bartowski/Qwen2.5-7B-Instruct-GGUF".to_string(), 
-            tokenizer_repo: "Qwen/Qwen2.5-7B-Instruct".to_string(),
-            // Note the exact capitalization used in the bartowski repo:
-            filename: "Qwen2.5-7B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 128000, 
-            roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
-            arch: ModelArch::Qwen2,
-            compression_dtype: None,
-            parameters_billions: 7.61,
-            size_on_disk_gb: 4.36,
-        },
-        ModelConfig { 
-            id: "qwen-2.5-14b".to_string(), 
-            name: "Qwen 2.5 (14B)".to_string(),
-            repo: "bartowski/Qwen2.5-14B-Instruct-GGUF".to_string(), 
-            tokenizer_repo: "Qwen/Qwen2.5-14B-Instruct".to_string(),
-            filename: "Qwen2.5-14B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 131072, 
-            roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
-            arch: ModelArch::Qwen2,
-            compression_dtype: None,
-            parameters_billions: 14.0,
-            size_on_disk_gb: 8.37,
-        },
-        ModelConfig { 
-            id: "qwen-coder-14b".to_string(), 
-            name: "Qwen2.5 Coder (14B)".to_string(),
-            repo: "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF".to_string(), 
-            tokenizer_repo: "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
-            filename: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 131072,
-            roles: vec![ModelRole::CodeSpecialist],
-            arch: ModelArch::Qwen2,
-            compression_dtype: None,
-            parameters_billions: 14.0,
-            size_on_disk_gb: 8.37,
-        },
-        ModelConfig { 
-            id: "strand-rust-14b".to_string(), 
-            name: "Strand Rust Coder (14B)".to_string(),
-            repo: "mradermacher/Strand-Rust-Coder-14B-v1-GGUF".to_string(), 
-            tokenizer_repo: "Fortytwo-Network/Strand-Rust-Coder-14B-v1".to_string(),
-            filename: "Strand-Rust-Coder-14B-v1.Q4_K_M.gguf".to_string(), 
-            max_context_len: 32768,
-            roles: vec![ModelRole::CodeSpecialist],
-            arch: ModelArch::Qwen2,
-            compression_dtype: None,
-            parameters_billions: 14.0,
-            size_on_disk_gb: 8.37,
-        },
-        ModelConfig { 
-            id: "llmlingua-2-f16".to_string(), 
-            name: "LLMLingua-2 (F16 - Lean)".to_string(),
-            repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(), 
-            tokenizer_repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
-            filename: "model.safetensors".to_string(), 
-            max_context_len: 512, 
-            roles: vec![ModelRole::ContextCompressor],
-            arch: ModelArch::XLMRoberta,
-            compression_dtype: Some(CompressionDType::F16),
-            parameters_billions: 0.56,
-            size_on_disk_gb: 2.08,
-        },
-        ModelConfig { 
-            id: "llmlingua-2-f32".to_string(), 
-            name: "LLMLingua-2 (F32 - Precision)".to_string(),
-            repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(), 
-            tokenizer_repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
-            filename: "model.safetensors".to_string(), 
-            max_context_len: 512, 
-            roles: vec![ModelRole::ContextCompressor],
-            arch: ModelArch::XLMRoberta,
-            compression_dtype: Some(CompressionDType::F32),
-            parameters_billions: 0.56,
-            size_on_disk_gb: 2.08,
-        },
-        ModelConfig { 
-            id: "qwen-compressor".to_string(), 
-            name: "Qwen 1.5B (Abstractive)".to_string(),
-            repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".to_string(), 
-            tokenizer_repo: "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
-            filename: "qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(), 
-            max_context_len: 32768, 
-            roles: vec![ModelRole::ContextCompressor],
-            arch: ModelArch::Qwen2,
-            compression_dtype: None,
-            parameters_billions: 1.54,
-            size_on_disk_gb: 1.04,
-        },
-    ]
-}
-
-#[derive(Deserialize, Clone)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Deserialize)]
-pub struct ApiRequest {
-    pub chat_model_id: String,
-    pub compressor_model_id: String,
-    pub messages: Vec<Message>,
-}
-
-#[derive(Serialize)]
-pub struct ApiResponse {
-    pub answer: String,
-}
-
-pub struct UserRequest {
-    pub chat_model_id: String,
-    pub compressor_model_id: String,
-    pub messages: Vec<Message>,
-    pub responder: oneshot::Sender<String>,
-    pub force_compression: bool,
 }
 
 // Helper: Formats the array into a generic string format
@@ -566,7 +334,13 @@ pub async fn run_batcher_loop(
         let mut dynamic_target_budget = active_max_context;
 
         // estimate_bytes_per_token logic (roughly 150KB for 14B models)
-        let config = active_model_config.as_ref().unwrap();
+        let config = match active_model_config.as_ref() {
+            Some(c) => c,
+            None => {
+                let _ = request.responder.send("Server Error: No active model configuration found. Please initialize a model first.".to_string());
+                continue 'main;
+            }
+        };
         let bytes_per_token = estimate_bytes_per_token(&config.arch, config.parameters_billions);
 
         if let Some((_, _, free_vram)) = get_vram_info(0) {
