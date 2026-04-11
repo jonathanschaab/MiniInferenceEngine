@@ -46,8 +46,12 @@ impl TelemetryStore {
     }
 
     pub fn save_to_disk(&self) {
+        // Serialize synchronously (CPU bound, very fast)
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write("stats.json", json);
+            // Spawn a detached background task for the I/O (Disk bound, slow)
+            tokio::spawn(async move {
+                let _ = tokio::fs::write("stats.json", json).await;
+            });
         }
     }
 
@@ -68,6 +72,7 @@ impl TelemetryStore {
 pub struct EngineStatus {
     pub active_chat_model_id: Option<String>,
     pub last_compressor_model_id: Option<String>,
+    pub benchmark_running: bool,
 }
 
 pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'_, EngineStatus> {
@@ -485,6 +490,7 @@ pub async fn run_batcher_loop(
     let mut active_tokenizer: Option<Tokenizer> = None;
     let mut _active_file: Option<std::fs::File> = None;
     let mut active_max_context: usize = 2048; 
+    let mut active_model_config: Option<ModelConfig> = None;
 
     println!("⚙️  ORCHESTRATOR ONLINE: Waiting for requests...");
 
@@ -536,6 +542,7 @@ pub async fn run_batcher_loop(
                 }
             };
             active_max_context = config.max_context_len;
+            active_model_config = Some(config);
             println!("✅ Model limits established. Max context window: {}", active_max_context);
 
             {
@@ -559,7 +566,7 @@ pub async fn run_batcher_loop(
         let mut dynamic_target_budget = active_max_context;
 
         // estimate_bytes_per_token logic (roughly 150KB for 14B models)
-        let config = get_model_registry().into_iter().find(|c| c.id == active_model_id).unwrap();
+        let config = active_model_config.as_ref().unwrap();
         let bytes_per_token = estimate_bytes_per_token(&config.arch, config.parameters_billions);
 
         if let Some((_, _, free_vram)) = get_vram_info(0) {

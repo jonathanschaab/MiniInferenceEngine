@@ -16,3 +16,4 @@ candle-nn = "0.10.2"
 candle-transformers = { version = "0.10.2", features = ["cuda"] }
 hf-hub = "0.5.0"        # To download the model files automatically
 tokenizers = "0.22.2"   # To convert text to integer IDs
+uuid = { version = "1.23.0", features = ["v4"] }

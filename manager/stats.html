@@ -17,13 +17,17 @@
     </style>
 </head>
 <body>
-    <header>
+<header>
         <h1>Model Telemetry & Benchmarks</h1>
         <div>
             <button onclick="window.location.href='/'" style="background: #45475a; color: white; margin-right: 10px;">Back to Chat</button>
-            <button onclick="triggerCollection()">▶ Run Benchmark Suite</button>
+            <button id="benchmark-btn" onclick="triggerCollection()">▶ Run Benchmark Suite</button>
         </div>
     </header>
+
+    <div id="benchmark-banner" style="display: none; background: #f38ba8; color: #11111b; padding: 12px; text-align: center; border-radius: 8px; margin-bottom: 20px; font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
+        ⚠️ An automated benchmark suite is currently running. The GPU is heavily utilized and chat responses will be delayed.
+    </div>
 
     <table>
         <thead>
@@ -170,6 +174,64 @@
         }
 
         window.onload = loadDashboard;
+
+        let isBenchmarking = false;
+
+        async function checkStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const status = await res.json();
+                
+                const btn = document.getElementById('benchmark-btn');
+                const banner = document.getElementById('benchmark-banner');
+                
+                if (status.benchmark_running) {
+                    if (!isBenchmarking) {
+                        isBenchmarking = true;
+                        btn.disabled = true;
+                        btn.innerText = "⏳ Benchmark Running...";
+                        btn.style.background = "#f38ba8"; 
+                        btn.style.cursor = "not-allowed";
+                        if (banner) banner.style.display = "block";
+                    }
+                } else {
+                    if (isBenchmarking) {
+                        // The benchmark just finished! Reset UI and reload the graphs.
+                        isBenchmarking = false;
+                        btn.disabled = false;
+                        btn.innerText = "▶ Run Benchmark Suite";
+                        btn.style.background = "#89b4fa"; 
+                        btn.style.cursor = "pointer";
+                        if (banner) banner.style.display = "none";
+                        loadDashboard(); 
+                    }
+                }
+            } catch (e) {
+                console.error("Failed to fetch engine status", e);
+            }
+        }
+
+        // Poll the server every 2 seconds
+        setInterval(checkStatus, 2000);
+
+        // Update the trigger function to handle the new 409 Conflict status
+        async function triggerCollection() {
+            if(confirm("This will lock the GPU for several minutes. Continue?")) {
+                const res = await fetch('/api/stats/collect', { method: 'POST' });
+                if (res.status === 409) {
+                    alert("A benchmark is already running in the background!");
+                } else {
+                    // Instantly update the UI without waiting for the next 2-second poll
+                    checkStatus(); 
+                }
+            }
+        }
+
+        // Call checkStatus immediately on load alongside the dashboard
+        window.onload = () => {
+            loadDashboard();
+            checkStatus();
+        };
     </script>
 </body>
 </html>
