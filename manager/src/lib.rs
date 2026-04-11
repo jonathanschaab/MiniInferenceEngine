@@ -282,6 +282,10 @@ pub async fn run_batcher_loop(
             drop(active_tokenizer.take()); 
             drop(_active_file.take()); 
 
+            // wipe the ID and config so a failed load doesn't leave a poison state
+            active_model_id.clear();
+            active_model_config = None;
+
             let load_start = Instant::now();
 
             let (m, t, f) = match load_engine(&request.chat_model_id, &device) {

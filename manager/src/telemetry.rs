@@ -62,11 +62,15 @@ impl TelemetryStore {
     pub fn record_load(&mut self, model_id: String, load_time_ms: u128) {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         self.loads.push(LoadMetric { timestamp, model_id, load_time_ms });
-        
+
         self.unsaved_events += 1;
         if self.unsaved_events >= 5 {
             self.save_to_disk();
             self.unsaved_events = 0;
+        }
+
+        if self.loads.len() > 1000 {
+            self.loads.drain(0..200);
         }
     }
 
@@ -78,6 +82,10 @@ impl TelemetryStore {
         if self.unsaved_events >= 5 {
             self.save_to_disk();
             self.unsaved_events = 0;
+        }
+
+        if self.generations.len() > 1000 {
+            self.generations.drain(0..200); // Remove the oldest 200 records
         }
     }
 }

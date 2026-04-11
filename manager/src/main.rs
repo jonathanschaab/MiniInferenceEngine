@@ -213,14 +213,20 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>, Json(payload): Js
                             counter += 1;
                         }
                         
-                        let final_encoding = tokenizer.encode(synthetic_data, true).unwrap();
-                        
-                        let safe_size = size.min(final_encoding.get_ids().len());
-                        let exact_slice = &final_encoding.get_ids()[0..safe_size];
-                        
-                        final_content = tokenizer.decode(exact_slice, true).unwrap();
-                        should_save = true;
-                        println!("✅ Successfully synthesized exactly {} unique tokens.", safe_size);
+                        if let Ok(final_encoding) = tokenizer.encode(synthetic_data, true) {
+                            let safe_size = size.min(final_encoding.get_ids().len());
+                            let exact_slice = &final_encoding.get_ids()[0..safe_size];
+                            
+                            if let Ok(decoded) = tokenizer.decode(exact_slice, true) {
+                                final_content = decoded;
+                                should_save = true;
+                                println!("✅ Successfully synthesized exactly {} unique tokens.", safe_size);
+                            } else {
+                                println!("⚠️ Decode failed. Falling back to padding.");
+                            }
+                        } else {
+                            println!("⚠️ Encode failed. Falling back to padding.");
+                        }
                     }
                 }
 
