@@ -25,6 +25,7 @@ pub struct AppConfig {
     pub oauth_redirect_uri: String,
     pub admin_emails: Vec<String>,
     pub user_emails: Vec<String>,
+    pub secure_cookies: bool,
 }
 
 impl Default for AppConfig {
@@ -34,6 +35,7 @@ impl Default for AppConfig {
             oauth_redirect_uri: "http://localhost:3000/auth/google/callback".to_string(),
             admin_emails: vec![],
             user_emails: vec![],
+            secure_cookies: true,
         }
     }
 }
@@ -437,7 +439,8 @@ async fn main() {
     // Setup Session Layer
     let session_store = MemoryStore::default();
     let session_layer = SessionManagerLayer::new(session_store)
-        .with_secure(false); // Set to true if using HTTPS in prod
+        .with_secure(config.secure_cookies)
+        .with_same_site(tower_sessions::cookie::SameSite::Lax);
 
     // WEB & SETTINGS ROUTES
     // These handle their own session logic and redirects, so we don't apply the strict middleware here.

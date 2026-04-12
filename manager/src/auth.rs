@@ -91,7 +91,7 @@ impl AuthStore {
     }
 
     pub fn save(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(&self.api_keys) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
             let _ = fs::write("api_keys.json", json);
         }
     }
@@ -134,16 +134,26 @@ pub fn build_oauth_client(redirect_uri: &str) -> BasicClient {
 
 // --- LOGIN ROUTES ---
 
-pub async fn login_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let (auth_url, _csrf_token) = state.oauth_client
+pub async fn login_handler(
+    session: Session,
+    State(state): State<Arc<AppState>>
+) -> Result<Redirect, StatusCode> {
+    let (auth_url, csrf_token) = state.oauth_client
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new("email".to_string()))
         .url();
-    Redirect::to(auth_url.as_str())
+
+    session.insert("oauth_csrf_state", csrf_token.secret().clone())
+        .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Redirect::to(auth_url.as_str()))
 }
 
 #[derive(Deserialize)]
-pub struct AuthRequest { code: String }
+pub struct AuthRequest {
+    pub code: String,
+    pub state: String,
+}
 
 #[derive(Deserialize)]
 pub struct GoogleUser { email: String }
@@ -154,6 +164,13 @@ pub async fn callback_handler(
     Query(query): Query<AuthRequest>,
 ) -> Result<Response, StatusCode> { 
     
+    let saved_state: Option<String> = session.get("oauth_csrf_state")
+        .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    if saved_state.is_none() || saved_state.unwrap() != query.state {
+        return Err(StatusCode::BAD_REQUEST); // CSRF Attack Detected!
+    }
+
     // map network errors to HTTP status codes
     let token = state.oauth_client.exchange_code(AuthorizationCode::new(query.code))
         .request_async(async_http_client)
@@ -178,9 +195,9 @@ pub async fn callback_handler(
     Ok(Redirect::to("/").into_response())
 }
 
-pub async fn logout_handler(session: Session) -> impl IntoResponse {
-    session.delete().await.unwrap();
-    Redirect::to("/auth/login")
+pub async fn logout_handler(session: Session) -> Result<Redirect, StatusCode> {
+    session.delete().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Redirect::to("/auth/login"))
 }
 
 // --- SETTINGS PAGE APIs (Requires Session) ---
@@ -251,12 +268,14 @@ pub async fn dual_auth_middleware(
     else if let Some(auth_header) = request.headers().get("Authorization").and_then(|h| h.to_str().ok()) {
         if auth_header.starts_with("Bearer ") {
             let token = auth_header.trim_start_matches("Bearer ").trim();
-            let hash = hex::encode(Sha256::digest(token.as_bytes()));
+            if !token.is_empty() {
+                let hash = hex::encode(Sha256::digest(token.as_bytes()));
 
-            let store = state.auth_store.lock().unwrap();
-            if let Some(email) = store.key_index.get(&hash) {
-                let is_admin = state.config.admin_emails.contains(email);
-                current_user = Some(CurrentUser { email: email.clone(), is_admin });
+                let store = state.auth_store.lock().unwrap();
+                if let Some(email) = store.key_index.get(&hash) {
+                    let is_admin = state.config.admin_emails.contains(email);
+                    current_user = Some(CurrentUser { email: email.clone(), is_admin });
+                }
             }
         }
     }
