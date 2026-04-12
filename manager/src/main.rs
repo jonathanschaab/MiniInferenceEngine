@@ -1,29 +1,36 @@
 use axum::{
     extract::State,
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Redirect},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, delete},
     Json, Router,
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
+use tower_sessions::{MemoryStore, SessionManagerLayer};
+use auth::{AuthStore, require_session};
 
 use manager::{
     get_model_registry, run_batcher_loop, ApiRequest, ApiResponse, ModelConfig, UserRequest, EngineStatus, lock_status, TelemetryStore, Message, ModelRole, BenchmarkRequest
 };
+
+pub mod auth;
 
 // State to share the transmitter queue across web requests
 pub struct AppState {
     pub queue_tx: mpsc::Sender<UserRequest>,
     pub engine_status: Arc<Mutex<EngineStatus>>,
     pub telemetry: Arc<Mutex<TelemetryStore>>,
+    pub auth_store: Arc<Mutex<AuthStore>>,
 }
 
-// Route 1: Serve the HTML UI
-async fn serve_ui() -> Html<&'static str> {
-    Html(include_str!("../index.html"))
+async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok(Html(include_str!("../index.html")))
 }
 
 // Send the model roster to the Javascript dropdowns
@@ -108,13 +115,27 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>, Json(payload): Js
         // --- GENERATE REALISTIC PROMPTS ---
         println!("🌱 Verifying benchmark prompt files...");
 
-        let hf_api = Api::new().expect("Failed to initialize Hugging Face API");
+        let tokenizer_result = tokio::task::spawn_blocking(|| {
+            let api = Api::new().map_err(|e| format!("API Init Error: {}", e))?;
+            let path = api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string())
+                .get("tokenizer.json")
+                .map_err(|e| format!("Tokenizer Download Error: {}", e))?;
+            
+            Tokenizer::from_file(path).map_err(|e| format!("Tokenizer Parse Error: {}", e))
+        }).await;
         
-        // FIX 1: Hoist the Tokenizer initialization outside the loop!
         let mut qwen_tokenizer = None;
-        if let Ok(tokenizer_path) = hf_api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string()).get("tokenizer.json") {
-            if let Ok(tokenizer) = Tokenizer::from_file(tokenizer_path) {
+        
+        match tokenizer_result {
+            Ok(Ok(tokenizer)) => {
                 qwen_tokenizer = Some(tokenizer);
+            }
+            Ok(Err(e)) => {
+                println!("⚠️ Tokenizer initialization failed: {}. Falling back to padding.", e);
+            }
+            Err(e) => {
+                // If the spawn_blocking task actually panics, it is caught here as a JoinError
+                println!("⚠️ Thread execution failed: {}. Falling back to padding.", e);
             }
         }
         
@@ -308,6 +329,13 @@ async fn serve_stats_ui() -> Html<&'static str> {
     Html(include_str!("../stats.html"))
 }
 
+async fn serve_settings_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok(Html(include_str!("../settings.html")))
+}
+
 // Route: Serve the Telemetry JSON
 async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetryStore> {
     let current_data = state.telemetry.lock().unwrap().clone();
@@ -342,22 +370,51 @@ async fn main() {
         run_batcher_loop(rx, status_for_batcher, telemetry_for_batcher).await;
     });
 
+    let auth_store = Arc::new(Mutex::new(AuthStore::load()));
+
     let shared_state = Arc::new(AppState { 
         queue_tx: tx,
         engine_status,
         telemetry: telemetry.clone(),
+        auth_store,
     });
 
-    // Build the Axum web server routes
-    let app = Router::new()
+    // Setup Session Layer
+    let session_store = MemoryStore::default();
+    let session_layer = SessionManagerLayer::new(session_store)
+        .with_secure(false); // Set to true if using HTTPS in prod
+
+    // WEB & SETTINGS ROUTES
+    // These handle their own session logic and redirects, so we don't apply the strict middleware here.
+    let web_routes = Router::new()
+        // Public OAuth
+        .route("/auth/login", get(auth::login_handler))
+        .route("/auth/google/callback", get(auth::callback_handler))
+        .route("/auth/logout", get(auth::logout_handler))
+        // Protected UIs (They redirect if session is missing)
         .route("/", get(serve_ui))
-        .route("/api/models", get(get_models))
-        .route("/api/generate", post(handle_generate))
-        .route("/api/status", get(get_status))
-        .route("/api/stats/collect", post(trigger_benchmark))
-        .route("/api/stats/data", get(get_stats_data))
+        .route("/settings", get(serve_settings_ui)) 
         .route("/stats", get(serve_stats_ui))
-        .with_state(shared_state);
+        // Settings APIs (They check session manually)
+        .route("/api/settings/keys", get(auth::list_keys_handler).post(auth::create_key_handler))
+        .route("/api/settings/keys/:hash", delete(auth::delete_key_handler));
+
+    // ENGINE API ROUTES
+    // These get wrapped in our strict Dual-Auth Middleware layer.
+    let engine_api_routes = Router::new()
+        .route("/api/generate", post(handle_generate))
+        .route("/api/stats/collect", post(trigger_benchmark))
+        .route("/api/models", get(get_models))
+        .route("/api/status", get(get_status))
+        .route("/api/stats/data", get(get_stats_data))
+        .route_layer(axum::middleware::from_fn_with_state(shared_state.clone(), auth::dual_auth_middleware));
+
+    // MERGE & MOUNT
+    // Combine them, inject the shared state, and apply the session layer globally
+    let app = web_routes
+        .merge(engine_api_routes)
+        .with_state(shared_state)
+        .layer(session_layer);
 
     // Start listening on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();

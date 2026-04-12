@@ -69,8 +69,8 @@ impl TelemetryStore {
             self.unsaved_events = 0;
         }
 
-        if self.loads.len() > 1000 {
-            self.loads.drain(0..200);
+        if self.loads.len() > 100 {
+            self.loads.drain(0..20);
         }
     }
 
@@ -84,8 +84,8 @@ impl TelemetryStore {
             self.unsaved_events = 0;
         }
 
-        if self.generations.len() > 1000 {
-            self.generations.drain(0..200); // Remove the oldest 200 records
+        if self.generations.len() > 100 {
+            self.generations.drain(0..20); // Remove the oldest 20 records
         }
     }
 }
