@@ -1,6 +1,7 @@
 use axum::{
-    extract::{Path, Query, Request, State},
-    http::StatusCode,
+    async_trait,
+    extract::{Path, Query, Request, State, FromRequestParts},
+    http::{StatusCode, request::Parts},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
     Json,
@@ -17,6 +18,26 @@ use std::{collections::HashMap, fs, sync::Arc};
 use tower_sessions::Session;
 use crate::AppState;
 
+#[derive(Clone, Debug)]
+pub struct CurrentUser {
+    pub email: String,
+    pub is_admin: bool,
+}
+
+#[async_trait]
+impl<S> FromRequestParts<S> for CurrentUser
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts.extensions.get::<CurrentUser>()
+            .cloned()
+            .ok_or((StatusCode::UNAUTHORIZED, "Unauthorized: Identity missing."))
+    }
+}
+
 // --- STATE MANAGEMENT ---
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -28,49 +49,51 @@ pub struct ApiKeyRecord {
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct AuthStore {
-    pub allowed_emails: Vec<String>,
     pub api_keys: HashMap<String, Vec<ApiKeyRecord>>, 
+    #[serde(skip)] 
+    pub key_index: HashMap<String, String>,
 }
 
 impl AuthStore {
     pub fn load() -> Self {
-        let allowed = fs::read_to_string("allowed_emails.txt")
-            .unwrap_or_default()
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
         let mut store = if let Ok(data) = fs::read_to_string("api_keys.json") {
             serde_json::from_str(&data).unwrap_or_default()
         } else {
-            AuthStore { allowed_emails: Vec::new(), api_keys: HashMap::new() }
+            // FIXED: Removed allowed_emails from here
+            AuthStore { api_keys: HashMap::new(), key_index: HashMap::new() } 
         };
-        store.allowed_emails = allowed;
+        
+        // Build the O(1) index on startup
+        for (email, records) in &store.api_keys {
+            for record in records {
+                store.key_index.insert(record.hash.clone(), email.clone());
+            }
+        }
         store
+    }
+
+    pub fn generate_key(&mut self, email: &str, name: String, description: Option<String>) -> String {
+        let mut key_bytes = [0u8; 32];
+        thread_rng().fill_bytes(&mut key_bytes);
+        
+        let plaintext_key = format!("sk-{}", STANDARD.encode(key_bytes));
+        let hash = hex::encode(Sha256::digest(plaintext_key.as_bytes()));
+        
+        self.api_keys.entry(email.to_string()).or_default().push(ApiKeyRecord {
+            name, description, hash: hash.clone(),
+        });
+        
+        // Add to O(1) index
+        self.key_index.insert(hash, email.to_string());
+        self.save();
+        
+        plaintext_key
     }
 
     pub fn save(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&self.api_keys) {
             let _ = fs::write("api_keys.json", json);
         }
-    }
-
-    pub fn generate_key(&mut self, email: &str, name: String, description: Option<String>) -> String {
-        let mut key_bytes = [0u8; 32];
-        thread_rng().fill_bytes(&mut key_bytes); // <-- Fixed random generator
-        
-        let plaintext_key = format!("sk-{}", STANDARD.encode(key_bytes)); // <-- Fixed base64
-        let hash = hex::encode(Sha256::digest(plaintext_key.as_bytes()));
-        
-        self.api_keys.entry(email.to_string()).or_default().push(ApiKeyRecord {
-            name,
-            description,
-            hash,
-        });
-        self.save();
-        
-        plaintext_key
     }
 }
 
@@ -87,7 +110,7 @@ struct GoogleClientSecretWeb {
 
 // --- OAUTH2 CLIENT SETUP ---
 
-pub fn build_oauth_client() -> BasicClient {
+pub fn build_oauth_client(redirect_uri: &str) -> BasicClient {
     // 1. Read the JSON file from the disk
     let file_content = fs::read_to_string("client_secret.apps.googleusercontent.com.json")
         .expect("⚠️ CRITICAL: Could not find client_secret.apps.googleusercontent.com.json in the manager directory!");
@@ -106,14 +129,13 @@ pub fn build_oauth_client() -> BasicClient {
         Some(TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).unwrap()),
     )
     // Make sure this matches your Nginx setup exactly! (e.g., https://ai.lan/auth/google/callback)
-    .set_redirect_uri(RedirectUrl::new("http://localhost:3000/auth/google/callback".to_string()).unwrap())
+    .set_redirect_uri(RedirectUrl::new(redirect_uri.to_string()).unwrap())
 }
 
 // --- LOGIN ROUTES ---
 
-pub async fn login_handler() -> impl IntoResponse {
-    let client = build_oauth_client();
-    let (auth_url, _csrf_token) = client
+pub async fn login_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (auth_url, _csrf_token) = state.oauth_client
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new("email".to_string()))
         .url();
@@ -130,32 +152,30 @@ pub async fn callback_handler(
     session: Session,
     State(state): State<Arc<AppState>>,
     Query(query): Query<AuthRequest>,
-) -> impl IntoResponse {
-    let client = build_oauth_client();
-    let token = match client.exchange_code(AuthorizationCode::new(query.code)).request_async(async_http_client).await {
-        Ok(t) => t,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "Failed to exchange token").into_response(),
-    };
+) -> Result<Response, StatusCode> { 
+    
+    // map network errors to HTTP status codes
+    let token = state.oauth_client.exchange_code(AuthorizationCode::new(query.code))
+        .request_async(async_http_client)
+        .await
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    let req_client = reqwest::Client::new();
-    let user_data = req_client
+    // Use the pooled Reqwest client from AppState
+    let user_data = state.reqwest_client
         .get("https://www.googleapis.com/oauth2/v2/userinfo")
         .bearer_auth(token.access_token().secret())
-        .send().await.unwrap()
-        .json::<GoogleUser>().await.unwrap();
+        .send().await.map_err(|_| StatusCode::BAD_GATEWAY)?
+        .json::<GoogleUser>().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    // Scope the lock so it drops BEFORE the `.await` point below
-    let is_allowed = {
-        let store = state.auth_store.lock().unwrap();
-        store.allowed_emails.contains(&user_data.email)
-    };
+    let is_admin = state.config.admin_emails.contains(&user_data.email);
+    let is_user = state.config.user_emails.contains(&user_data.email);
 
-    if !is_allowed {
-        return (StatusCode::FORBIDDEN, "Email not on allowed list.").into_response();
+    if !is_admin && !is_user {
+        return Ok((StatusCode::FORBIDDEN, "Email not registered in config.json").into_response());
     }
 
-    session.insert("user_email", user_data.email).await.unwrap();
-    Redirect::to("/").into_response()
+    session.insert("user_email", user_data.email).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Redirect::to("/").into_response())
 }
 
 pub async fn logout_handler(session: Session) -> impl IntoResponse {
@@ -205,9 +225,10 @@ pub async fn delete_key_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
     let email = require_session(session).await?;
-    let mut store = state.auth_store.lock().unwrap();
+    let mut store = state.auth_store.lock().unwrap(); 
     if let Some(keys) = store.api_keys.get_mut(&email) {
-        keys.retain(|k| k.hash != hash); // <-- Check the struct's hash field
+        keys.retain(|k| k.hash != hash);
+        store.key_index.remove(&hash); // Keep O(1) cache in sync
         store.save();
     }
     Ok(StatusCode::OK)
@@ -218,36 +239,31 @@ pub async fn delete_key_handler(
 pub async fn dual_auth_middleware(
     session: Session,
     State(state): State<Arc<AppState>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    // Try internal UI authentication first (Session Cookie)
-    if session.get::<String>("user_email").await.unwrap_or(None).is_some() {
-        return next.run(request).await;
-    }
+    let mut current_user: Option<CurrentUser> = None;
 
-    let mut is_authorized = false;
-
-    // Fallback to external API authentication (Bearer Token)
-    if let Some(auth_header) = request.headers().get("Authorization").and_then(|h| h.to_str().ok()) {
+    if let Ok(Some(email)) = session.get::<String>("user_email").await {
+        let is_admin = state.config.admin_emails.contains(&email);
+        current_user = Some(CurrentUser { email, is_admin });
+    } 
+    else if let Some(auth_header) = request.headers().get("Authorization").and_then(|h| h.to_str().ok()) {
         if auth_header.starts_with("Bearer ") {
             let token = auth_header.trim_start_matches("Bearer ").trim();
-            // Hash the incoming token to compare against our secure storage
             let hash = hex::encode(Sha256::digest(token.as_bytes()));
 
-            {
-                let store = state.auth_store.lock().unwrap();
-                for keys in store.api_keys.values() {
-                    if keys.iter().any(|k| k.hash == hash) {
-                        is_authorized = true;
-                        break;
-                    }
-                }
-            } // Lock is safely dropped here
+            let store = state.auth_store.lock().unwrap();
+            if let Some(email) = store.key_index.get(&hash) {
+                let is_admin = state.config.admin_emails.contains(email);
+                current_user = Some(CurrentUser { email: email.clone(), is_admin });
+            }
         }
     }
     
-    if is_authorized {
+    // Inject the identity or fail!
+    if let Some(user) = current_user {
+        request.extensions_mut().insert(user);
         next.run(request).await
     } else {
         StatusCode::UNAUTHORIZED.into_response()

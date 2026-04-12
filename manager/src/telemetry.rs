@@ -60,7 +60,7 @@ impl TelemetryStore {
     }
 
     pub fn record_load(&mut self, model_id: String, load_time_ms: u128) {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         self.loads.push(LoadMetric { timestamp, model_id, load_time_ms });
 
         self.unsaved_events += 1;
@@ -75,7 +75,7 @@ impl TelemetryStore {
     }
 
     pub fn record_generation(&mut self, model_id: String, prompt_chars: usize, prompt_tokens: usize, generation_time_ms: u128) {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         self.generations.push(GenerationMetric { timestamp, model_id, prompt_chars, prompt_tokens, generation_time_ms });
         
         self.unsaved_events += 1;

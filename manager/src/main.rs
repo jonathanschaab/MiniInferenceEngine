@@ -11,10 +11,44 @@ use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 use tower_sessions::{MemoryStore, SessionManagerLayer};
 use auth::{AuthStore, require_session};
+use serde::{Deserialize, Serialize};
+use oauth2::basic::BasicClient; // Ensure this is imported for AppState
 
 use manager::{
     get_model_registry, run_batcher_loop, ApiRequest, ApiResponse, ModelConfig, UserRequest, EngineStatus, lock_status, TelemetryStore, Message, ModelRole, BenchmarkRequest
 };
+
+// --- CONFIGURATION ---
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AppConfig {
+    pub bind_address: String,
+    pub oauth_redirect_uri: String,
+    pub admin_emails: Vec<String>,
+    pub user_emails: Vec<String>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: "127.0.0.1:3000".to_string(), // Secure local default
+            oauth_redirect_uri: "http://localhost:3000/auth/google/callback".to_string(),
+            admin_emails: vec![],
+            user_emails: vec![],
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn load() -> Self {
+        if let Ok(data) = std::fs::read_to_string("config.json") {
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            let config = Self::default();
+            let _ = std::fs::write("config.json", serde_json::to_string_pretty(&config).unwrap());
+            config
+        }
+    }
+}
 
 pub mod auth;
 
@@ -24,6 +58,9 @@ pub struct AppState {
     pub engine_status: Arc<Mutex<EngineStatus>>,
     pub telemetry: Arc<Mutex<TelemetryStore>>,
     pub auth_store: Arc<Mutex<AuthStore>>,
+    pub reqwest_client: reqwest::Client,
+    pub oauth_client: BasicClient,
+    pub config: Arc<AppConfig>,
 }
 
 async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
@@ -70,12 +107,22 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
 }
 
 // The Automated Benchmark Trigger
-async fn trigger_benchmark(State(state): State<Arc<AppState>>, Json(payload): Json<BenchmarkRequest>) -> impl IntoResponse {
+async fn trigger_benchmark(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Json(payload): Json<BenchmarkRequest>
+) -> impl IntoResponse {
+
+    if !user.is_admin {
+        println!("⚠️ Benchmark trigger rejected for non-admin: {}", user.email);
+        return (StatusCode::FORBIDDEN, "Only administrators can run the benchmark suite.").into_response();
+    }
+    
     // Check if a benchmark is already running
     {
         let mut status = lock_status(&state.engine_status);
         if status.benchmark_running {
-            return (StatusCode::CONFLICT, "Benchmark suite is already running.");
+            return (StatusCode::CONFLICT, "Benchmark suite is already running.").into_response();
         }
         // Lock it!
         status.benchmark_running = true;
@@ -321,7 +368,7 @@ async fn trigger_benchmark(State(state): State<Arc<AppState>>, Json(payload): Js
         }
     });
 
-    (StatusCode::ACCEPTED, "Benchmark sweep started in the background.")
+    (StatusCode::ACCEPTED, "Benchmark sweep started in the background.").into_response()
 }
 
 // Route: Serve the Stats UI
@@ -347,7 +394,7 @@ async fn main() {
     // Create the async channel for the GPU queue
     let (tx, rx) = mpsc::channel(32);
 
-    // 2. Initialize the shared state BEFORE spawning the background thread
+    // Initialize the shared state BEFORE spawning the background thread
     let engine_status = Arc::new(Mutex::new(EngineStatus::default()));
     let status_for_batcher = engine_status.clone();
 
@@ -370,13 +417,21 @@ async fn main() {
         run_batcher_loop(rx, status_for_batcher, telemetry_for_batcher).await;
     });
 
+    let config = AppConfig::load();
     let auth_store = Arc::new(Mutex::new(AuthStore::load()));
+
+    // Initialize global pooled clients once!
+    let reqwest_client = reqwest::Client::new();
+    let oauth_client = auth::build_oauth_client(&config.oauth_redirect_uri);
 
     let shared_state = Arc::new(AppState { 
         queue_tx: tx,
         engine_status,
-        telemetry: telemetry.clone(),
+        telemetry: telemetry,
         auth_store,
+        reqwest_client,
+        oauth_client,
+        config: Arc::new(config.clone()),
     });
 
     // Setup Session Layer
@@ -417,7 +472,7 @@ async fn main() {
         .layer(session_layer);
 
     // Start listening on port 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("🚀 Server running on http://0.0.0.0:3000");
+    let listener = tokio::net::TcpListener::bind(&config.bind_address).await.unwrap();
+    println!("🚀 Server safely listening on {}", config.bind_address);
     axum::serve(listener, app).await.unwrap();
 }

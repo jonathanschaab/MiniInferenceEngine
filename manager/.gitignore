@@ -1,6 +1,6 @@
-target
 benchmark_prompts
-allowed_emails.txt
+target
 api_keys.json
-stats.json
 client_secret.apps.googleusercontent.com.json
+config.json
+stats.json
