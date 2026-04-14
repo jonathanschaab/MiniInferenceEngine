@@ -15,6 +15,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, sync::Arc};
+use tokio::sync::mpsc::UnboundedSender;
 use tower_sessions::Session;
 use crate::AppState;
 
@@ -52,15 +53,29 @@ pub struct AuthStore {
     pub api_keys: HashMap<String, Vec<ApiKeyRecord>>, 
     #[serde(skip)] 
     pub key_index: HashMap<String, String>,
+    #[serde(skip)]
+    pub writer_tx: Option<UnboundedSender<String>>,
 }
 
 impl AuthStore {
     pub fn load() -> Self {
         let mut store = if let Ok(data) = fs::read_to_string("api_keys.json") {
-            serde_json::from_str(&data).unwrap_or_default()
+            match serde_json::from_str(&data) {
+                Ok(s) => s,
+                Err(e) => {
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let backup_name = format!("api_keys_{}.json.bak", timestamp);
+                    eprintln!("⚠️ CRITICAL: api_keys.json is corrupted! Error: {}", e);
+                    eprintln!("⚠️ Backing up corrupted file to {} to prevent data loss.", backup_name);
+                    let _ = fs::rename("api_keys.json", backup_name);
+                    AuthStore { api_keys: HashMap::new(), key_index: HashMap::new(), writer_tx: None }
+                }
+            }
         } else {
-            // FIXED: Removed allowed_emails from here
-            AuthStore { api_keys: HashMap::new(), key_index: HashMap::new() } 
+            AuthStore { api_keys: HashMap::new(), key_index: HashMap::new(), writer_tx: None } 
         };
         
         // Build the O(1) index on startup
@@ -92,7 +107,11 @@ impl AuthStore {
 
     pub fn save(&self) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write("api_keys.json", json);
+            if let Some(tx) = &self.writer_tx {
+                let _ = tx.send(json);
+            } else {
+                eprintln!("⚠️ [AUTH FAULT] Writer channel missing! Dropping api_keys.json write.");
+            }
         }
     }
 }
@@ -220,7 +239,7 @@ pub async fn list_keys_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ApiKeyRecord>>, StatusCode> {
     let email = require_session(session).await?;
-    let store = state.auth_store.lock().unwrap();
+    let store = state.auth_store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let keys = store.api_keys.get(&email).cloned().unwrap_or_default();
     Ok(Json(keys))
 }
@@ -231,7 +250,7 @@ pub async fn create_key_handler(
     Json(payload): Json<CreateKeyRequest>, 
 ) -> Result<Json<String>, StatusCode> {
     let email = require_session(session).await?;
-    let mut store = state.auth_store.lock().unwrap(); 
+    let mut store = state.auth_store.lock().unwrap_or_else(|poisoned| poisoned.into_inner()); 
     let new_key = store.generate_key(&email, payload.name, payload.description);
     Ok(Json(new_key))
 }
@@ -242,7 +261,7 @@ pub async fn delete_key_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
     let email = require_session(session).await?;
-    let mut store = state.auth_store.lock().unwrap(); 
+    let mut store = state.auth_store.lock().unwrap_or_else(|poisoned| poisoned.into_inner()); 
     if let Some(keys) = store.api_keys.get_mut(&email) {
         keys.retain(|k| k.hash != hash);
         store.key_index.remove(&hash); // Keep O(1) cache in sync
@@ -265,17 +284,15 @@ pub async fn dual_auth_middleware(
         let is_admin = state.config.admin_emails.contains(&email);
         current_user = Some(CurrentUser { email, is_admin });
     } 
-    else if let Some(auth_header) = request.headers().get("Authorization").and_then(|h| h.to_str().ok()) {
-        if auth_header.starts_with("Bearer ") {
-            let token = auth_header.trim_start_matches("Bearer ").trim();
-            if !token.is_empty() {
-                let hash = hex::encode(Sha256::digest(token.as_bytes()));
+    else if let Some(auth_header) = request.headers().get("Authorization").and_then(|h| h.to_str().ok()) && auth_header.starts_with("Bearer ") {
+        let token = auth_header.trim_start_matches("Bearer ").trim();
+        if !token.is_empty() {
+            let hash = hex::encode(Sha256::digest(token.as_bytes()));
 
-                let store = state.auth_store.lock().unwrap();
-                if let Some(email) = store.key_index.get(&hash) {
-                    let is_admin = state.config.admin_emails.contains(email);
-                    current_user = Some(CurrentUser { email: email.clone(), is_admin });
-                }
+            let store = state.auth_store.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(email) = store.key_index.get(&hash) {
+                let is_admin = state.config.admin_emails.contains(email);
+                current_user = Some(CurrentUser { email: email.clone(), is_admin });
             }
         }
     }

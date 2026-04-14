@@ -19,7 +19,7 @@ pub struct GenerationMetric {
     pub generation_time_ms: u128,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TelemetryStore {
     pub loads: Vec<LoadMetric>,
     pub generations: Vec<GenerationMetric>,
@@ -27,12 +27,6 @@ pub struct TelemetryStore {
     pub unsaved_events: usize,
     #[serde(skip)]
     pub writer_tx: Option<UnboundedSender<String>>,
-}
-
-impl Default for TelemetryStore {
-    fn default() -> Self {
-        Self { loads: Vec::new(), generations: Vec::new(), unsaved_events: 0, writer_tx: None }
-    }
 }
 
 impl TelemetryStore {

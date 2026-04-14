@@ -493,12 +493,10 @@ pub async fn run_batcher_loop(
 
             drop(comp_t); drop(_comp_f); drop(comp_m);
 
-            if let Some((used_end, total, _)) = get_vram_info(0) {
-                if (used_end as f32 / total as f32) > 0.85 {
-                    println!("🧹 Threshold met. Syncing hardware...");
-                    if let Err(e) = device.synchronize() {
-                        println!("⚠️ Warning: Hardware VRAM sync failed: {}", e);
-                    }
+            if let Some((used_end, total, _)) = get_vram_info(0) && (used_end as f32 / total as f32) > 0.85 {
+                println!("🧹 Threshold met. Syncing hardware...");
+                if let Err(e) = device.synchronize() {
+                    println!("⚠️ Warning: Hardware VRAM sync failed: {}", e);
                 }
             }
             

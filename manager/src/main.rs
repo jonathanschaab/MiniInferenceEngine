@@ -159,7 +159,12 @@ async fn trigger_benchmark(
             return;
         }
 
-        let _ = tokio::fs::create_dir_all("benchmark_prompts").await;
+        if let Err(e) = tokio::fs::create_dir_all("benchmark_prompts").await {
+            println!("⚠️ Benchmark aborted: Failed to create prompt directory: {}", e);
+            let mut status = lock_status(&engine_status);
+            status.benchmark_running = false;
+            return;
+        }
 
         // --- GENERATE REALISTIC PROMPTS ---
         println!("🌱 Verifying benchmark prompt files...");
@@ -224,22 +229,20 @@ async fn trigger_benchmark(
                         force_compression: false,
                     }).await;
 
-                    if let Ok(generated_seed) = seed_rx.await {
-                        if !generated_seed.starts_with("Server Error") {
-                            if let Some(tokenizer) = &qwen_tokenizer {
-                                if let Ok(encoding) = tokenizer.encode(generated_seed.clone(), true) {
-                                    let token_len = encoding.get_ids().len();
-                                    let margin = (size as f32 * 0.35) as usize;
-                                    
-                                    if token_len >= size.saturating_sub(margin) && token_len <= size + margin {
-                                        final_content = generated_seed;
-                                        should_save = true;
-                                        println!("✅ Generated {} tokens (within 35% of {}). Saving.", token_len, size);
-                                    } else {
-                                        println!("⚠️ Generation missed margin: {} tokens (target {}).", token_len, size);
-                                    }
-                                }
-                            }
+                    if let Ok(generated_seed) = seed_rx.await 
+                        && !generated_seed.starts_with("Server Error") 
+                        && let Some(tokenizer) = &qwen_tokenizer 
+                        && let Ok(encoding) = tokenizer.encode(generated_seed.clone(), true) 
+                    {
+                        let token_len = encoding.get_ids().len();
+                        let margin = (size as f32 * 0.35) as usize;
+                        
+                        if token_len >= size.saturating_sub(margin) && token_len <= size + margin {
+                            final_content = generated_seed;
+                            should_save = true;
+                            println!("✅ Generated {} tokens (within 35% of {}). Saving.", token_len, size);
+                        } else {
+                            println!("⚠️ Generation missed margin: {} tokens (target {}).", token_len, size);
                         }
                     }
                 } else {
@@ -275,9 +278,11 @@ async fn trigger_benchmark(
                             chunk_buffer.push_str(&log_line);
                             
                             if counter % 50 == 0 {
-                                if let Ok(enc) = tokenizer.encode(chunk_buffer.as_str(), false) {
-                                    current_tokens += enc.get_ids().len();
-                                }
+                                let new_tokens = tokenizer.encode(chunk_buffer.as_str(), false)
+                                    .map(|enc| enc.get_ids().len())
+                                    .unwrap_or(0);
+                                
+                                current_tokens += if new_tokens > 0 { new_tokens } else { (chunk_buffer.len() / 4).max(1) };
                                 chunk_buffer.clear(); 
                             }
                             counter += 1;
@@ -387,7 +392,7 @@ async fn serve_settings_ui(session: tower_sessions::Session) -> Result<Html<&'st
 
 // Route: Serve the Telemetry JSON
 async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetryStore> {
-    let current_data = state.telemetry.lock().unwrap().clone();
+    let current_data = state.telemetry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
     Json(current_data)
 }
 
@@ -420,7 +425,21 @@ async fn main() {
     });
 
     let config = AppConfig::load();
-    let auth_store = Arc::new(Mutex::new(AuthStore::load()));
+    
+    let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        // This loop processes writes one-at-a-time, enforcing strict order and atomic replacement
+        while let Some(json) = auth_rx.recv().await {
+            let temp_file = "api_keys.json.tmp";
+            if tokio::fs::write(temp_file, &json).await.is_ok() {
+                let _ = tokio::fs::rename(temp_file, "api_keys.json").await;
+            }
+        }
+    });
+
+    let mut store = AuthStore::load();
+    store.writer_tx = Some(auth_tx);
+    let auth_store = Arc::new(Mutex::new(store));
 
     // Initialize global pooled clients once!
     let reqwest_client = reqwest::Client::new();
@@ -429,7 +448,7 @@ async fn main() {
     let shared_state = Arc::new(AppState { 
         queue_tx: tx,
         engine_status,
-        telemetry: telemetry,
+        telemetry,
         auth_store,
         reqwest_client,
         oauth_client,
