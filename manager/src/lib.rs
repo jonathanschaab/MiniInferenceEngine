@@ -20,8 +20,8 @@ pub use telemetry::*;
 pub use types::*;
 pub use registry::*;
 
-pub fn get_vram_info(device_index: u32) -> Option<(u64, u64, u64)> {
-    let nvml = Nvml::init().ok()?;
+pub fn get_vram_info(nvml: Option<&Nvml>, device_index: u32) -> Option<(u64, u64, u64)> {
+    let nvml = nvml?;
     let device = nvml.device_by_index(device_index).ok()?;
     let info = device.memory_info().ok()?;
     
@@ -253,6 +253,8 @@ pub async fn run_batcher_loop(
 ) {
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
     
+    let nvml = Nvml::init().ok();
+
     let mut active_model_id = String::new();
     let mut active_model: Option<DynamicModel> = None;
     let mut active_tokenizer: Option<Tokenizer> = None;
@@ -347,7 +349,7 @@ pub async fn run_batcher_loop(
         };
         let bytes_per_token = estimate_bytes_per_token(&config.arch, config.parameters_billions);
 
-        if let Some((_, _, free_vram)) = get_vram_info(0) {
+        if let Some((_, _, free_vram)) = get_vram_info(nvml.as_ref(), 0) {
             let safe_free_vram = free_vram.saturating_sub(500 * 1024 * 1024); 
             let absolute_max_tokens = (safe_free_vram as usize / bytes_per_token).min(active_max_context);
             
@@ -356,30 +358,30 @@ pub async fn run_batcher_loop(
             if token_count > absolute_max_tokens {
                 println!("⚠️ WARNING: Prompt exceeds physical VRAM limits! Triggering dynamic compression.");
                 trigger_compression = true;
-                // FIX 1: Prevent 0-token budgets. Always leave at least 256 tokens.
-                dynamic_target_budget = ((absolute_max_tokens as f32 * 0.80) as usize).max(256); 
+                // Prevent 0-token budgets, but strictly cap at physical VRAM limits to avoid OOM.
+                dynamic_target_budget = ((absolute_max_tokens as f32 * 0.80) as usize).max(256).min(absolute_max_tokens); 
             } else if token_count > (active_max_context as f32 * 0.80) as usize {
                 trigger_compression = true;
-                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize).max(256);
+                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize).max(256).min(absolute_max_tokens);
             } else if request.force_compression {
                 println!("⚠️ Benchmarking: Forcing compression execution.");
                 trigger_compression = true;
-                dynamic_target_budget = ((token_count as f32 * 0.50) as usize).max(256);
+                dynamic_target_budget = ((token_count as f32 * 0.50) as usize).max(256).min(absolute_max_tokens);
             }
         } else {
             // CPU fallback
             if token_count > (active_max_context as f32 * 0.80) as usize {
                 trigger_compression = true;
-                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize).max(256);
+                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize).max(256).min(active_max_context);
             } else if request.force_compression {
                 println!("⚠️ Benchmarking: Forcing compression execution.");
                 trigger_compression = true;
-                dynamic_target_budget = ((token_count as f32 * 0.50) as usize).max(256);
+                dynamic_target_budget = ((token_count as f32 * 0.50) as usize).max(256).min(active_max_context);
             }
         }
 
         if trigger_compression {
-            if let Some((used_start, total, _)) = get_vram_info(0) { 
+            if let Some((used_start, total, _)) = get_vram_info(nvml.as_ref(), 0) { 
                 println!("📊 VRAM before compressor: {:.2}GB / {:.2}GB", 
                     used_start as f32 / 1024.0_f32.powi(3), 
                     total as f32 / 1024.0_f32.powi(3));
@@ -493,7 +495,7 @@ pub async fn run_batcher_loop(
 
             drop(comp_t); drop(_comp_f); drop(comp_m);
 
-            if let Some((used_end, total, _)) = get_vram_info(0) && (used_end as f32 / total as f32) > 0.85 {
+            if let Some((used_end, total, _)) = get_vram_info(nvml.as_ref(), 0) && (used_end as f32 / total as f32) > 0.85 {
                 println!("🧹 Threshold met. Syncing hardware...");
                 if let Err(e) = device.synchronize() {
                     println!("⚠️ Warning: Hardware VRAM sync failed: {}", e);

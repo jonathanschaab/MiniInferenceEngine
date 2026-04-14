@@ -263,9 +263,12 @@ pub async fn delete_key_handler(
     let email = require_session(session).await?;
     let mut store = state.auth_store.lock().unwrap_or_else(|poisoned| poisoned.into_inner()); 
     if let Some(keys) = store.api_keys.get_mut(&email) {
+        let initial_len = keys.len();
         keys.retain(|k| k.hash != hash);
-        store.key_index.remove(&hash); // Keep O(1) cache in sync
-        store.save();
+        if keys.len() < initial_len {
+            store.key_index.remove(&hash); // Keep O(1) cache in sync
+            store.save();
+        }
     }
     Ok(StatusCode::OK)
 }

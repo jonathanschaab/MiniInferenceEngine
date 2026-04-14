@@ -409,7 +409,10 @@ async fn main() {
     tokio::spawn(async move {
         // This loop processes writes one-at-a-time, perfectly preventing race conditions
         while let Some(json) = telemetry_rx.recv().await {
-            let _ = tokio::fs::write("stats.json", json).await;
+            let temp_file = "stats.json.tmp";
+            if tokio::fs::write(temp_file, &json).await.is_ok() {
+                let _ = tokio::fs::rename(temp_file, "stats.json").await;
+            }
         }
     });
 
