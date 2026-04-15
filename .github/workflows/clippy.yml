@@ -1,0 +1,24 @@
+name: Clippy Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  clippy:
+    name: Run Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.18
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run Clippy
+        working-directory: manager
+        env:
+          CUDA_COMPUTE_CAP: "86" # Bypasses nvidia-smi auto-detection since runners lack GPUs
+        run: cargo clippy --all-targets --all-features -- -D warnings

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Account Settings</title>
+    <style>
+        body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #cdd6f4; margin: 0; }
+        header { background: #11111b; padding: 15px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #313244; }
+        header h1 { margin: 0; font-size: 1.4rem; color: #cdd6f4; }
+        button, select { 
+            font-family: inherit; 
+            font-size: 0.9rem; 
+        }
+        
+        button { 
+            border-radius: 6px; 
+            border: none; 
+            font-weight: bold; 
+            cursor: pointer; 
+            transition: 0.2s; 
+            color: #11111b; 
+            display: inline-flex; 
+            align-items: center; 
+            justify-content: center;
+        }
+        
+        button:hover { 
+            filter: brightness(1.15); 
+        }
+        .key-container { background: #181825; padding: 20px; border-radius: 8px; margin-bottom: 30px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #313244; }
+        th { background: #11111b; color: #89b4fa; }
+        .btn-danger { background: #f38ba8; padding: 6px 12px; }
+        .btn-danger:hover { background: #fca4b7; }
+        .hash-text { font-family: monospace; color: #a6adc8; }
+        
+        /* Modal CSS */
+        .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); display: none; justify-content: center; align-items: center; z-index: 1000; }
+        .modal-content { background: #1e1e2e; padding: 25px; border-radius: 8px; width: 400px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        .modal-content h2 { margin-top: 0; border-bottom: 1px solid #45475a; padding-bottom: 10px; }
+        .modal-actions { display: flex; justify-content: space-between; margin-top: 20px; }
+        .btn-cancel { background: #45475a; color: white; }
+        .btn-run { background: #a6e3a1; color: #11111b; }
+        .input-field { width: 95%; padding: 10px; margin-top: 5px; background: #313244; color: white; border: 1px solid #45475a; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Account Settings</h1>
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button onclick="window.location.href='/'" style="background: #89b4fa; height: 30px; padding: 0 10px;">💬 Chat</button>
+            <button onclick="window.location.href='/stats'" style="background: #cba6f7; height: 30px; padding: 0 10px;">📊 Stats</button>
+            <button onclick="window.location.href='/auth/logout'" style="background: #45475a; color: white; height: 30px; padding: 0 10px;">Logout</button>
+        </div>
+    </header>
+
+    <div class="key-container">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h2>API Keys</h2>
+            <button onclick="openKeyModal()" style="background: #a6e3a1;">+ Create New Key</button>
+        </div>
+        <p style="color: #a6adc8; font-size: 0.9rem;">Keys are mathematically hashed using SHA-256 before being stored on our servers. For your security, we cannot show you a key after it is generated.</p>
+        
+        <table>
+            <thead><tr><th>Name</th><th>Description</th><th>Key Hash Prefix</th><th>Action</th></tr></thead>
+            <tbody id="keys-tbody"></tbody>
+        </table>
+    </div>
+
+    <div id="new-key-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Create API Key</h2>
+            <div style="margin-bottom: 15px;">
+                <label>Name (required)</label><br>
+                <input type="text" id="new-key-name" class="input-field" placeholder="e.g. Python Script">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label>Description (optional)</label><br>
+                <input type="text" id="new-key-desc" class="input-field" placeholder="e.g. Used for nightly cron job">
+            </div>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeKeyModal()">Cancel</button>
+                <button class="btn-run" onclick="submitNewKey()">Generate Key</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function loadKeys() {
+            const res = await fetch('/api/settings/keys');
+            if (!res.ok) { window.location.href = '/auth/login'; return; }
+            const keys = await res.json();
+            
+            const tbody = document.getElementById('keys-tbody');
+            tbody.innerHTML = '';
+            keys.forEach(record => {
+                const shortHash = record.hash.substring(0, 16) + '...';
+                const desc = record.description ? record.description : '<span style="color: #6c7086; font-style: italic;">None</span>';
+                tbody.innerHTML += `
+                    <tr>
+                        <td style="font-weight: bold;">${record.name}</td>
+                        <td>${desc}</td>
+                        <td class="hash-text">${shortHash}</td>
+                        <td><button class="btn-danger" onclick="deleteKey('${record.hash}')">Revoke</button></td>
+                    </tr>
+                `;
+            });
+        }
+
+        function openKeyModal() {
+            document.getElementById('new-key-name').value = '';
+            document.getElementById('new-key-desc').value = '';
+            document.getElementById('new-key-modal').style.display = 'flex';
+        }
+
+        function closeKeyModal() {
+            document.getElementById('new-key-modal').style.display = 'none';
+        }
+
+        async function submitNewKey() {
+            const name = document.getElementById('new-key-name').value.trim();
+            const desc = document.getElementById('new-key-desc').value.trim();
+            
+            if (!name) { alert("A name is required for the API Key."); return; }
+            
+            const res = await fetch('/api/settings/keys', { 
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: name, description: desc ? desc : null })
+            });
+
+            if (res.ok) {
+                const plaintextKey = await res.json();
+                closeKeyModal();
+                // Show the plaintext key to the user EXACTLY once
+                window.prompt("Keep this safe! You will never see it again. Copy it now:", plaintextKey);
+                loadKeys();
+            } else {
+                alert("Failed to create API key.");
+            }
+        }
+
+        async function deleteKey(hash) {
+            if(!confirm("Are you sure you want to permanently revoke this key? External apps using it will instantly fail.")) return;
+            await fetch(`/api/settings/keys/${hash}`, { method: 'DELETE' });
+            loadKeys();
+        }
+
+        window.onload = loadKeys;
+    </script>
+</body>
+</html>

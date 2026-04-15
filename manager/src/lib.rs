@@ -1,5 +1,6 @@
-use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
@@ -10,40 +11,30 @@ use candle_transformers::models::quantized_llama::ModelWeights as LlamaWeights;
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2Weights;
 use candle_transformers::generation::LogitsProcessor;
 use nvml_wrapper::Nvml;
-use std::sync::{Arc, Mutex};
 
-// The thread-safe status object we will share between the web server and the engine
-#[derive(Serialize, Clone, Default, Debug)]
-pub struct EngineStatus {
-    pub active_chat_model_id: Option<String>,
-    pub last_compressor_model_id: Option<String>,
-}
+pub mod telemetry;
+pub mod types;
+pub mod registry;
 
-pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'_, EngineStatus> {
-    status.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+pub use telemetry::*;
+pub use types::*;
+pub use registry::*;
 
-pub fn get_vram_info(device_index: u32) -> Option<(u64, u64)> {
-    // Fail gracefully at each step if hardware is missing or incompatible
-    let nvml = Nvml::init().ok()?;
+pub fn get_vram_info(nvml: Option<&Nvml>, device_index: u32) -> Option<(u64, u64, u64)> {
+    let nvml = nvml?;
     let device = nvml.device_by_index(device_index).ok()?;
     let info = device.memory_info().ok()?;
     
-    // Returns (Used, Total) in bytes
-    Some((info.used, info.total))
+    Some((info.used, info.total, info.free))
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub enum CompressionDType {
-    F32,
-    F16,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub enum ModelArch {
-    Llama,
-    Qwen2,
-    XLMRoberta,
+fn estimate_bytes_per_token(arch: &ModelArch, params_billions: f32) -> usize {
+    match arch {
+        ModelArch::Qwen2 if params_billions > 10.0 => 150_000, // ~150KB for 14B
+        ModelArch::Qwen2 => 80_000,                            // Smaller Qwens
+        ModelArch::Llama if params_billions < 10.0 => 125_000, // ~125KB for 8B
+        _ => 100_000,                                          // Fallback
+    }
 }
 
 pub struct ExtractiveCompressor {
@@ -91,135 +82,6 @@ impl DynamicModel {
             }
         }
     }
-}
-
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
-pub enum ModelRole {
-    GeneralChat,
-    ContextCompressor,
-    CodeSpecialist,
-    ToolCaller,
-    Reasoning,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
-    pub id: String,
-    pub name: String,
-    pub repo: String,
-    pub tokenizer_repo: String,
-    pub filename: String,
-    pub max_context_len: usize,
-    pub roles: Vec<ModelRole>,
-    pub arch: ModelArch,
-    pub compression_dtype: Option<CompressionDType>, // Only for Safetensors models
-}
-
-// Expose the registry so the web server can send it to the UI
-pub fn get_model_registry() -> Vec<ModelConfig> {
-    vec![
-        ModelConfig { 
-            id: "llama-3.1-8b".to_string(), name: "Llama 3.1 (8B)".to_string(),
-            repo: "QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF".to_string(),
-            tokenizer_repo: "NousResearch/Meta-Llama-3.1-8B-Instruct".to_string(),
-            filename: "Meta-Llama-3.1-8B-Instruct.Q4_K_M.gguf".to_string(), 
-            max_context_len: 128000, roles: vec![ModelRole::GeneralChat],
-            arch: ModelArch::Llama,
-            compression_dtype: None
-        },
-        ModelConfig { 
-            id: "qwen3-14b".to_string(), 
-            name: "Qwen3 (14B Equivalent)".to_string(),
-            // Switched to a single-file community repo
-            repo: "bartowski/Qwen2.5-14B-Instruct-GGUF".to_string(), 
-            tokenizer_repo: "Qwen/Qwen2.5-14B-Instruct".to_string(),
-            filename: "Qwen2.5-14B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 131072, 
-            roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
-            arch: ModelArch::Qwen2,
-            compression_dtype: None
-        },
-        ModelConfig { 
-            id: "qwen-coder-14b".to_string(), 
-            name: "Qwen2.5 Coder (14B)".to_string(),
-            repo: "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF".to_string(), 
-            tokenizer_repo: "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
-            filename: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 131072, // Qwen2.5 base supports up to 131k
-            roles: vec![ModelRole::CodeSpecialist],
-            arch: ModelArch::Qwen2,
-            compression_dtype: None
-        },
-        ModelConfig { 
-            id: "strand-rust-14b".to_string(), 
-            name: "Strand Rust Coder (14B)".to_string(),
-            repo: "mradermacher/Strand-Rust-Coder-14B-v1-GGUF".to_string(), 
-            tokenizer_repo: "Fortytwo-Network/Strand-Rust-Coder-14B-v1".to_string(),
-            filename: "Strand-Rust-Coder-14B-v1.Q4_K_M.gguf".to_string(), 
-            max_context_len: 32768, // The Strand fine-tune caps optimal context at 32k
-            roles: vec![ModelRole::CodeSpecialist],
-            arch: ModelArch::Qwen2, // Strand is built on top of the Qwen2 architecture
-            compression_dtype: None
-        },
-        ModelConfig { 
-            id: "llmlingua-2-f16".to_string(), 
-            name: "LLMLingua-2 (F16 - Lean)".to_string(),
-            repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(), 
-            tokenizer_repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
-            filename: "model.safetensors".to_string(), 
-            max_context_len: 512, 
-            roles: vec![ModelRole::ContextCompressor],
-            arch: ModelArch::XLMRoberta,
-            compression_dtype: Some(CompressionDType::F16)
-        },
-        ModelConfig { 
-            id: "llmlingua-2-f32".to_string(), 
-            name: "LLMLingua-2 (F32 - Precision)".to_string(),
-            repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(), 
-            tokenizer_repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
-            filename: "model.safetensors".to_string(), 
-            max_context_len: 512, 
-            roles: vec![ModelRole::ContextCompressor],
-            arch: ModelArch::XLMRoberta,
-            compression_dtype: Some(CompressionDType::F32)
-        },
-        ModelConfig { 
-            id: "qwen-compressor".to_string(), 
-            name: "Qwen 1.5B (Abstractive)".to_string(),
-            repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".to_string(), 
-            tokenizer_repo: "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
-            filename: "qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(), 
-            max_context_len: 32768, 
-            roles: vec![ModelRole::ContextCompressor],
-            arch: ModelArch::Qwen2,
-            compression_dtype: None
-        },
-    ]
-}
-
-#[derive(Deserialize, Clone)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Deserialize)]
-pub struct ApiRequest {
-    pub chat_model_id: String,
-    pub compressor_model_id: String,
-    pub messages: Vec<Message>,
-}
-
-#[derive(Serialize)]
-pub struct ApiResponse {
-    pub answer: String,
-}
-
-pub struct UserRequest {
-    pub chat_model_id: String,
-    pub compressor_model_id: String,
-    pub messages: Vec<Message>,
-    pub responder: oneshot::Sender<String>,
 }
 
 // Helper: Formats the array into a generic string format
@@ -384,14 +246,21 @@ fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, devi
     }
 }
 
-pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status: Arc<Mutex<EngineStatus>>) {
+pub async fn run_batcher_loop(
+    mut receiver: mpsc::Receiver<UserRequest>, 
+    status: Arc<Mutex<EngineStatus>>,
+    telemetry: Arc<Mutex<TelemetryStore>>
+) {
     let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
     
+    let nvml = Nvml::init().ok();
+
     let mut active_model_id = String::new();
     let mut active_model: Option<DynamicModel> = None;
     let mut active_tokenizer: Option<Tokenizer> = None;
     let mut _active_file: Option<std::fs::File> = None;
     let mut active_max_context: usize = 2048; 
+    let mut active_model_config: Option<ModelConfig> = None;
 
     println!("⚙️  ORCHESTRATOR ONLINE: Waiting for requests...");
 
@@ -410,10 +279,17 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
         // 1. Hot-Swap to the requested Chat Model
         if active_model_id != request.chat_model_id {
             println!("🔄 Swapping VRAM to {}...", request.chat_model_id);
+
             drop(active_model.take()); 
             drop(active_tokenizer.take()); 
             drop(_active_file.take()); 
-            
+
+            // wipe the ID and config so a failed load doesn't leave a poison state
+            active_model_id.clear();
+            active_model_config = None;
+
+            let load_start = Instant::now();
+
             let (m, t, f) = match load_engine(&request.chat_model_id, &device) {
                 Ok(engine) => engine,
                 Err(e) => {
@@ -422,6 +298,12 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                     continue 'main;
                 }
             };
+
+            let elapsed = load_start.elapsed().as_millis();
+            println!("⏱️ Model loaded in {} ms", elapsed);
+            if let Ok(mut t) = telemetry.lock() {
+                t.record_load(request.chat_model_id.clone(), elapsed);
+            }
             
             active_model = Some(m); active_tokenizer = Some(t); _active_file = f; 
             active_model_id = request.chat_model_id.clone();
@@ -434,6 +316,7 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                 }
             };
             active_max_context = config.max_context_len;
+            active_model_config = Some(config);
             println!("✅ Model limits established. Max context window: {}", active_max_context);
 
             {
@@ -452,15 +335,60 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
             }
         };
 
-        let compression_threshold = (active_max_context as f32 * 0.80) as usize;
+        // --- THE DYNAMIC MEMORY MANAGER ---
+        let mut trigger_compression = false;
+        let mut dynamic_target_budget = active_max_context;
 
-        if token_count > compression_threshold {
-            if let Some((used_start, total)) = get_vram_info(0) { 
+        // estimate_bytes_per_token logic (roughly 150KB for 14B models)
+        let config = match active_model_config.as_ref() {
+            Some(c) => c,
+            None => {
+                let _ = request.responder.send("Server Error: No active model configuration found. Please initialize a model first.".to_string());
+                continue 'main;
+            }
+        };
+        let bytes_per_token = estimate_bytes_per_token(&config.arch, config.parameters_billions);
+
+        if let Some((_, _, free_vram)) = get_vram_info(nvml.as_ref(), 0) {
+            let safe_free_vram = free_vram.saturating_sub(500 * 1024 * 1024); 
+            let absolute_max_tokens = (safe_free_vram as usize / bytes_per_token).min(active_max_context);
+            
+            println!("🧮 MEMORY CHECK: Free VRAM can hold ~{} tokens.", absolute_max_tokens);
+
+            if token_count > absolute_max_tokens {
+                println!("⚠️ WARNING: Prompt exceeds physical VRAM limits! Triggering dynamic compression.");
+                trigger_compression = true;
+                // Prevent 0-token budgets, but strictly cap at physical VRAM limits to avoid OOM.
+                dynamic_target_budget = ((absolute_max_tokens as f32 * 0.80) as usize).max(256).min(absolute_max_tokens); 
+            } else if token_count > (active_max_context as f32 * 0.80) as usize {
+                trigger_compression = true;
+                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize).max(256).min(absolute_max_tokens);
+            } else if request.force_compression {
+                println!("⚠️ Benchmarking: Forcing compression execution.");
+                trigger_compression = true;
+                dynamic_target_budget = ((token_count as f32 * 0.50) as usize).max(256).min(absolute_max_tokens);
+            }
+        } else {
+            // CPU fallback
+            if token_count > (active_max_context as f32 * 0.80) as usize {
+                trigger_compression = true;
+                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize).max(256).min(active_max_context);
+            } else if request.force_compression {
+                println!("⚠️ Benchmarking: Forcing compression execution.");
+                trigger_compression = true;
+                dynamic_target_budget = ((token_count as f32 * 0.50) as usize).max(256).min(active_max_context);
+            }
+        }
+
+        if trigger_compression {
+            if let Some((used_start, total, _)) = get_vram_info(nvml.as_ref(), 0) { 
                 println!("📊 VRAM before compressor: {:.2}GB / {:.2}GB", 
                     used_start as f32 / 1024.0_f32.powi(3), 
                     total as f32 / 1024.0_f32.powi(3));
             }
 
+            // --- RECORD COMPRESSOR LOAD TIME ---
+            let comp_load_start = Instant::now();
             let (mut comp_m, comp_t, _comp_f) = match load_engine(&request.compressor_model_id, &device) {
                 Ok(engine) => engine,
                 Err(e) => {
@@ -468,6 +396,12 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                     continue 'main; 
                 }
             };
+            
+            let comp_load_elapsed = comp_load_start.elapsed().as_millis();
+            println!("⏱️ Compressor loaded in {} ms", comp_load_elapsed);
+            if let Ok(mut t) = telemetry.lock() {
+                t.record_load(request.compressor_model_id.clone(), comp_load_elapsed);
+            }
             
             let comp_config = match get_model_registry().into_iter().find(|c| c.id == request.compressor_model_id) {
                 Some(c) => c,
@@ -481,9 +415,11 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                 let mut current_status = lock_status(&status);
                 current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
             }
-            
-            let target_budget = (active_max_context as f32 * 0.2) as usize; 
 
+            let target_budget = dynamic_target_budget; 
+
+            // --- RECORD COMPRESSION EXECUTION TIME ---
+            let comp_start = Instant::now();
             let summary = match &comp_m {
                 DynamicModel::XLMRoberta(_) => {
                     match compress_text(&formatted_prompt, &comp_m, &comp_t, &device, target_budget, comp_config.max_context_len) {
@@ -551,26 +487,48 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                 }
             };
 
+            let comp_elapsed = comp_start.elapsed().as_millis();
+            println!("⏱️ Compression completed in {} ms", comp_elapsed);
+            if let Ok(mut t) = telemetry.lock() {
+                t.record_generation(request.compressor_model_id.clone(), formatted_prompt.len(), token_count, comp_elapsed);
+            }
+
             drop(comp_t); drop(_comp_f); drop(comp_m);
 
-            if let Some((used_end, total)) = get_vram_info(0) {
-                if (used_end as f32 / total as f32) > 0.85 {
-                    println!("🧹 Threshold met. Syncing hardware...");
-                    if let Err(e) = device.synchronize() {
-                        println!("⚠️ Warning: Hardware VRAM sync failed: {}", e);
-                    }
+            if let Some((used_end, total, _)) = get_vram_info(nvml.as_ref(), 0) && (used_end as f32 / total as f32) > 0.85 {
+                println!("🧹 Threshold met. Syncing hardware...");
+                if let Err(e) = device.synchronize() {
+                    println!("⚠️ Warning: Hardware VRAM sync failed: {}", e);
                 }
             }
             
             println!("🔄 Resuming Chat...");
-            let mut new_messages = vec![Message { role: "system".to_string(), content: format!("Compressed Context:\n{}", summary.trim()) }];
-            new_messages.push(last_message);
+            let mut new_messages = Vec::new();
+            
+            if request.messages.len() > 1 {
+                // Multi-turn chat: Compress the older history, but keep their newest question intact
+                new_messages.push(Message { role: "system".to_string(), content: format!("Compressed Context:\n{}", summary.trim()) });
+                new_messages.push(last_message);
+            } else {
+                // Single massive file drop (or benchmark): The summary IS the new message
+                new_messages.push(Message { role: "user".to_string(), content: format!("Review this compressed context:\n{}", summary.trim()) });
+            }
+            
             formatted_prompt = format_chat(&new_messages);
         }
 
         println!("📥 Processing prompt...");
+        let gen_start = Instant::now();
+        
+        // Execute the main chat model generation
         match generate_text(&formatted_prompt, active_model.as_mut().unwrap(), active_tokenizer.as_ref().unwrap(), &device, 500) {
             Ok(answer) => {
+                let elapsed = gen_start.elapsed().as_millis();
+                println!("⏱️ Generation completed in {} ms", elapsed);
+                if let Ok(mut t) = telemetry.lock() {
+                    t.record_generation(active_model_id.clone(), formatted_prompt.len(), token_count, elapsed);
+                }
+                
                 let _ = request.responder.send(answer.trim().to_string());
             },
             Err(e) => {
@@ -578,5 +536,5 @@ pub async fn run_batcher_loop(mut receiver: mpsc::Receiver<UserRequest>, status:
                 let _ = request.responder.send(format!("Server Error: Generation failed: {}", e));
             }
         }
-    }
-}
+    } // Closes the 'main while loop
+} // Closes the run_batcher_loop function

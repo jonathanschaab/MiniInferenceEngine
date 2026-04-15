@@ -1,0 +1,85 @@
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs;
+use tokio::sync::mpsc::UnboundedSender;
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LoadMetric {
+    pub timestamp: u64,
+    pub model_id: String,
+    pub load_time_ms: u128,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GenerationMetric {
+    pub timestamp: u64,
+    pub model_id: String,
+    pub prompt_chars: usize,
+    pub prompt_tokens: usize,
+    pub generation_time_ms: u128,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TelemetryStore {
+    pub loads: Vec<LoadMetric>,
+    pub generations: Vec<GenerationMetric>,
+    #[serde(skip)]
+    pub unsaved_events: usize,
+    #[serde(skip)]
+    pub writer_tx: Option<UnboundedSender<String>>,
+}
+
+impl TelemetryStore {
+    pub fn load_from_disk() -> Self {
+        if let Ok(data) = fs::read_to_string("stats.json") {
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    pub fn save_to_disk(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            if let Some(tx) = &self.writer_tx {
+                // Send payload to the dedicated writer task (Thread-safe & Ordered!)
+                let _ = tx.send(json); 
+            } else {
+                // FAIL LOUDLY: Include the exact payload that is being dropped!
+                eprintln!(
+                    "⚠️ [TELEMETRY FAULT] Writer channel missing! Dropping metric payload to prevent disk I/O race conditions. Check channel initialization in main.rs.\nDropped Payload:\n{}", 
+                    json
+                );
+            }
+        }
+    }
+
+    pub fn record_load(&mut self, model_id: String, load_time_ms: u128) {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        self.loads.push(LoadMetric { timestamp, model_id, load_time_ms });
+
+        self.unsaved_events += 1;
+        if self.unsaved_events >= 5 {
+            self.save_to_disk();
+            self.unsaved_events = 0;
+        }
+
+        if self.loads.len() > 100 {
+            self.loads.drain(0..20);
+        }
+    }
+
+    pub fn record_generation(&mut self, model_id: String, prompt_chars: usize, prompt_tokens: usize, generation_time_ms: u128) {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        self.generations.push(GenerationMetric { timestamp, model_id, prompt_chars, prompt_tokens, generation_time_ms });
+        
+        self.unsaved_events += 1;
+        if self.unsaved_events >= 5 {
+            self.save_to_disk();
+            self.unsaved_events = 0;
+        }
+
+        if self.generations.len() > 100 {
+            self.generations.drain(0..20); // Remove the oldest 20 records
+        }
+    }
+}
