@@ -72,22 +72,89 @@
         #send-btn:hover { background: #b4befe; }
         #send-btn:disabled { background: #45475a; color: #a6adc8; cursor: not-allowed; }
         .typing { font-style: italic; color: #a6adc8; font-size: 0.9rem; align-self: flex-start; display: none; margin-bottom: 10px; }
+        
+        #stop-btn { 
+            padding: 14px 24px; 
+            border-radius: 6px; 
+            border: none; 
+            background: #f38ba8; 
+            color: #11111b; 
+            font-weight: bold; 
+            cursor: pointer; 
+            transition: 0.2s; 
+            font-size: 16px; 
+            height: 52px; 
+            display: none;
+        }
+        #stop-btn:hover { background: #fca4b7; }
+    
+    #regen-btn { padding: 14px; border-radius: 6px; border: none; background: #cba6f7; color: #11111b; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 16px; height: 52px; display: none; }
+    #regen-btn:hover { background: #dce0e8; }
+    
+    .param-group { display: flex; flex-direction: column; gap: 5px; }
+    .param-group label { color: #a6adc8; }
+    .param-group span { color: #cdd6f4; font-weight: bold; }
+    .param-group input[type="number"] { background: #313244; color: white; border: 1px solid #45475a; padding: 5px; border-radius: 4px; }
     </style>
 </head>
 <body>
     <header>
-        <h1>Mini Inference Engine</h1>
+        <h1>Mini Inference Engine <span id="engine-status-indicator" class="status"></span></h1>
         <div style="display: flex; gap: 15px; align-items: center;">
-            <select id="chat-model-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
-            <select id="compressor-model-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
-            
-            <button onclick="clearChat()" style="background: #f38ba8; height: 30px; padding: 0 10px;">🗑️ Clear Chat</button>
+            <button onclick="window.location.href='/memory'" style="background: #f9e2af; height: 30px; padding: 0 10px;">💾 Memory</button>
             <button onclick="window.location.href='/stats'" style="background: #cba6f7; height: 30px; padding: 0 10px;">📊 Stats</button>
             <button onclick="window.location.href='/settings'" style="background: #a6e3a1; height: 30px; padding: 0 10px;">⚙️ Settings</button>
             <button onclick="window.location.href='/auth/logout'" style="background: #45475a; color: white; height: 30px; padding: 0 10px;">Logout</button>
         </div>
     </header>
     
+    <!-- Session Control Bar -->
+    <div style="background: #181825; padding: 10px 20px; border-bottom: 1px solid #313244; display: flex; gap: 15px; align-items: center; justify-content: space-between;">
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <select id="chat-model-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
+            <select id="compressor-model-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
+            <select id="backend-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
+        </div>
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button onclick="document.getElementById('parameters-panel').style.display = document.getElementById('parameters-panel').style.display === 'none' ? 'flex' : 'none'" style="background: #89dceb; height: 30px; padding: 0 10px;">🎛️ Parameters</button>
+            <button onclick="clearChat()" style="background: #f38ba8; height: 30px; padding: 0 10px;">🗑️ Clear Chat</button>
+        </div>
+    </div>
+
+    <div id="parameters-panel" style="display: none; background: #181825; padding: 15px 20px; border-bottom: 1px solid #313244; gap: 20px; flex-wrap: wrap; align-items: center; font-size: 0.9rem;">
+        <div class="param-group">
+            <label for="param-temp">Temperature: <span id="val-temp">0.7</span></label>
+            <input type="range" id="param-temp" min="0" max="2" step="0.1" value="0.7" oninput="document.getElementById('val-temp').innerText=this.value">
+        </div>
+        <div class="param-group">
+            <label for="param-top-p">Top-P: <span id="val-top-p">0.95</span></label>
+            <input type="range" id="param-top-p" min="0" max="1" step="0.05" value="0.95" oninput="document.getElementById('val-top-p').innerText=this.value">
+        </div>
+        <div class="param-group">
+            <label for="param-top-k">Top-K:</label>
+            <input type="number" id="param-top-k" min="1" max="100" value="40" style="width: 60px;">
+        </div>
+        <div class="param-group">
+            <label for="param-max-tokens">Max Tokens:</label>
+            <input type="number" id="param-max-tokens" min="1" max="8192" value="500" style="width: 80px;">
+        </div>
+        <div class="param-group">
+            <label for="param-seed">Seed (Optional):</label>
+            <input type="number" id="param-seed" placeholder="Random" style="width: 100px;">
+        </div>
+        <div class="param-group">
+            <label for="param-context-buffer">Ctx Buffer:</label>
+            <input type="number" id="param-context-buffer" min="0" max="128000" value="1024" style="width: 80px;">
+        </div>
+        <div class="param-group">
+            <label for="param-memory-strategy">Llama.cpp Strategy:</label>
+            <select id="param-memory-strategy" style="background: #313244; color: white; border: 1px solid #45475a; padding: 5px; border-radius: 4px;">
+                <option value="offload">CPU Offload (Max Context)</option>
+                <option value="compress">Compression (Max Speed)</option>
+            </select>
+        </div>
+    </div>
+
     <div id="chat-container">
         <div class="message ai-message">System: Engine ready. TinyLlama 1.1B online. How can I help you?</div>
     </div>
@@ -96,17 +163,34 @@
     <div id="input-container">
         <textarea id="prompt-input" placeholder="Message the AI... (Shift + Enter for new line)" rows="1"></textarea>
         <button id="send-btn">Send</button>
+        <button id="stop-btn">Stop</button>
+        <button id="regen-btn" title="Regenerate last response">🔄</button>
     </div>
 
 <script>
         const chatContainer = document.getElementById('chat-container');
         const inputField = document.getElementById('prompt-input');
         const sendBtn = document.getElementById('send-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const regenBtn = document.getElementById('regen-btn');
         const typingIndicator = document.getElementById('typing-indicator');
 
         let chatHistory = [];
+        let currentAbortController = null;
 
         window.onload = initializeUI;
+
+        async function updateStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const status = await res.json();
+                if (status.active_backend) {
+                    document.getElementById('engine-status-indicator').textContent = `(${status.active_backend})`;
+                }
+            } catch (e) {
+                console.warn("Failed to update engine status", e);
+            }
+        }
 
         async function initializeUI() {
             try {
@@ -136,9 +220,21 @@
 
                 const chatSelect = document.getElementById('chat-model-select');
                 const compSelect = document.getElementById('compressor-model-select');
+                const backendSelect = document.getElementById('backend-select');
 
                 chatSelect.innerHTML = '';
                 compSelect.innerHTML = '';
+                backendSelect.innerHTML = '';
+                backendSelect.add(new Option('Backend: Auto', ''));
+
+                // Collect all unique backends from the model registry
+                const allBackends = new Set();
+                models.forEach(m => {
+                    m.supported_backends.forEach(b => allBackends.add(b));
+                });
+
+                // Populate the dropdown
+                allBackends.forEach(b => backendSelect.add(new Option(b, b.toLowerCase())));
 
                 models.forEach(m => {
                     if (m.roles.includes("GeneralChat") || m.roles.includes("CodeSpecialist")) {
@@ -155,6 +251,8 @@
                 if (status.last_compressor_model_id) {
                     compSelect.value = status.last_compressor_model_id;
                 }
+
+                updateStatus();
             } catch (err) {
                 console.error("Failed to execute UI initialization:", err);
             }
@@ -168,6 +266,7 @@
         function clearChat() {
             chatHistory = [];
             // Remove all messages except the first AI greeting
+            regenBtn.style.display = 'none';
             const messages = chatContainer.querySelectorAll('.message');
             for (let i = 1; i < messages.length; i++) {
                 chatContainer.removeChild(messages[i]);
@@ -192,12 +291,32 @@
             inputField.value = '';
             inputField.style.height = 'auto'; 
             sendBtn.disabled = true;
+            sendBtn.style.display = 'none';
+            stopBtn.style.display = 'inline-flex';
+            regenBtn.style.display = 'none';
             typingIndicator.style.display = 'block';
+            
+            currentAbortController = new AbortController();
+
+            let aiMessageDiv = document.createElement('div');
+            aiMessageDiv.className = 'message ai-message';
+            chatContainer.appendChild(aiMessageDiv);
 
             try {
                 // Grab the IDs from the UI dropdowns
                 const chatModelId = document.getElementById('chat-model-select').value;
                 const compModelId = document.getElementById('compressor-model-select').value;
+                const targetBackend = document.getElementById('backend-select').value;
+
+                // Grab parameters
+                const temp = parseFloat(document.getElementById('param-temp').value);
+                const topP = parseFloat(document.getElementById('param-top-p').value);
+                const topK = parseInt(document.getElementById('param-top-k').value);
+                const maxTokens = parseInt(document.getElementById('param-max-tokens').value);
+                const seedVal = document.getElementById('param-seed').value;
+                const seed = seedVal !== "" ? parseInt(seedVal) : null;
+                const ctxBuffer = parseInt(document.getElementById('param-context-buffer').value) || 0;
+                const memStrategy = document.getElementById('param-memory-strategy').value;
 
                 const response = await fetch('/api/generate', {
                     method: 'POST',
@@ -205,26 +324,89 @@
                     body: JSON.stringify({ 
                         chat_model_id: chatModelId,
                         compressor_model_id: compModelId,
-                        messages: chatHistory 
-                    })
+                        messages: chatHistory,
+                        parameters: {
+                            temperature: temp,
+                            top_p: topP,
+                            top_k: topK,
+                            max_tokens: maxTokens,
+                            seed: seed,
+                            memory_strategy: memStrategy,
+                            context_buffer: ctxBuffer
+                        },
+                        target_backend: targetBackend !== "" ? targetBackend : null
+                    }),
+                    signal: currentAbortController.signal
                 });
                 
-                const data = await response.json();
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        window.location.href = '/auth/login';
+                        return;
+                    }
+                    throw new Error(`Server returned HTTP ${response.status}`);
+                }
+
                 typingIndicator.style.display = 'none';
                 
-                appendMessage(data.answer, false);
-                chatHistory.push({ role: "assistant", content: data.answer });
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let fullAnswer = "";
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    fullAnswer += decoder.decode(value, { stream: true });
+                    aiMessageDiv.textContent = fullAnswer;
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                }
+                
+                chatHistory.push({ role: "assistant", content: fullAnswer });
+                updateStatus();
 
             } catch (err) {
-                typingIndicator.style.display = 'none';
-                appendMessage("Error: Failed to connect to engine.", false);
-                chatHistory.pop(); 
+                if (err.name === 'AbortError') {
+                    aiMessageDiv.textContent += " [Stopped]";
+                    chatHistory.push({ role: "assistant", content: aiMessageDiv.textContent });
+                    updateStatus();
+                } else {
+                    typingIndicator.style.display = 'none';
+                    appendMessage("Error: Failed to connect to engine.", false);
+                    chatHistory.pop(); 
+                }
             }
+            
+            sendBtn.style.display = 'inline-flex';
+            stopBtn.style.display = 'none';
+            if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
             sendBtn.disabled = false;
             inputField.focus();
+            currentAbortController = null;
+        }
+
+        function regenerateLast() {
+            if (chatHistory.length === 0) return;
+            
+            // Remove the assistant's last message
+            if (chatHistory[chatHistory.length - 1].role === 'assistant') {
+                chatHistory.pop();
+                chatContainer.removeChild(chatContainer.lastChild);
+            }
+            
+            // Remove the user's last message, place it in the input box, and immediately re-send
+            if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'user') {
+                const lastUserMsg = chatHistory.pop();
+                chatContainer.removeChild(chatContainer.lastChild);
+                inputField.value = lastUserMsg.content;
+                sendMessage();
+            }
         }
 
         sendBtn.addEventListener('click', sendMessage);
+        stopBtn.addEventListener('click', () => {
+            if (currentAbortController) currentAbortController.abort();
+        });
+        regenBtn.addEventListener('click', regenerateLast);
 
         inputField.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && !e.shiftKey) {

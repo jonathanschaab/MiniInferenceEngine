@@ -2,18 +2,29 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs;
 use tokio::sync::mpsc::UnboundedSender;
+use crate::types::GenerationParameters;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LoadMetric {
     pub timestamp: u64,
     pub model_id: String,
+    #[serde(default = "default_backend")]
+    pub backend: String,
     pub load_time_ms: u128,
 }
+
+fn default_backend() -> String { "Unknown".to_string() }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GenerationMetric {
     pub timestamp: u64,
     pub model_id: String,
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub parameters: GenerationParameters,
+    #[serde(default)]
+    pub offload_pct: f32,
     pub prompt_chars: usize,
     pub prompt_tokens: usize,
     pub generation_time_ms: u128,
@@ -53,9 +64,9 @@ impl TelemetryStore {
         }
     }
 
-    pub fn record_load(&mut self, model_id: String, load_time_ms: u128) {
+    pub fn record_load(&mut self, model_id: String, backend: String, load_time_ms: u128) {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        self.loads.push(LoadMetric { timestamp, model_id, load_time_ms });
+        self.loads.push(LoadMetric { timestamp, model_id, backend, load_time_ms });
 
         self.unsaved_events += 1;
         if self.unsaved_events >= 5 {
@@ -68,9 +79,9 @@ impl TelemetryStore {
         }
     }
 
-    pub fn record_generation(&mut self, model_id: String, prompt_chars: usize, prompt_tokens: usize, generation_time_ms: u128) {
+    pub fn record_generation(&mut self, model_id: String, backend: String, parameters: GenerationParameters, offload_pct: f32, prompt_chars: usize, prompt_tokens: usize, generation_time_ms: u128) {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        self.generations.push(GenerationMetric { timestamp, model_id, prompt_chars, prompt_tokens, generation_time_ms });
+        self.generations.push(GenerationMetric { timestamp, model_id, backend, parameters, offload_pct, prompt_chars, prompt_tokens, generation_time_ms });
         
         self.unsaved_events += 1;
         if self.unsaved_events >= 5 {

@@ -1,0 +1,5 @@
+[build]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+CMAKE_TOOLCHAIN_FILE = "C:/Users/jscha/Software Projects/MiniInferenceEngine/manager/static_crt.cmake"

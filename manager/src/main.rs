@@ -4,9 +4,15 @@ use axum::{
     http::StatusCode,
     routing::{get, post, delete},
     Json, Router,
+    body::Body,
+    http::header,
+    body::Bytes,
 };
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::StreamExt;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use sysinfo::System;
+use tokio::sync::mpsc;
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 use tower_sessions::{MemoryStore, SessionManagerLayer};
@@ -15,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use oauth2::basic::BasicClient; // Ensure this is imported for AppState
 
 use manager::{
-    get_model_registry, run_batcher_loop, ApiRequest, ApiResponse, ModelConfig, UserRequest, EngineStatus, lock_status, TelemetryStore, Message, ModelRole, BenchmarkRequest
+    get_model_registry, run_batcher_loop, ApiRequest, ModelConfig, UserRequest, EngineStatus, lock_status, TelemetryStore, Message, ModelRole, BenchmarkRequest, StreamEvent
 };
 
 // --- CONFIGURATION ---
@@ -81,9 +87,9 @@ async fn get_models() -> Json<Vec<ModelConfig>> {
 async fn handle_generate(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ApiRequest>,
-) -> Json<ApiResponse> {
+) -> impl IntoResponse {
     
-    let (response_tx, response_rx) = oneshot::channel();
+    let (response_tx, response_rx) = mpsc::unbounded_channel();
 
     // Package the UI's model choices and the chat history
     let request = UserRequest {
@@ -92,15 +98,27 @@ async fn handle_generate(
         messages: payload.messages,
         responder: response_tx,
         force_compression: false,
+        parameters: payload.parameters.unwrap_or_default(),
+        target_backend: payload.target_backend,
     };
 
     // Send to the GPU thread
     let _ = state.queue_tx.send(request).await;
 
-    // Wait for the LLM to finish generating
-    let generated_text = response_rx.await.unwrap_or_else(|_| "Error: GPU disconnected".to_string());
-    
-    Json(ApiResponse { answer: generated_text })
+    // Map the incoming channel into an HTTP streaming body
+    let stream = UnboundedReceiverStream::new(response_rx).map(|event| {
+        match event {
+            StreamEvent::Token(t) => Ok::<_, std::convert::Infallible>(Bytes::from(t)),
+            StreamEvent::Done => Ok(Bytes::new()),
+            StreamEvent::Error(e) => Ok(Bytes::from(format!("Error: {}", e))),
+        }
+    });
+
+    axum::response::Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::TRANSFER_ENCODING, "chunked")
+        .body(Body::from_stream(stream))
+        .unwrap()
 }
 
 async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
@@ -130,6 +148,11 @@ async fn trigger_benchmark(
         status.benchmark_running = true;
     }
 
+    let mut params = payload.parameters.unwrap_or_default();
+    if params.seed.is_none() {
+        params.seed = Some(rand::random::<u64>());
+    }
+    let target_backends = payload.target_backends;
     let queue_tx = state.queue_tx.clone();
     let engine_status = state.engine_status.clone(); // Clone the Arc so the background thread can reset it
     let selected_models = payload.models;
@@ -154,6 +177,13 @@ async fn trigger_benchmark(
 
         if registry.is_empty() {
             println!("⚠️ Benchmark aborted: No valid models selected.");
+            let mut status = lock_status(&engine_status);
+            status.benchmark_running = false;
+            return;
+        }
+
+        if target_backends.is_empty() {
+            println!("⚠️ Benchmark aborted: No valid backends selected.");
             let mut status = lock_status(&engine_status);
             status.benchmark_running = false;
             return;
@@ -220,16 +250,27 @@ async fn trigger_benchmark(
                         format!("Write a detailed paragraph about Rust memory management. Target exactly {} words.", size)
                     };
 
-                    let (seed_tx, seed_rx) = oneshot::channel();
+                    let (seed_tx, mut seed_rx) = mpsc::unbounded_channel();
                     let _ = queue_tx.send(UserRequest {
                         chat_model_id: "qwen-compressor".to_string(), 
                         compressor_model_id: default_compressor.clone(),
                         messages: vec![Message { role: "user".to_string(), content: prompt_instruction }],
                         responder: seed_tx,
                         force_compression: false,
+                        parameters: params.clone(),
+                        target_backend: None,
                     }).await;
 
-                    if let Ok(generated_seed) = seed_rx.await 
+                    let mut generated_seed = String::new();
+                    while let Some(ev) = seed_rx.recv().await {
+                        match ev {
+                            StreamEvent::Token(t) => generated_seed.push_str(&t),
+                            StreamEvent::Done => break,
+                            StreamEvent::Error(e) => { generated_seed.push_str(&e); break; },
+                        }
+                    }
+
+                    if !generated_seed.is_empty() 
                         && !generated_seed.starts_with("Server Error") 
                         && let Some(tokenizer) = &qwen_tokenizer 
                         && let Ok(encoding) = tokenizer.encode(generated_seed.clone(), true) 
@@ -326,17 +367,24 @@ async fn trigger_benchmark(
                 let filename = format!("benchmark_prompts/prompt_{}.txt", size);
                 let exact_prompt = tokio::fs::read_to_string(&filename).await.unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
                 
-                println!("📊 Benchmarking Generative {} using file {}...", model.name, filename);
-                
-                let (response_tx, response_rx) = oneshot::channel();
-                let _ = queue_tx.send(UserRequest {
-                    chat_model_id: model.id.clone(),
-                    compressor_model_id: default_compressor.clone(),
-                    messages: vec![Message { role: "user".to_string(), content: exact_prompt }],
-                    responder: response_tx,
-                    force_compression: false,
-                }).await;
-                let _ = response_rx.await;
+                for target_b in target_backends.iter() {
+                    let supports = model.supported_backends.iter().any(|b| format!("{:?}", b).to_lowercase() == target_b.to_lowercase());
+                    if !supports { continue; }
+
+                    println!("📊 Benchmarking Generative {} using file {} on Backend {}...", model.name, filename, target_b);
+                    
+                    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                    let _ = queue_tx.send(UserRequest {
+                        chat_model_id: model.id.clone(),
+                        compressor_model_id: default_compressor.clone(),
+                        messages: vec![Message { role: "user".to_string(), content: exact_prompt.clone() }],
+                        responder: response_tx,
+                        force_compression: false,
+                        parameters: params.clone(),
+                        target_backend: Some(target_b.clone()),
+                    }).await;
+                    while let Some(ev) = response_rx.recv().await { if let StreamEvent::Done = ev { break; } }
+                }
             }
         }
 
@@ -352,17 +400,24 @@ async fn trigger_benchmark(
                 let filename = format!("benchmark_prompts/prompt_{}.txt", size);
                 let exact_prompt = tokio::fs::read_to_string(&filename).await.unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
                 
-                println!("📊 Benchmarking Compressor {} using file {}...", comp_model.name, filename);
-                
-                let (response_tx, response_rx) = oneshot::channel();
-                let _ = queue_tx.send(UserRequest {
-                    chat_model_id: default_chat.clone(), 
-                    compressor_model_id: comp_model.id.clone(),
-                    messages: vec![Message { role: "user".to_string(), content: exact_prompt }],
-                    responder: response_tx,
-                    force_compression: true, 
-                }).await;
-                let _ = response_rx.await;
+                for target_b in target_backends.iter() {
+                    let supports = comp_model.supported_backends.iter().any(|b| format!("{:?}", b).to_lowercase() == target_b.to_lowercase());
+                    if !supports { continue; }
+
+                    println!("📊 Benchmarking Compressor {} using file {} on Backend {}...", comp_model.name, filename, target_b);
+                    
+                    let (response_tx, mut response_rx) = mpsc::unbounded_channel();
+                    let _ = queue_tx.send(UserRequest {
+                        chat_model_id: default_chat.clone(), 
+                        compressor_model_id: comp_model.id.clone(),
+                        messages: vec![Message { role: "user".to_string(), content: exact_prompt.clone() }],
+                        responder: response_tx,
+                        force_compression: true, 
+                        parameters: params.clone(),
+                        target_backend: Some(target_b.clone()),
+                    }).await;
+                    while let Some(ev) = response_rx.recv().await { if let StreamEvent::Done = ev { break; } }
+                }
             }
         }
 
@@ -379,8 +434,11 @@ async fn trigger_benchmark(
 }
 
 // Route: Serve the Stats UI
-async fn serve_stats_ui() -> Html<&'static str> {
-    Html(include_str!("../stats.html"))
+async fn serve_stats_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok(Html(include_str!("../stats.html")))
 }
 
 async fn serve_settings_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
@@ -388,6 +446,13 @@ async fn serve_settings_ui(session: tower_sessions::Session) -> Result<Html<&'st
         return Err(Redirect::to("/auth/login"));
     }
     Ok(Html(include_str!("../settings.html")))
+}
+
+async fn serve_memory_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok(Html(include_str!("../memory.html")))
 }
 
 // Route: Serve the Telemetry JSON
@@ -403,6 +468,30 @@ async fn main() {
 
     // Initialize the shared state BEFORE spawning the background thread
     let engine_status = Arc::new(Mutex::new(EngineStatus::default()));
+    
+    // Background VRAM Tracker
+    let status_for_nvml = engine_status.clone();
+    tokio::spawn(async move {
+        let mut sys = System::new_all();
+        let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
+        let nvml = nvml_wrapper::Nvml::init().ok();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            
+            sys.refresh_all();
+            if let Some(process) = sys.process(pid) {
+                let mut s = manager::lock_status(&status_for_nvml);
+                s.update_sysinfo(sys.total_memory(), sys.used_memory(), sys.free_memory(), process.memory());
+            }
+
+            if let Some((used, total, free)) = manager::get_vram_info(nvml.as_ref(), 0) {
+                let mut s = manager::lock_status(&status_for_nvml);
+                s.update_nvml(total, used, free);
+            }
+        }
+    });
+
     let status_for_batcher = engine_status.clone();
 
     let (telemetry_tx, mut telemetry_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -475,6 +564,7 @@ async fn main() {
         .route("/", get(serve_ui))
         .route("/settings", get(serve_settings_ui)) 
         .route("/stats", get(serve_stats_ui))
+        .route("/memory", get(serve_memory_ui))
         // Settings APIs (They check session manually)
         .route("/api/settings/keys", get(auth::list_keys_handler).post(auth::create_key_handler))
         .route("/api/settings/keys/:hash", delete(auth::delete_key_handler));

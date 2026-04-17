@@ -48,19 +48,60 @@
         .modal-actions { display: flex; justify-content: space-between; }
         .btn-cancel { background: #45475a; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
         .btn-run { background: #a6e3a1; color: #11111b; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+
+        .param-group { display: flex; flex-direction: column; gap: 5px; }
+        .param-group label { color: #a6adc8; }
+        .param-group span { color: #cdd6f4; font-weight: bold; }
+        .param-group input[type="number"], .param-group input[type="text"] { background: #313244; color: white; border: 1px solid #45475a; padding: 5px; border-radius: 4px; }
     </style>
 </head>
 <body>
     <header>
         <h1>Engine Telemetry Dashboard</h1>
         <div style="display: flex; gap: 15px; align-items: center;">
-            <button id="btn-run-benchmark" onclick="openBenchmarkModal()" style="background: #89b4fa; height: 30px; padding: 0 10px;">▶ Run Benchmark Suite</button>
-            
             <button onclick="window.location.href='/'" style="background: #89b4fa; height: 30px; padding: 0 10px;">💬 Chat</button>
+            <button onclick="window.location.href='/memory'" style="background: #f9e2af; height: 30px; padding: 0 10px;">💾 Memory</button>
             <button onclick="window.location.href='/settings'" style="background: #a6e3a1; height: 30px; padding: 0 10px;">⚙️ Settings</button>
             <button onclick="window.location.href='/auth/logout'" style="background: #45475a; color: white; height: 30px; padding: 0 10px;">Logout</button>
         </div>
     </header>
+
+    <!-- Session Control Bar -->
+    <div style="background: #181825; padding: 10px 20px; border-bottom: 1px solid #313244; display: flex; gap: 15px; align-items: center; justify-content: space-between;">
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button id="btn-run-benchmark" onclick="openBenchmarkModal()" style="background: #89b4fa; height: 30px; padding: 0 10px;">▶ Run Benchmark</button>
+        </div>
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button onclick="document.getElementById('parameters-panel').style.display = document.getElementById('parameters-panel').style.display === 'none' ? 'flex' : 'none'" style="background: #89dceb; height: 30px; padding: 0 10px;">🎛️ Parameters</button>
+        </div>
+    </div>
+
+    <div id="parameters-panel" style="display: none; background: #181825; padding: 15px 20px; border-bottom: 1px solid #313244; gap: 20px; flex-wrap: wrap; align-items: center; font-size: 0.9rem;">
+        <div class="param-group">
+            <label for="param-temp">Temperature: <span id="val-temp">0.7</span></label>
+            <input type="range" id="param-temp" min="0" max="2" step="0.1" value="0.7" oninput="document.getElementById('val-temp').innerText=this.value">
+        </div>
+        <div class="param-group">
+            <label for="param-top-p">Top-P: <span id="val-top-p">0.95</span></label>
+            <input type="range" id="param-top-p" min="0" max="1" step="0.05" value="0.95" oninput="document.getElementById('val-top-p').innerText=this.value">
+        </div>
+        <div class="param-group">
+            <label for="param-top-k">Top-K:</label>
+            <input type="number" id="param-top-k" min="1" max="100" value="40" style="width: 60px;">
+        </div>
+        <div class="param-group">
+            <label for="param-max-tokens">Max Tokens:</label>
+            <input type="number" id="param-max-tokens" min="1" max="8192" value="500" style="width: 80px;">
+        </div>
+        <div class="param-group">
+            <label for="param-seed">Seed (Optional):</label>
+            <input type="number" id="param-seed" placeholder="Random" style="width: 100px;">
+        </div>
+        <div class="param-group">
+            <label for="param-context-buffer">Ctx Buffer:</label>
+            <input type="number" id="param-context-buffer" min="0" max="128000" value="1024" style="width: 80px;">
+        </div>
+    </div>
 
     <div style="padding: 20px;">
 
@@ -75,7 +116,6 @@
                     <th>Parameters</th>
                     <th>Size on Disk</th>
                     <th>Max Context</th>
-                    <th>Avg Load Time (VRAM)</th>
                 </tr>
             </thead>
             <tbody id="model-table-body"></tbody>
@@ -93,7 +133,10 @@
             <div class="modal-content">
                 <h2>Select Models to Benchmark</h2>
                 <div id="model-checkbox-list" class="model-list">
-                    </div>
+                </div>
+                <h2>Select Backends</h2>
+                <div id="backend-checkbox-list" class="model-list" style="margin-bottom: 20px;">
+                </div>
                 <div class="modal-actions">
                     <button class="btn-cancel" onclick="closeModal()">Cancel</button>
                     <button class="btn-run" onclick="submitBenchmark()">Run Selected</button>
@@ -119,12 +162,22 @@
                 const listDiv = document.getElementById('model-checkbox-list');
                 listDiv.innerHTML = ''; // Clear previous list
                 
+                const allBackends = new Set();
                 models.forEach(m => {
                     listDiv.innerHTML += `
                         <label class="model-item">
                             <input type="checkbox" value="${m.id}" checked>
                             ${m.name} <span style="color: #6c7086; margin-left: 5px;">(${m.arch})</span>
                         </label>
+                    `;
+                    m.supported_backends.forEach(b => allBackends.add(b));
+                });
+                
+                const backendDiv = document.getElementById('backend-checkbox-list');
+                backendDiv.innerHTML = '';
+                allBackends.forEach(b => {
+                    backendDiv.innerHTML += `
+                        <label class="model-item"><input type="checkbox" value="${b}" checked> ${b}</label>
                     `;
                 });
                 
@@ -149,6 +202,22 @@
                 alert("Please select at least one model to benchmark.");
                 return;
             }
+            
+            const backendCheckboxes = document.querySelectorAll('#backend-checkbox-list input:checked');
+            const selectedBackends = Array.from(backendCheckboxes).map(cb => cb.value);
+            
+            if (selectedBackends.length === 0) {
+                alert("Please select at least one backend to benchmark.");
+                return;
+            }
+            
+        const temp = parseFloat(document.getElementById('param-temp').value);
+        const topP = parseFloat(document.getElementById('param-top-p').value);
+        const topK = parseInt(document.getElementById('param-top-k').value);
+        const maxTokens = parseInt(document.getElementById('param-max-tokens').value);
+        const seedVal = document.getElementById('param-seed').value;
+        const seed = seedVal !== "" ? parseInt(seedVal) : null;
+        const ctxBuffer = parseInt(document.getElementById('param-context-buffer').value) || 0;
 
             closeModal();
 
@@ -156,7 +225,18 @@
             const res = await fetch('/api/stats/collect', { 
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ models: selectedModels })
+            body: JSON.stringify({ 
+                models: selectedModels,
+                target_backends: selectedBackends,
+                parameters: {
+                    temperature: temp,
+                    top_p: topP,
+                    top_k: topK,
+                    max_tokens: maxTokens,
+                    seed: seed,
+                    context_buffer: ctxBuffer
+                }
+            })
             });
 
             if (res.status === 409) {
@@ -172,6 +252,13 @@
                 fetch('/api/stats/data')
             ]);
             
+            if (!modelsRes.ok || !statsRes.ok) {
+                if (modelsRes.status === 401 || statsRes.status === 401) {
+                    window.location.href = '/auth/login';
+                }
+                return;
+            }
+            
             const models = await modelsRes.json();
             const stats = await statsRes.json();
             
@@ -182,48 +269,79 @@
 
         function populateTable(models, loads) {
             const tbody = document.getElementById('model-table-body');
+            const thead = document.querySelector('table thead');
+            tbody.innerHTML = '';
             
-            // Calculate average load times
+            const allBackends = Array.from(new Set(models.flatMap(m => m.supported_backends))).sort();
+            
+            let theadHTML = `<tr>
+                <th>Model Name</th>
+                <th>Parameters</th>
+                <th>Size on Disk</th>
+                <th>Max Context</th>`;
+            allBackends.forEach(b => {
+                theadHTML += `<th>Avg Load (${b})</th>`;
+            });
+            theadHTML += `</tr>`;
+            thead.innerHTML = theadHTML;
+
             const loadAverages = {};
             loads.forEach(l => {
-                if (!loadAverages[l.model_id]) loadAverages[l.model_id] = { sum: 0, count: 0 };
-                loadAverages[l.model_id].sum += l.load_time_ms;
-                loadAverages[l.model_id].count++;
+                if (!loadAverages[l.model_id]) loadAverages[l.model_id] = {};
+                const b = l.backend || 'Candle'; // Fallback for old data points
+                if (!loadAverages[l.model_id][b]) loadAverages[l.model_id][b] = { sum: 0, count: 0 };
+                loadAverages[l.model_id][b].sum += l.load_time_ms;
+                loadAverages[l.model_id][b].count++;
             });
 
             models.forEach(m => {
-                const avgLoad = loadAverages[m.id] ? Math.round(loadAverages[m.id].sum / loadAverages[m.id].count) + " ms" : "No Data";
-                tbody.innerHTML += `
-                    <tr>
-                        <td>${m.name}</td>
-                        <td>${m.parameters_billions}B</td>
-                        <td>${m.size_on_disk_gb} GB</td>
-                        <td>${m.max_context_len.toLocaleString()}</td>
-                        <td>${avgLoad}</td>
-                    </tr>
-                `;
+                let rowHTML = `<tr>
+                    <td>${m.name}</td>
+                    <td>${m.parameters_billions}B</td>
+                    <td>${m.size_on_disk_gb} GB</td>
+                    <td>${m.max_context_len.toLocaleString()}</td>`;
+                    
+                allBackends.forEach(b => {
+                    if (loadAverages[m.id] && loadAverages[m.id][b]) {
+                        rowHTML += `<td>${Math.round(loadAverages[m.id][b].sum / loadAverages[m.id][b].count)} ms</td>`;
+                    } else {
+                        rowHTML += `<td><span style="color:#6c7086;">-</span></td>`;
+                    }
+                });
+                rowHTML += `</tr>`;
+                tbody.innerHTML += rowHTML;
             });
         }
 
         function renderSpeedChart(models, generations) {
-            const datasets = models.map((m, i) => {
-                const modelData = generations.filter(g => g.model_id === m.id);
+            const uniqueCombos = [];
+            models.forEach(m => {
+                m.supported_backends.forEach(b => {
+                    const hasData = generations.some(g => g.model_id === m.id && g.backend === b);
+                    if (hasData) uniqueCombos.push({ model: m, backend: b });
+                });
+            });
+
+            const datasets = uniqueCombos.map((combo, i) => {
+                const modelData = generations.filter(g => g.model_id === combo.model.id && g.backend === combo.backend);
                 // Group by prompt size to calculate averages
                 const grouped = {};
                 modelData.forEach(g => {
                     const bucket = g.prompt_tokens;
-                    if (!grouped[bucket]) grouped[bucket] = { sum: 0, count: 0 };
+                    if (!grouped[bucket]) grouped[bucket] = { sum: 0, count: 0, offload_sum: 0 };
                     grouped[bucket].sum += g.generation_time_ms;
+                    grouped[bucket].offload_sum += g.offload_pct || 0;
                     grouped[bucket].count++;
                 });
 
                 const dataPoints = Object.keys(grouped).map(tokens => ({
                     x: parseInt(tokens),
-                    y: grouped[tokens].sum / grouped[tokens].count
+                    y: grouped[tokens].sum / grouped[tokens].count,
+                    offload: grouped[tokens].offload_sum / grouped[tokens].count
                 })).sort((a, b) => a.x - b.x);
 
                 return {
-                    label: m.name,
+                    label: `${combo.model.name} (${combo.backend})`,
                     data: dataPoints,
                     borderColor: colorPalette[i % colorPalette.length],
                     backgroundColor: colorPalette[i % colorPalette.length],
@@ -237,7 +355,21 @@
                 data: { datasets },
                 options: {
                     responsive: true, maintainAspectRatio: false,
-                    plugins: { title: { display: true, text: 'Average Generation Time vs. Prompt Tokens', color: '#cdd6f4' }, legend: { labels: { color: '#cdd6f4' } } },
+                    plugins: { 
+                        title: { display: true, text: 'Average Generation Time vs. Prompt Tokens', color: '#cdd6f4' }, 
+                        legend: { labels: { color: '#cdd6f4' } },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    let label = context.dataset.label || '';
+                                    if (label) { label += ': '; }
+                                    label += `${Math.round(context.parsed.y)} ms`;
+                                    if (context.raw.offload > 0) { label += ` (${(context.raw.offload * 100).toFixed(1)}% offload)`; }
+                                    return label;
+                                }
+                            }
+                        }
+                    },
                     scales: {
                         x: { type: 'logarithmic', title: { display: true, text: 'Prompt Size (Tokens) - Log Scale', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } },
                         y: { title: { display: true, text: 'Generation Time (ms)', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } }
@@ -247,8 +379,16 @@
         }
 
         function renderTokenChart(models, generations) {
-            const datasets = models.map((m, i) => {
-                const modelData = generations.filter(g => g.model_id === m.id);
+            const uniqueCombos = [];
+            models.forEach(m => {
+                m.supported_backends.forEach(b => {
+                    const hasData = generations.some(g => g.model_id === m.id && g.backend === b);
+                    if (hasData) uniqueCombos.push({ model: m, backend: b });
+                });
+            });
+
+            const datasets = uniqueCombos.map((combo, i) => {
+                const modelData = generations.filter(g => g.model_id === combo.model.id && g.backend === combo.backend);
                 // Compare Raw Characters to Parsed Tokens
                 const dataPoints = modelData.map(g => ({
                     x: g.prompt_chars,
@@ -256,7 +396,7 @@
                 })).sort((a, b) => a.x - b.x);
 
                 return {
-                    label: m.name,
+                    label: `${combo.model.name} (${combo.backend})`,
                     data: dataPoints,
                     borderColor: colorPalette[i % colorPalette.length],
                     backgroundColor: colorPalette[i % colorPalette.length],
@@ -286,9 +426,14 @@
         async function checkStatus() {
             try {
                 const res = await fetch('/api/status');
+                if (!res.ok) {
+                    if (res.status === 401) window.location.href = '/auth/login';
+                    return;
+                }
+                
                 const status = await res.json();
                 
-                const btn = document.getElementById('benchmark-btn');
+                const btn = document.getElementById('btn-run-benchmark');
                 const banner = document.getElementById('benchmark-banner');
                 
                 if (status.benchmark_running) {
