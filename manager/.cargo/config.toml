@@ -2,4 +2,4 @@
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [env]
-CMAKE_TOOLCHAIN_FILE = "C:/Users/jscha/Software Projects/MiniInferenceEngine/manager/static_crt.cmake"
+CMAKE_TOOLCHAIN_FILE = { value = "../static_crt.cmake", relative = true }

@@ -27,6 +27,8 @@ pub struct GenerationMetric {
     pub offload_pct: f32,
     pub prompt_chars: usize,
     pub prompt_tokens: usize,
+    #[serde(default)]
+    pub tokenization_time_ms: u128,
     pub generation_time_ms: u128,
 }
 
@@ -79,9 +81,9 @@ impl TelemetryStore {
         }
     }
 
-    pub fn record_generation(&mut self, model_id: String, backend: String, parameters: GenerationParameters, offload_pct: f32, prompt_chars: usize, prompt_tokens: usize, generation_time_ms: u128) {
+    pub fn record_generation(&mut self, model_id: String, backend: String, parameters: GenerationParameters, offload_pct: f32, prompt_chars: usize, prompt_tokens: usize, tokenization_time_ms: u128, generation_time_ms: u128) {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        self.generations.push(GenerationMetric { timestamp, model_id, backend, parameters, offload_pct, prompt_chars, prompt_tokens, generation_time_ms });
+        self.generations.push(GenerationMetric { timestamp, model_id, backend, parameters, offload_pct, prompt_chars, prompt_tokens, tokenization_time_ms, generation_time_ms });
         
         self.unsaved_events += 1;
         if self.unsaved_events >= 5 {

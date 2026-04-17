@@ -1,5 +1,6 @@
 use std::num::NonZeroU32;
 use async_trait::async_trait;
+use self_cell::self_cell;
 use hf_hub::api::sync::Api;
 
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -17,91 +18,121 @@ use crate::registry::ModelConfig;
 use crate::types::GenerationParameters;
 use crate::backend::InferenceBackend;
 
+self_cell! {
+    struct LlamaInstance {
+        owner: LlamaModel,
+        #[covariant]
+        dependent: LlamaContext,
+    }
+}
+
 pub struct LlamaCppEngine {
-    backend: LlamaBackend,
-    model: Option<LlamaModel>,
-    context: Option<LlamaContext<'static>>,
+    backend: Arc<LlamaBackend>,
+    instance: std::sync::Mutex<Option<LlamaInstance>>,
     offload_pct: f32,
 }
 
-// Safety: LlamaContext uses raw C pointers. We safely encapsulate them behind 
-// the InferenceBackend trait, which ensures exclusive access during generation.
-unsafe impl Send for LlamaCppEngine {}
-unsafe impl Sync for LlamaCppEngine {}
-
-impl Drop for LlamaCppEngine {
-    fn drop(&mut self) {
-        // The context relies on the model. We must drop it first!
-        self.context.take();
-        self.model.take();
-    }
-}
+// Safety: LlamaContext uses raw C pointers. We safely encapsulate them
+// and ensure thread-safe concurrent access by wrapping the instance in a Mutex.
+unsafe impl Send for LlamaInstance {}
 
 impl LlamaCppEngine {
     pub fn new() -> Result<Self, String> {
         let backend = LlamaBackend::init().map_err(|e| format!("Failed to init llama backend: {}", e))?;
         Ok(Self {
-            backend,
-            model: None,
-            context: None,
+            backend: Arc::new(backend),
+            instance: std::sync::Mutex::new(None),
             offload_pct: 0.0,
         })
     }
     
     pub async fn generate_stream(&mut self, prompt: &str, params: &GenerationParameters, tx: tokio::sync::mpsc::UnboundedSender<crate::types::StreamEvent>) {
-        let model = match self.model.as_ref() {
-            Some(m) => m,
-            None => { let _ = tx.send(crate::types::StreamEvent::Error("Model not loaded".into())); return; }
+        let tok_start = std::time::Instant::now();
+        let tokens_list = {
+            let mut lock = self.instance.lock().unwrap();
+            let instance = match lock.as_mut() {
+                Some(i) => i,
+                None => { let _ = tx.send(crate::types::StreamEvent::Error("Model not loaded".into())); return; }
+            };
+            match instance.with_dependent_mut(|model, _| model.str_to_token(prompt, AddBos::Always)) {
+                Ok(t) => t,
+                Err(e) => { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); return; }
+            }
         };
-        let ctx = match self.context.as_mut() {
-            Some(c) => c,
-            None => { let _ = tx.send(crate::types::StreamEvent::Error("Context not loaded".into())); return; }
-        };
-        let tokens_list = match model.str_to_token(prompt, AddBos::Always) {
-            Ok(t) => t,
-            Err(e) => { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); return; }
-        };
-        ctx.clear_kv_cache();
+        
+        let tok_time = tok_start.elapsed().as_millis();
+        let _ = tx.send(crate::types::StreamEvent::TokenizationTime(tok_time));
+        
+        self.instance.lock().unwrap().as_mut().unwrap().with_dependent_mut(|_, ctx| ctx.clear_kv_cache());
 
         // Chunked Prefill to avoid batch size limits
-        let n_batch = ctx.n_batch() as usize;
+        let n_batch = self.instance.lock().unwrap().as_mut().unwrap().with_dependent_mut(|_, ctx| ctx.n_batch() as usize);
         let mut current_pos = 0;
         let last_index_of_prompt = tokens_list.len().saturating_sub(1);
         let mut logit_index = 0;
         
         for chunk in tokens_list.chunks(n_batch) {
-            let mut batch = LlamaBatch::new(chunk.len(), 1);
-            for (i, &token) in chunk.iter().enumerate() {
-                let pos = current_pos + i;
-                // The last token of the entire prompt has logits enabled.
-                let is_last = pos == last_index_of_prompt;
-                if is_last { logit_index = i as i32; }
-                if let Err(e) = batch.add(token, pos as i32, &[0], is_last) { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); return; }
+            {
+                let mut lock = self.instance.lock().unwrap();
+                let instance = lock.as_mut().unwrap();
+                let mut batch = LlamaBatch::new(chunk.len(), 1);
+                for (i, &token) in chunk.iter().enumerate() {
+                    let pos = current_pos + i;
+                    // The last token of the entire prompt has logits enabled.
+                    let is_last = pos == last_index_of_prompt;
+                    if is_last { logit_index = i as i32; }
+                    if let Err(e) = batch.add(token, pos as i32, &[0], is_last) { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); return; }
+                }
+                if let Err(e) = instance.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)) { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); return; }
             }
-            if let Err(e) = ctx.decode(&mut batch) { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); return; }
             current_pos += chunk.len();
+            tokio::task::yield_now().await;
         }
 
         let mut n_cur = tokens_list.len() as i32;
         let max_new_tokens = params.max_tokens.unwrap_or(500) as i32;
         let mut generated_tokens = 0;
+        let seed = params.seed.unwrap_or(42) as u32;
         
         while generated_tokens < max_new_tokens {
-            let candidates = ctx.candidates_ith(logit_index);
-            let mut candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
-            
-            let new_token_id = candidates_p.sample_token(params.seed.unwrap_or(42) as u32);
-            if model.is_eog_token(new_token_id) { break; }
-            if let Ok(token_bytes) = model.token_to_piece_bytes(new_token_id, 128, false, None) {
-                let text = String::from_utf8_lossy(&token_bytes).to_string();
-                if tx.send(crate::types::StreamEvent::Token(text)).is_err() { break; }
+            let (new_token_id, is_eog, text) = {
+                let mut lock = self.instance.lock().unwrap();
+                let instance = lock.as_mut().unwrap();
+                instance.with_dependent_mut(|model, ctx| {
+                    let candidates = ctx.candidates_ith(logit_index);
+                    let mut candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
+                    
+                    let new_token_id = candidates_p.sample_token(seed);
+                    let is_eog = model.is_eog_token(new_token_id);
+                    
+                    let text = if !is_eog {
+                        model.token_to_piece_bytes(new_token_id, 128, false, None)
+                            .ok()
+                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    } else { None };
+                    
+                    (new_token_id, is_eog, text)
+                })
+            };
+
+            if is_eog { break; }
+            if let Some(t) = text {
+                if tx.send(crate::types::StreamEvent::Token(t)).is_err() { break; }
             }
-            let mut batch = LlamaBatch::new(1, 1);
-            if let Err(e) = batch.add(new_token_id, n_cur, &[0], true) { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); break; }
-            if let Err(e) = ctx.decode(&mut batch) { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); break; }
+            
+            {
+                let mut lock = self.instance.lock().unwrap();
+                let instance = lock.as_mut().unwrap();
+                let mut batch = LlamaBatch::new(1, 1);
+                if let Err(e) = batch.add(new_token_id, n_cur, &[0], true) { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); break; }
+                if let Err(e) = instance.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)) { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); break; }
+            }
+            
             logit_index = 0;
             n_cur += 1;
             generated_tokens += 1;
+            
+            tokio::task::yield_now().await;
         }
         let _ = tx.send(crate::types::StreamEvent::Done);
     }
@@ -166,9 +197,6 @@ impl InferenceBackend for LlamaCppEngine {
             }
         }
 
-        let mut model_params = LlamaModelParams::default();
-        model_params = model_params.with_n_gpu_layers(n_gpu_layers); 
-        
         let (vram_used_before, vram_total, _) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0, 0, 0));
 
         {
@@ -176,8 +204,14 @@ impl InferenceBackend for LlamaCppEngine {
             s.log_vram("Allocate", "LlamaCpp", &format!("Loading weights for {}", config.id), 0);
         }
 
-        self.model = Some(LlamaModel::load_from_file(&self.backend, weights_path, &model_params)
-            .map_err(|e| format!("Failed to load llama.cpp model: {}", e))?);
+        let backend_clone = self.backend.clone();
+        let model = tokio::task::spawn_blocking(move || {
+            let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
+            LlamaModel::load_from_file(&*backend_clone, weights_path, &model_params)
+        })
+        .await
+        .map_err(|e| format!("Model loading task panicked: {}", e))?
+        .map_err(|e| format!("Failed to load llama.cpp model: {}", e))?;
             
         let (vram_used_after, _, vram_free_after) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0, 0, 0));
         let weights_vram = vram_used_after.saturating_sub(vram_used_before);
@@ -213,8 +247,10 @@ impl InferenceBackend for LlamaCppEngine {
         
         let (vram_used_before_ctx, _, _) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0, 0, 0));
 
-        let context = self.model.as_ref().unwrap().new_context(&self.backend, ctx_params)
-            .map_err(|e| format!("Failed to create llama.cpp context: {}", e))?;
+        let instance = LlamaInstance::try_new(
+            model,
+            |m| m.new_context(&*self.backend, ctx_params)
+        ).map_err(|e| format!("Failed to create llama.cpp context: {}", e))?;
             
         let (vram_used_after_ctx, _, vram_free_final) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0, 0, 0));
         let kv_vram = vram_used_after_ctx.saturating_sub(vram_used_before_ctx);
@@ -226,67 +262,99 @@ impl InferenceBackend for LlamaCppEngine {
             s.update_nvml(vram_total, vram_used_after_ctx, vram_free_final);
         }
 
-        // Safely decouple the Rust lifetime since the underlying C pointers remain valid in heap memory.
-        self.context = Some(unsafe { std::mem::transmute::<LlamaContext<'_>, LlamaContext<'static>>(context) });
+        *self.instance.lock().unwrap() = Some(instance);
         Ok(final_ctx_len)
     }
     
-    async fn generate_text(&mut self, prompt: &str, params: &GenerationParameters) -> Result<String, String> {
-        let model = self.model.as_ref().ok_or("Model not loaded")?;
-        let ctx = self.context.as_mut().ok_or("Context not loaded")?;
+    async fn generate_text(&mut self, prompt: &str, params: &GenerationParameters) -> Result<(String, u128), String> {
+        let tok_start = std::time::Instant::now();
+        let tokens_list = {
+            let mut lock = self.instance.lock().unwrap();
+            let instance = lock.as_mut().ok_or("Model not loaded")?;
+            instance.with_dependent_mut(|model, _| {
+                model.str_to_token(prompt, AddBos::Always)
+            }).map_err(|e| e.to_string())?
+        };
         
-        // Convert the string prompt to tokens
-        let tokens_list = model.str_to_token(prompt, AddBos::Always)
-            .map_err(|e| e.to_string())?;
+        let tok_time = tok_start.elapsed().as_millis();
             
-        ctx.clear_kv_cache();
+        self.instance.lock().unwrap().as_mut().unwrap().with_dependent_mut(|_, ctx| ctx.clear_kv_cache());
 
         // Chunked Prefill to avoid batch size limits
-        let n_batch = ctx.n_batch() as usize;
+        let n_batch = self.instance.lock().unwrap().as_mut().unwrap().with_dependent_mut(|_, ctx| ctx.n_batch() as usize);
         let mut current_pos = 0;
         let last_index_of_prompt = tokens_list.len().saturating_sub(1);
         let mut logit_index = 0;
         
         for chunk in tokens_list.chunks(n_batch) {
-            let mut batch = LlamaBatch::new(chunk.len(), 1);
-            for (i, &token) in chunk.iter().enumerate() {
-                let pos = current_pos + i;
-                let is_last = pos == last_index_of_prompt;
-                if is_last { logit_index = i as i32; }
-                batch.add(token, pos as i32, &[0], is_last).map_err(|e| e.to_string())?;
+            {
+                let mut lock = self.instance.lock().unwrap();
+                let instance = lock.as_mut().unwrap();
+                let mut batch = LlamaBatch::new(chunk.len(), 1);
+                for (i, &token) in chunk.iter().enumerate() {
+                    let pos = current_pos + i;
+                    let is_last = pos == last_index_of_prompt;
+                    if is_last { logit_index = i as i32; }
+                    batch.add(token, pos as i32, &[0], is_last).map_err(|e| e.to_string())?;
+                }
+                instance.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)).map_err(|e| e.to_string())?;
             }
-            ctx.decode(&mut batch).map_err(|e| e.to_string())?;
             current_pos += chunk.len();
+            tokio::task::yield_now().await;
         }
         
         let mut output = String::new();
         let mut n_cur = tokens_list.len() as i32;
         let max_new_tokens = params.max_tokens.unwrap_or(500) as i32;
         let mut generated_tokens = 0;
+        let seed = params.seed.unwrap_or(42) as u32;
         
         while generated_tokens < max_new_tokens {
-            let candidates = ctx.candidates_ith(logit_index);
-            let mut candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
+            let (new_token_id, is_eog, text) = {
+                let mut lock = self.instance.lock().unwrap();
+                let instance = lock.as_mut().unwrap();
+                instance.with_dependent_mut(|model, ctx| {
+                    let candidates = ctx.candidates_ith(logit_index);
+                    let mut candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
+                    
+                    let new_token_id = candidates_p.sample_token(seed);
+                    let is_eog = model.is_eog_token(new_token_id);
+                    
+                    let text = if !is_eog {
+                        model.token_to_piece_bytes(new_token_id, 128, false, None)
+                            .ok()
+                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    } else { None };
+                    
+                    (new_token_id, is_eog, text)
+                })
+            };
             
-            let new_token_id = candidates_p.sample_token(params.seed.unwrap_or(42) as u32);
-            if model.is_eog_token(new_token_id) { break; }
+            if is_eog { break; }
             
-            let token_bytes = model.token_to_piece_bytes(new_token_id, 128, false, None).map_err(|e| e.to_string())?;
-            output.push_str(&String::from_utf8_lossy(&token_bytes));
+            if let Some(t) = text {
+                output.push_str(&t);
+            }
             
-            let mut batch = LlamaBatch::new(1, 1);
-            batch.add(new_token_id, n_cur, &[0], true).map_err(|e| e.to_string())?;
-            ctx.decode(&mut batch).map_err(|e| e.to_string())?;
+            {
+                let mut lock = self.instance.lock().unwrap();
+                let instance = lock.as_mut().unwrap();
+                let mut batch = LlamaBatch::new(1, 1);
+                batch.add(new_token_id, n_cur, &[0], true).map_err(|e| e.to_string())?;
+                instance.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)).map_err(|e| e.to_string())?;
+            }
             logit_index = 0;
             n_cur += 1;
             generated_tokens += 1;
+            
+            tokio::task::yield_now().await;
         }
         
-        Ok(output)
+        Ok((output, tok_time))
     }
     
     fn supports_extractive_compression(&self) -> bool { false }
-    async fn compress_text(&mut self, _prompt: &str, _target_len: usize, _max_chunk: usize) -> Result<String, String> { Err("Not supported".into()) }
+    async fn compress_text(&mut self, _prompt: &str, _target_len: usize, _max_chunk: usize) -> Result<(String, u128), String> { Err("Not supported".into()) }
     fn get_vram_usage(&self) -> Option<(u64, u64)> { None }
 
     fn is_statically_allocated(&self) -> bool { true }

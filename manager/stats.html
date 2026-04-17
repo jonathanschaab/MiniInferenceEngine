@@ -129,6 +129,10 @@
             <canvas id="tokenChart"></canvas>
         </div>
 
+        <div class="chart-container">
+            <canvas id="tokTimeChart"></canvas>
+        </div>
+
         <div id="benchmark-modal" class="modal-overlay">
             <div class="modal-content">
                 <h2>Select Models to Benchmark</h2>
@@ -265,6 +269,7 @@
             populateTable(models, stats.loads);
             renderSpeedChart(models, stats.generations);
             renderTokenChart(models, stats.generations);
+            renderTokTimeChart(models, stats.generations);
         }
 
         function populateTable(models, loads) {
@@ -414,6 +419,57 @@
                     scales: {
                         x: { type: 'logarithmic', title: { display: true, text: 'File Size (Raw Characters) - Log Scale', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } },
                         y: { type: 'logarithmic', title: { display: true, text: 'Required Tokens', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } }
+                    }
+                }
+            });
+        }
+
+        function renderTokTimeChart(models, generations) {
+            const uniqueCombos = [];
+            models.forEach(m => {
+                m.supported_backends.forEach(b => {
+                    const hasData = generations.some(g => g.model_id === m.id && g.backend === b);
+                    if (hasData) uniqueCombos.push({ model: m, backend: b });
+                });
+            });
+
+            const datasets = uniqueCombos.map((combo, i) => {
+                const modelData = generations.filter(g => g.model_id === combo.model.id && g.backend === combo.backend);
+                const grouped = {};
+                modelData.forEach(g => {
+                    const bucket = g.prompt_tokens;
+                    if (!grouped[bucket]) grouped[bucket] = { sum: 0, count: 0 };
+                    grouped[bucket].sum += g.tokenization_time_ms || 0;
+                    grouped[bucket].count++;
+                });
+
+                const dataPoints = Object.keys(grouped).map(tokens => ({
+                    x: parseInt(tokens),
+                    y: grouped[tokens].sum / grouped[tokens].count
+                })).sort((a, b) => a.x - b.x);
+
+                return {
+                    label: `${combo.model.name} (${combo.backend})`,
+                    data: dataPoints,
+                    borderColor: colorPalette[(i + 2) % colorPalette.length],
+                    backgroundColor: colorPalette[(i + 2) % colorPalette.length],
+                    tension: 0.3,
+                    showLine: true
+                };
+            }).filter(d => d.data.length > 0);
+
+            new Chart(document.getElementById('tokTimeChart'), {
+                type: 'scatter',
+                data: { datasets },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { 
+                        title: { display: true, text: 'Average Tokenization Time vs. Prompt Tokens', color: '#cdd6f4' }, 
+                        legend: { labels: { color: '#cdd6f4' } }
+                    },
+                    scales: {
+                        x: { type: 'logarithmic', title: { display: true, text: 'Prompt Size (Tokens) - Log Scale', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } },
+                        y: { title: { display: true, text: 'Tokenization Time (ms)', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } }
                     }
                 }
             });

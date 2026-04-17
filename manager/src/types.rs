@@ -192,6 +192,7 @@ pub struct ApiResponse {
 #[derive(Debug)]
 pub enum StreamEvent {
     Token(String),
+    TokenizationTime(u128),
     Done,
     Error(String),
 }

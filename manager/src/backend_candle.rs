@@ -101,8 +101,11 @@ pub fn load_engine(model_id: &str, device: &Device) -> Result<(DynamicModel, Tok
     Ok((model, tokenizer, Some(file)))
 }
 
-pub fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, max_tokens: usize) -> Result<String, String> {
+pub async fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, max_tokens: usize) -> Result<(String, u128), String> {
+    let tok_start = std::time::Instant::now();
     let mut tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
+    let tok_time = tok_start.elapsed().as_millis();
+    
     let prompt_length = tokens.len();
     let mut logits_processor = LogitsProcessor::new(299792458, None, None);
 
@@ -120,6 +123,7 @@ pub fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokeniz
 
             let _ = model.forward(&input_tensor, current_pos).map_err(|e| e.to_string())?;
             current_pos += chunk.len();
+            tokio::task::yield_now().await;
         }
     }
 
@@ -141,13 +145,18 @@ pub fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokeniz
         
         tokens.push(next_token);
         if next_token == 2 || next_token == 151645 || next_token == 151643 || next_token == 128001 || next_token == 128009 { break; }
+        tokio::task::yield_now().await;
     }
     
-    tokenizer.decode(&tokens[prompt_length..], true).map_err(|e| e.to_string())
+    Ok((tokenizer.decode(&tokens[prompt_length..], true).map_err(|e| e.to_string())?, tok_time))
 }
 
-pub fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, max_tokens: usize, tx: tokio::sync::mpsc::UnboundedSender<crate::types::StreamEvent>) -> Result<(), String> {
+pub async fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, max_tokens: usize, tx: tokio::sync::mpsc::UnboundedSender<crate::types::StreamEvent>) -> Result<(), String> {
+    let tok_start = std::time::Instant::now();
     let mut tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
+    let tok_time = tok_start.elapsed().as_millis();
+    let _ = tx.send(crate::types::StreamEvent::TokenizationTime(tok_time));
+    
     let prompt_length = tokens.len();
     let mut logits_processor = LogitsProcessor::new(299792458, None, None);
     let prefill_chunk_size = 256; 
@@ -158,6 +167,7 @@ pub fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokenizer: &
             let input_tensor = Tensor::new(chunk, device).map_err(|e| e.to_string())?.unsqueeze(0).map_err(|e| e.to_string())?.contiguous().map_err(|e| e.to_string())?;
             let _ = model.forward(&input_tensor, current_pos).map_err(|e| e.to_string())?;
             current_pos += chunk.len();
+            tokio::task::yield_now().await;
         }
     }
 
@@ -179,14 +189,17 @@ pub fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokenizer: &
                 if tx.send(crate::types::StreamEvent::Token(new_text)).is_err() { break; }
             }
         }
+        tokio::task::yield_now().await;
     }
     let _ = tx.send(crate::types::StreamEvent::Done);
     Ok(())
 }
 
-pub fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, device: &Device, target_len: usize, max_chunk_size: usize) -> Result<String, String> {
+pub async fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, device: &Device, target_len: usize, max_chunk_size: usize) -> Result<(String, u128), String> {
     if let DynamicModel::XLMRoberta(m) = model {
+        let tok_start = std::time::Instant::now();
         let tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
+        let tok_time = tok_start.elapsed().as_millis();
         let mut token_scores: Vec<(usize, u32, f32)> = Vec::new(); 
         let mut global_idx = 0;
 
@@ -206,6 +219,7 @@ pub fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, 
                 token_scores.push((global_idx, *token, probs_vec[i][1]));
                 global_idx += 1;
             }
+            tokio::task::yield_now().await;
         }
 
         token_scores.sort_by(|a, b| b.2.total_cmp(&a.2));
@@ -216,7 +230,7 @@ pub fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Tokenizer, 
         let compressed_text = tokenizer.decode(&kept_tokens, true).map_err(|e| e.to_string())?;
         println!("✅ Extractive compression complete. Shrunk from {} to {} tokens.", tokens.len(), kept_tokens.len());
         
-        Ok(compressed_text)
+        Ok((compressed_text, tok_time))
     } else {
         Err("compress_text must be used with a Token Classifier!".to_string())
     }
@@ -248,7 +262,7 @@ impl CandleEngine {
             Some(t) => t,
             None => { let _ = tx.send(crate::types::StreamEvent::Error("Tokenizer not loaded".into())); return; }
         };
-        if let Err(e) = generate_text_stream(prompt, model, tokenizer, &self.device, params.max_tokens.unwrap_or(500), tx.clone()) {
+        if let Err(e) = generate_text_stream(prompt, model, tokenizer, &self.device, params.max_tokens.unwrap_or(500), tx.clone()).await {
             let _ = tx.send(crate::types::StreamEvent::Error(e));
         }
     }
@@ -281,20 +295,20 @@ impl InferenceBackend for CandleEngine {
         Ok(config.max_context_len)
     }
     
-    async fn generate_text(&mut self, prompt: &str, params: &GenerationParameters) -> Result<String, String> {
+    async fn generate_text(&mut self, prompt: &str, params: &GenerationParameters) -> Result<(String, u128), String> {
         let model = self.model.as_mut().ok_or("Model not loaded")?;
         let tokenizer = self.tokenizer.as_ref().ok_or("Tokenizer not loaded")?;
-        generate_text(prompt, model, tokenizer, &self.device, params.max_tokens.unwrap_or(500))
+        generate_text(prompt, model, tokenizer, &self.device, params.max_tokens.unwrap_or(500)).await
     }
     
     fn supports_extractive_compression(&self) -> bool {
         matches!(self.model, Some(DynamicModel::XLMRoberta(_)))
     }
     
-    async fn compress_text(&mut self, prompt: &str, target_len: usize, max_chunk: usize) -> Result<String, String> {
+    async fn compress_text(&mut self, prompt: &str, target_len: usize, max_chunk: usize) -> Result<(String, u128), String> {
         let model = self.model.as_ref().ok_or("Model not loaded")?;
         let tokenizer = self.tokenizer.as_ref().ok_or("Tokenizer not loaded")?;
-        compress_text(prompt, model, tokenizer, &self.device, target_len, max_chunk)
+        compress_text(prompt, model, tokenizer, &self.device, target_len, max_chunk).await
     }
     
     fn get_vram_usage(&self) -> Option<(u64, u64)> {

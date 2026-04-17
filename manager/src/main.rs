@@ -109,6 +109,7 @@ async fn handle_generate(
     let stream = UnboundedReceiverStream::new(response_rx).map(|event| {
         match event {
             StreamEvent::Token(t) => Ok::<_, std::convert::Infallible>(Bytes::from(t)),
+            StreamEvent::TokenizationTime(_) => Ok(Bytes::new()),
             StreamEvent::Done => Ok(Bytes::new()),
             StreamEvent::Error(e) => Ok(Bytes::from(format!("Error: {}", e))),
         }
@@ -267,6 +268,7 @@ async fn trigger_benchmark(
                             StreamEvent::Token(t) => generated_seed.push_str(&t),
                             StreamEvent::Done => break,
                             StreamEvent::Error(e) => { generated_seed.push_str(&e); break; },
+                            StreamEvent::TokenizationTime(_) => {}, // Ignore for seed generation
                         }
                     }
 

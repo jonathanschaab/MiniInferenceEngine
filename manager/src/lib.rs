@@ -50,13 +50,13 @@ impl ActiveBackend {
             #[cfg(feature = "backend-llamacpp")] ActiveBackend::LlamaCpp(b) => b.generate_stream(prompt, params, tx).await,
         }
     }
-    pub async fn generate_text(&mut self, prompt: &str, params: &GenerationParameters) -> Result<String, String> {
+    pub async fn generate_text(&mut self, prompt: &str, params: &GenerationParameters) -> Result<(String, u128), String> {
         match self {
             #[cfg(feature = "backend-candle")] ActiveBackend::Candle(b) => b.generate_text(prompt, params).await,
             #[cfg(feature = "backend-llamacpp")] ActiveBackend::LlamaCpp(b) => b.generate_text(prompt, params).await,
         }
     }
-    pub async fn compress_text(&mut self, prompt: &str, target_len: usize, max_chunk: usize) -> Result<String, String> {
+    pub async fn compress_text(&mut self, prompt: &str, target_len: usize, max_chunk: usize) -> Result<(String, u128), String> {
         match self {
             #[cfg(feature = "backend-candle")] ActiveBackend::Candle(b) => b.compress_text(prompt, target_len, max_chunk).await,
             #[cfg(feature = "backend-llamacpp")] ActiveBackend::LlamaCpp(b) => b.compress_text(prompt, target_len, max_chunk).await,
@@ -389,7 +389,7 @@ pub async fn run_batcher_loop(
             // --- RECORD COMPRESSION EXECUTION TIME ---
             let comp_start = Instant::now();
             
-            let summary = if comp_backend.supports_extractive_compression() {
+            let (summary, comp_tok_time) = if comp_backend.supports_extractive_compression() {
                 match comp_backend.compress_text(&formatted_prompt, target_budget, comp_config.max_context_len).await {
                     Ok(compressed) => compressed,
                     Err(e) => {
@@ -413,11 +413,11 @@ pub async fn run_batcher_loop(
             };
 
             let comp_elapsed = comp_start.elapsed().as_millis();
-            println!("⏱️ Compression completed in {} ms", comp_elapsed);
+            println!("⏱️ Compression completed in {} ms (Tokenization: {} ms)", comp_elapsed, comp_tok_time);
             let comp_btype_str = format!("{:?}", comp_btype);
             let comp_offload_pct = comp_backend.get_offload_pct();
             if let Ok(mut t) = telemetry.lock() {
-                t.record_generation(request.compressor_model_id.clone(), comp_btype_str, request.parameters.clone(), comp_offload_pct, formatted_prompt.len(), token_count, comp_elapsed);
+                t.record_generation(request.compressor_model_id.clone(), comp_btype_str, request.parameters.clone(), comp_offload_pct, formatted_prompt.len(), token_count, comp_tok_time, comp_elapsed);
             }
 
             if comp_backend.get_offload_pct() > 0.0 {
@@ -456,19 +456,35 @@ pub async fn run_batcher_loop(
 
         println!("📥 Processing prompt...");
         let gen_start = Instant::now();
+
+        let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tokenization_time_ms: u128 = 0;
+        let responder = request.responder;
+
+        let gen_fut = active_backend.as_mut().unwrap().generate_stream(&formatted_prompt, &request.parameters, inner_tx);
         
-        active_backend.as_mut().unwrap()
-            .generate_stream(&formatted_prompt, &request.parameters, request.responder).await;
+        // Concurrently run the backend generator and dynamically intercept internal stream
+        // events like 'TokenizationTime' so they don't leak into the web HTTP chunked response!
+        let fwd_fut = async {
+            while let Some(ev) = inner_rx.recv().await {
+                match ev {
+                    StreamEvent::TokenizationTime(t) => tokenization_time_ms = t,
+                    other => { let _ = responder.send(other); }
+                }
+            }
+        };
+
+        tokio::join!(gen_fut, fwd_fut);
             
         let elapsed = gen_start.elapsed().as_millis();
-        println!("⏱️ Generation completed in {} ms", elapsed);
+        println!("⏱️ Generation completed in {} ms (Tokenization: {} ms)", elapsed, tokenization_time_ms);
         let active_backend_name = {
             let s = lock_status(&status);
             s.active_backend.clone().unwrap_or_else(|| "Unknown".to_string())
         };
         let offload_pct = active_backend.as_ref().unwrap().get_offload_pct();
         if let Ok(mut t) = telemetry.lock() {
-            t.record_generation(active_model_id.clone(), active_backend_name, request.parameters.clone(), offload_pct, formatted_prompt.len(), token_count, elapsed);
+            t.record_generation(active_model_id.clone(), active_backend_name, request.parameters.clone(), offload_pct, formatted_prompt.len(), token_count, tokenization_time_ms, elapsed);
         }
     } // Closes the 'main while loop
 } // Closes the run_batcher_loop function
