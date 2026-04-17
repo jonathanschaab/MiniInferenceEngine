@@ -4,3 +4,4 @@ api_keys.json
 client_secret.apps.googleusercontent.com.json
 config.json
 stats.json
+server.log
