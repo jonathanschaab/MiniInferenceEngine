@@ -57,14 +57,14 @@ pub fn load_engine(
     device: &Device,
 ) -> Result<(DynamicModel, Tokenizer, Option<std::fs::File>), String> {
     let config = get_model_registry()
-        .into_iter()
+        .iter()
         .find(|c| c.id == model_id)
         .ok_or_else(|| format!("Model ID {} not found in registry", model_id))?;
 
     let api = Api::new().map_err(|e| e.to_string())?;
 
     if config.filename.ends_with(".safetensors") {
-        let repo = api.model(config.repo);
+        let repo = api.model(config.repo.clone());
         let weights_path = repo
             .get(&config.filename)
             .map_err(|e| format!("Missing weights: {}", e))?;
@@ -72,7 +72,7 @@ pub fn load_engine(
             .get("config.json")
             .map_err(|e| format!("Missing config.json: {}", e))?;
         let tokenizer_path = api
-            .model(config.tokenizer_repo)
+            .model(config.tokenizer_repo.clone())
             .get("tokenizer.json")
             .map_err(|e| format!("Missing tokenizer: {}", e))?;
 
@@ -103,11 +103,11 @@ pub fn load_engine(
     }
 
     let weights_path = api
-        .model(config.repo)
+        .model(config.repo.clone())
         .get(&config.filename)
         .map_err(|e| e.to_string())?;
     let tokenizer_path = api
-        .model(config.tokenizer_repo)
+        .model(config.tokenizer_repo.clone())
         .get("tokenizer.json")
         .map_err(|e| e.to_string())?;
 

@@ -182,7 +182,7 @@ pub async fn run_batcher_loop(
         let requested_max_tokens = request.parameters.max_tokens.unwrap_or(500);
         let ctx_buffer = request.parameters.context_buffer.unwrap_or(0);
         let config_for_prompt = match get_model_registry()
-            .into_iter()
+            .iter()
             .find(|c| c.id == request.chat_model_id)
         {
             Some(c) => c,
@@ -263,14 +263,14 @@ pub async fn run_batcher_loop(
                             }
                     })
                 {
-                    b.clone()
+                    *b
                 } else if config_for_prompt
                     .supported_backends
                     .contains(&BackendType::LlamaCpp)
                 {
                     BackendType::LlamaCpp
                 } else if let Some(b) = config_for_prompt.supported_backends.first() {
-                    b.clone()
+                    *b
                 } else {
                     let _ = request.responder.send(StreamEvent::Error(
                         "Server Error: No supported backend found for this model.".to_string(),
@@ -543,7 +543,7 @@ pub async fn run_batcher_loop(
             }
 
             let comp_config = match get_model_registry()
-                .into_iter()
+                .iter()
                 .find(|c| c.id == request.compressor_model_id)
             {
                 Some(c) => c,
@@ -604,7 +604,7 @@ pub async fn run_batcher_loop(
             let comp_load_start = Instant::now();
             if let Err(e) = comp_backend
                 .load_model(
-                    &comp_config,
+                    comp_config,
                     status.clone(),
                     &MemoryStrategy::Offload,
                     comp_required_ctx,

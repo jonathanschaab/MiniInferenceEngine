@@ -87,7 +87,7 @@ async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>
 
 // Send the model roster to the Javascript dropdowns
 async fn get_models() -> Json<Vec<ModelConfig>> {
-    Json(get_model_registry())
+    Json(get_model_registry().to_vec())
 }
 
 // Handle incoming chat requests
@@ -212,8 +212,9 @@ async fn trigger_benchmark(
             .unwrap_or_else(|| default_chat.clone());
 
         let registry: Vec<ModelConfig> = full_registry
-            .into_iter()
+            .iter()
             .filter(|m| selected_models.contains(&m.id))
+            .cloned()
             .collect();
 
         if registry.is_empty() {
