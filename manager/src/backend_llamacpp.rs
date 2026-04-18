@@ -46,6 +46,29 @@ enum EngineCommand {
     },
 }
 
+fn process_utf8_buffer(byte_buffer: &mut Vec<u8>) -> String {
+    let mut result = String::new();
+    match std::str::from_utf8(byte_buffer) {
+        Ok(valid_str) => {
+            result.push_str(valid_str);
+            byte_buffer.clear();
+        }
+        Err(e) => {
+            let valid_len = e.valid_up_to();
+            if valid_len > 0 {
+                let valid_str = unsafe { std::str::from_utf8_unchecked(&byte_buffer[..valid_len]) };
+                result.push_str(valid_str);
+                byte_buffer.drain(..valid_len);
+            }
+            if e.error_len().is_some() {
+                result.push_str(&String::from_utf8_lossy(byte_buffer));
+                byte_buffer.clear();
+            }
+        }
+    }
+    result
+}
+
 pub struct LlamaCppEngine {
     command_tx: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     offload_pct: f32,
@@ -56,10 +79,23 @@ impl LlamaCppEngine {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineCommand>();
 
         std::thread::spawn(move || {
-            let backend = match LlamaBackend::init() {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("Failed to init llama backend: {}", e);
+            let mut backend_opt = None;
+            for _ in 0..100 {
+                match LlamaBackend::init() {
+                    Ok(b) => {
+                        backend_opt = Some(b);
+                        break;
+                    }
+                    Err(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+
+            let backend = match backend_opt {
+                Some(b) => b,
+                None => {
+                    eprintln!("Failed to init llama backend: Timeout waiting for previous instance to release.");
                     return;
                 }
             };
@@ -346,23 +382,9 @@ impl LlamaCppEngine {
                                 if is_eog { break; }
                                 
                                 byte_buffer.extend_from_slice(&new_bytes);
-                                match std::str::from_utf8(&byte_buffer) {
-                                    Ok(valid_str) => {
-                                        output.push_str(valid_str);
-                                        byte_buffer.clear();
-                                    }
-                                    Err(e) => {
-                                        let valid_len = e.valid_up_to();
-                                        if valid_len > 0 {
-                                            let valid_str = unsafe { std::str::from_utf8_unchecked(&byte_buffer[..valid_len]) };
-                                            output.push_str(valid_str);
-                                            byte_buffer.drain(..valid_len);
-                                        }
-                                        if e.error_len().is_some() {
-                                            output.push_str(&String::from_utf8_lossy(&byte_buffer));
-                                            byte_buffer.clear();
-                                        }
-                                    }
+                                let decoded = process_utf8_buffer(&mut byte_buffer);
+                                if !decoded.is_empty() {
+                                    output.push_str(&decoded);
                                 }
                                 
                                 let mut batch = LlamaBatch::new(1, 1);

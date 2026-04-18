@@ -481,14 +481,16 @@ async fn main() {
         loop {
             interval.tick().await;
             
-            sys.refresh_all();
+            sys.refresh_memory();
+            sys.refresh_process(pid);
+
+            let mut s = manager::lock_status(&status_for_nvml);
+            
             if let Some(process) = sys.process(pid) {
-                let mut s = manager::lock_status(&status_for_nvml);
                 s.update_sysinfo(sys.total_memory(), sys.used_memory(), sys.free_memory(), process.memory());
             }
 
             if let Some((used, total, free)) = manager::get_vram_info(nvml.as_ref(), 0) {
-                let mut s = manager::lock_status(&status_for_nvml);
                 s.update_nvml(total, used, free);
             }
         }

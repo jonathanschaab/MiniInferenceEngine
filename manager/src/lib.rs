@@ -233,13 +233,14 @@ pub async fn run_batcher_loop(
         if needs_reload {
             println!("🔄 Swapping VRAM to {}...", request.chat_model_id);
 
-            if active_backend.is_some() {
-                if active_backend.as_ref().unwrap().get_offload_pct() > 0.0 {
-                    let mut s = lock_status(&status);
+            if let Some(backend) = active_backend.take() {
+                let offload_pct = backend.get_offload_pct();
+                drop(backend);
+                
+                let mut s = lock_status(&status);
+                if offload_pct > 0.0 {
                     s.log_ram("Free", "Orchestrator", &format!("Released offloaded layers for {}", active_model_id), 0);
                 }
-                drop(active_backend.take());
-                let mut s = lock_status(&status);
                 s.remove_model_vram(&active_model_id);
                 s.log_vram("Free", "Orchestrator", &format!("Released {} from VRAM", active_model_id), 0);
                 if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), 0) {
@@ -473,7 +474,11 @@ pub async fn run_batcher_loop(
                 }
             } else {
                 // Abstractive fallback using generative backend
-                let compression_prompt = format!("<|user|>\nSummarize this text to be shorter:\n{}</s>\n<|assistant|>\n", formatted_prompt);
+                let compression_messages = vec![Message {
+                    role: "user".to_string(),
+                    content: format!("Summarize this text to be shorter:\n{}", formatted_prompt),
+                }];
+                let compression_prompt = format_chat(&compression_messages, &comp_config.arch);
                 let params = GenerationParameters {
                     max_tokens: Some(target_budget),
                     ..Default::default()
@@ -496,21 +501,19 @@ pub async fn run_batcher_loop(
                 t.record_generation(request.compressor_model_id.clone(), comp_btype_str, request.parameters.clone(), comp_offload_pct, formatted_prompt.len(), token_count, comp_tok_time, comp_elapsed);
             }
 
-            if comp_backend.get_offload_pct() > 0.0 {
-                let mut s = lock_status(&status);
-                s.log_ram("Free", "Orchestrator", &format!("Released offloaded layers for {}", request.compressor_model_id), 0);
-            }
             drop(comp_backend);
             
             {
                 let mut s = lock_status(&status);
+                if comp_offload_pct > 0.0 {
+                    s.log_ram("Free", "Orchestrator", &format!("Released offloaded layers for {}", request.compressor_model_id), 0);
+                }
                 s.remove_model_vram(&request.compressor_model_id);
                 s.log_vram("Free", "Orchestrator", &format!("Released {} from VRAM", request.compressor_model_id), 0);
+            if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), 0) {
+                s.update_nvml(total, used, free);
             }
-
-            // Mark the main chat model as active again now that the compressor is gone
-            {
-                let mut s = lock_status(&status);
+                // Mark the main chat model as active again now that the compressor is gone
                 s.set_model_status(&active_model_id, "Active");
             }
 
