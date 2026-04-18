@@ -13,13 +13,16 @@ use llama_cpp_2::model::AddBos;
 use llama_cpp_2::sampling::LlamaSampler;
 
 use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 use crate::types::EngineStatus;
-use crate::registry::{ModelConfig, ModelDType};
+use crate::registry::ModelConfig;
 use crate::types::GenerationParameters;
 use crate::types::MemoryStrategy;
 use crate::backend::InferenceBackend;
 
 const LLAMA_CPP_COMPUTE_MARGIN_BYTES: u64 = 1_500 * 1024 * 1024;
+
+static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 
 self_cell! {
     struct LlamaInstance {
@@ -112,14 +115,17 @@ where
     let mut output = String::new();
     let mut byte_buffer = Vec::new();
     let mut n_cur = tokens_list.len() as i32;
-    let max_new_tokens = params.max_tokens.unwrap_or(500) as i32;
+    let max_new_tokens = params.max_tokens.unwrap_or(500).min(i32::MAX as usize) as i32;
     let mut generated_tokens = 0;
     
     let mut samplers = Vec::new();
     if let Some(k) = params.top_k { samplers.push(LlamaSampler::top_k(k as i32)); }
     if let Some(p) = params.top_p { samplers.push(LlamaSampler::top_p(p, 1)); }
     if let Some(t) = params.temperature { samplers.push(LlamaSampler::temp(t)); }
-    samplers.push(LlamaSampler::dist(params.seed.unwrap_or_else(rand::random::<u64>) as u32));
+    
+    let seed_u64 = params.seed.unwrap_or_else(rand::random::<u64>);
+    let seed_u32 = (seed_u64 ^ (seed_u64 >> 32)) as u32;
+    samplers.push(LlamaSampler::dist(seed_u32));
     let mut sampler = LlamaSampler::chain_simple(samplers);
     
     while generated_tokens < max_new_tokens {
@@ -171,33 +177,13 @@ pub struct LlamaCppEngine {
 }
 
 impl LlamaCppEngine {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(gpu_device_index: u32) -> Result<Self, String> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineCommand>();
 
         std::thread::spawn(move || {
-            let mut backend_opt = None;
-            // LlamaBackend::init() can fail if a previous instance is still being dropped.
-            // This retry loop mitigates a race condition where a new model is requested
-            // before the old backend's exclusive resources are completely released.
-            for _ in 0..100 {
-                match LlamaBackend::init() {
-                    Ok(b) => {
-                        backend_opt = Some(b);
-                        break;
-                    }
-                    Err(_) => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
-            }
-
-            let backend = match backend_opt {
-                Some(b) => b,
-                None => {
-                    eprintln!("Failed to init llama backend: Timeout waiting for previous instance to release.");
-                    return;
-                }
-            };
+            let backend = LLAMA_BACKEND.get_or_init(|| {
+                LlamaBackend::init().expect("Failed to initialize llama.cpp backend")
+            });
 
             let mut instance: Option<LlamaInstance> = None;
             let nvml = nvml_wrapper::Nvml::init().ok();
@@ -211,19 +197,11 @@ impl LlamaCppEngine {
                             let repo = api.model(config.repo.clone());
                             let weights_path = repo.get(&config.filename).map_err(|e| format!("Missing weights: {}", e))?;
                             
-                            let available_vram = crate::get_vram_info(nvml.as_ref(), 0).map(|(_, _, free)| free).unwrap_or(0);
+                            let available_vram = crate::get_vram_info(nvml.as_ref(), gpu_device_index).map(|(_, _, free)| free).unwrap_or(0);
                             
-                            let bytes_per_element = match config.kv_cache_dtype {
-                                ModelDType::F32 => 4,
-                                ModelDType::F16 | ModelDType::BF16 => 2,
-                            };
-                            let bytes_per_token = if config.n_head > 0 && config.n_head_kv > 0 {
-                                (config.num_layers * config.n_embd * config.n_head_kv / config.n_head) * bytes_per_element
-                            } else {
-                                100_000
-                            };
+                            let bytes_per_token = config.estimate_kv_bytes_per_token();
 
-                        let compute_margin: u64 = LLAMA_CPP_COMPUTE_MARGIN_BYTES;
+                            let compute_margin: u64 = LLAMA_CPP_COMPUTE_MARGIN_BYTES;
                             let mut final_ctx_len = required_ctx.max(2048).min(config.max_context_len);
                             let mut n_gpu_layers = config.num_layers as u32;
                             let weights_vram_cost_est = (config.size_on_disk_gb * 1024.0 * 1024.0 * 1024.0) as u64;
@@ -252,18 +230,18 @@ impl LlamaCppEngine {
                                 s.log_ram("Allocate", "LlamaCpp::Offload", &format!("Offloaded {:.1}% of model to CPU RAM", offload_pct * 100.0), offloaded_bytes);
                             }
 
-                            let (vram_used_before, vram_total, _) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0, 0, 0));
+                            let (vram_used_before, vram_total, _) = crate::get_vram_info(nvml.as_ref(), gpu_device_index).unwrap_or((0, 0, 0));
 
                             {
                                 let mut s = status.lock().unwrap();
                                 s.log_vram("Allocate", "LlamaCpp", &format!("Loading weights for {}", config.id), 0);
                             }
 
-                            let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
-                            let model = LlamaModel::load_from_file(&backend, weights_path, &model_params)
+                            let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers).with_main_gpu(gpu_device_index as i32);
+                            let model = LlamaModel::load_from_file(backend, weights_path, &model_params)
                                 .map_err(|e| format!("Failed to load llama.cpp model: {}", e))?;
                                 
-                            let (vram_used_after, _, vram_free_after) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0, 0, 0));
+                            let (vram_used_after, _, vram_free_after) = crate::get_vram_info(nvml.as_ref(), gpu_device_index).unwrap_or((0, 0, 0));
                             let weights_vram = vram_used_after.saturating_sub(vram_used_before);
 
                             {
@@ -294,14 +272,14 @@ impl LlamaCppEngine {
                                 ctx_params = ctx_params.with_n_ctx(Some(ctx_len));
                             }
                             
-                            let (vram_used_before_ctx, _, _) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0, 0, 0));
+                            let (vram_used_before_ctx, _, _) = crate::get_vram_info(nvml.as_ref(), gpu_device_index).unwrap_or((0, 0, 0));
 
                             let inst = LlamaInstance::try_new(
                                 model,
-                                |m| m.new_context(&backend, ctx_params)
+                                |m| m.new_context(backend, ctx_params)
                             ).map_err(|e| format!("Failed to create llama.cpp context: {}", e))?;
                                 
-                            let (vram_used_after_ctx, _, vram_free_final) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0, 0, 0));
+                            let (vram_used_after_ctx, _, vram_free_final) = crate::get_vram_info(nvml.as_ref(), gpu_device_index).unwrap_or((0, 0, 0));
                             let kv_vram = vram_used_after_ctx.saturating_sub(vram_used_before_ctx);
 
                             {

@@ -32,6 +32,8 @@ pub struct AppConfig {
     pub admin_emails: Vec<String>,
     pub user_emails: Vec<String>,
     pub secure_cookies: bool,
+    #[serde(default)]
+    pub gpu_device_index: u32,
 }
 
 impl Default for AppConfig {
@@ -42,6 +44,7 @@ impl Default for AppConfig {
             admin_emails: vec![],
             user_emails: vec![],
             secure_cookies: true,
+            gpu_device_index: 0,
         }
     }
 }
@@ -505,6 +508,8 @@ async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetrySto
 
 #[tokio::main]
 async fn main() {
+    let config = AppConfig::load();
+
     // Create the async channel for the GPU queue
     let (tx, rx) = mpsc::channel(32);
 
@@ -513,6 +518,7 @@ async fn main() {
     
     // Background VRAM Tracker
     let status_for_nvml = engine_status.clone();
+    let vram_tracker_gpu_idx = config.gpu_device_index;
     tokio::spawn(async move {
         let mut sys = System::new_all();
         let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
@@ -530,7 +536,7 @@ async fn main() {
                 s.update_sysinfo(sys.total_memory(), sys.used_memory(), sys.free_memory(), process.memory());
             }
 
-            if let Some((used, total, free)) = manager::get_vram_info(nvml.as_ref(), 0) {
+            if let Some((used, total, free)) = manager::get_vram_info(nvml.as_ref(), vram_tracker_gpu_idx) {
                 s.update_nvml(total, used, free);
             }
         }
@@ -556,12 +562,11 @@ async fn main() {
     let telemetry_for_batcher = telemetry.clone();
 
     // Boot up the GPU Orchestrator in the background
+    let batcher_gpu_idx = config.gpu_device_index;
     tokio::spawn(async move {
-        run_batcher_loop(rx, status_for_batcher, telemetry_for_batcher).await;
+        run_batcher_loop(rx, status_for_batcher, telemetry_for_batcher, batcher_gpu_idx).await;
     });
 
-    let config = AppConfig::load();
-    
     let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         // This loop processes writes one-at-a-time, enforcing strict order and atomic replacement

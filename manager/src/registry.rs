@@ -80,6 +80,26 @@ pub struct ModelConfig {
     pub is_default_compressor: bool,
 }
 
+impl ModelConfig {
+    pub fn estimate_kv_bytes_per_token(&self) -> usize {
+        let bytes_per_element = match self.kv_cache_dtype {
+            ModelDType::F32 => 4,
+            ModelDType::F16 | ModelDType::BF16 => 2,
+        };
+        if self.n_head > 0 && self.n_head_kv > 0 {
+            (2 * self.num_layers * self.n_embd * self.n_head_kv / self.n_head) * bytes_per_element
+        } else {
+            // Fallback heuristics if precise model architecture details are omitted
+            match &self.arch {
+                ModelArch::Qwen2 if self.parameters_billions > 10.0 => 150_000,
+                ModelArch::Qwen2 => 80_000,
+                ModelArch::Llama if self.parameters_billions < 10.0 => 125_000,
+                _ => 100_000,
+            }
+        }
+    }
+}
+
 // Expose the registry so the web server can send it to the UI
 pub fn get_model_registry() -> Vec<ModelConfig> {
     vec![

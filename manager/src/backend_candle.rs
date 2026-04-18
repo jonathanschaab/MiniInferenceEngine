@@ -256,22 +256,24 @@ pub struct CandleEngine {
     tokenizer: Option<Tokenizer>,
     _file: Option<std::fs::File>,
     nvml: Option<nvml_wrapper::Nvml>,
+    gpu_device_index: u32,
 }
 
 impl Default for CandleEngine {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
 impl CandleEngine {
-    pub fn new() -> Self {
+    pub fn new(gpu_device_index: u32) -> Self {
         Self {
-            device: Device::cuda_if_available(0).unwrap_or(Device::Cpu),
+            device: Device::cuda_if_available(gpu_device_index as usize).unwrap_or(Device::Cpu),
             model: None,
             tokenizer: None,
             _file: None,
             nvml: nvml_wrapper::Nvml::init().ok(),
+            gpu_device_index,
         }
     }
     
@@ -293,7 +295,7 @@ impl CandleEngine {
 #[async_trait]
 impl InferenceBackend for CandleEngine {
     async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, _strategy: &MemoryStrategy, _required_ctx: usize) -> Result<usize, String> {
-        let (used_before, total, _) = crate::get_vram_info(self.nvml.as_ref(), 0).unwrap_or((0,0,0));
+        let (used_before, total, _) = crate::get_vram_info(self.nvml.as_ref(), self.gpu_device_index).unwrap_or((0,0,0));
         
         {
             let mut s = status.lock().unwrap();
@@ -305,7 +307,7 @@ impl InferenceBackend for CandleEngine {
         self.tokenizer = Some(t);
         self._file = f;
 
-        let (used_after, _, free_after) = crate::get_vram_info(self.nvml.as_ref(), 0).unwrap_or((0,0,0));
+        let (used_after, _, free_after) = crate::get_vram_info(self.nvml.as_ref(), self.gpu_device_index).unwrap_or((0,0,0));
         let diff = used_after.saturating_sub(used_before);
         {
             let mut s = status.lock().unwrap();

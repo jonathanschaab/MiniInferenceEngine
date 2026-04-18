@@ -92,12 +92,12 @@ impl ActiveBackend {
     }
 }
 
-pub fn create_backend(btype: &BackendType) -> Result<ActiveBackend, String> {
+pub fn create_backend(btype: &BackendType, gpu_device_index: u32) -> Result<ActiveBackend, String> {
     match btype {
         #[cfg(feature = "backend-candle")]
-        BackendType::Candle => Ok(ActiveBackend::Candle(Box::default())),
+        BackendType::Candle => Ok(ActiveBackend::Candle(Box::new(CandleEngine::new(gpu_device_index)))),
         #[cfg(feature = "backend-llamacpp")]
-        BackendType::LlamaCpp => Ok(ActiveBackend::LlamaCpp(Box::new(LlamaCppEngine::new()?))),
+        BackendType::LlamaCpp => Ok(ActiveBackend::LlamaCpp(Box::new(LlamaCppEngine::new(gpu_device_index)?))),
         #[allow(unreachable_patterns)]
         _ => Err(format!("Backend {:?} is not enabled in this build.", btype)),
     }
@@ -106,7 +106,8 @@ pub fn create_backend(btype: &BackendType) -> Result<ActiveBackend, String> {
 pub async fn run_batcher_loop(
     mut receiver: mpsc::Receiver<UserRequest>, 
     status: Arc<Mutex<EngineStatus>>,
-    telemetry: Arc<Mutex<TelemetryStore>>
+    telemetry: Arc<Mutex<TelemetryStore>>,
+    gpu_device_index: u32
 ) {
     let nvml = Nvml::init().ok();
 
@@ -188,8 +189,13 @@ pub async fn run_batcher_loop(
             Some(b) => b,
             None => {
                 // Auto selection logic
-                if active_model_id == request.chat_model_id && config_for_prompt.supported_backends.iter().any(|sb| format!("{:?}", sb) == active_backend_name) {
-                    config_for_prompt.supported_backends.iter().find(|sb| format!("{:?}", sb) == active_backend_name).unwrap().clone()
+                    if active_model_id == request.chat_model_id && let Some(b) = config_for_prompt.supported_backends.iter().find(|sb| {
+                        active_backend_name == match sb {
+                            BackendType::Candle => "Candle",
+                            BackendType::LlamaCpp => "LlamaCpp",
+                        }
+                    }) {
+                        b.clone()
                 } else if config_for_prompt.supported_backends.contains(&BackendType::LlamaCpp) {
                     BackendType::LlamaCpp
                 } else if let Some(b) = config_for_prompt.supported_backends.first() {
@@ -225,7 +231,7 @@ pub async fn run_batcher_loop(
                 }
                 s.remove_model_vram(&active_model_id);
                 s.log_vram("Free", "Orchestrator", &format!("Released {} from VRAM", active_model_id), 0);
-                if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), 0) {
+                if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), gpu_device_index) {
                     s.update_nvml(total, used, free);
                 }
             }
@@ -241,7 +247,7 @@ pub async fn run_batcher_loop(
             }
 
             let config = config_for_prompt.clone();
-            let mut backend = match create_backend(&target_btype) {
+            let mut backend = match create_backend(&target_btype, gpu_device_index) {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = request.responder.send(StreamEvent::Error(format!("Server Error: {}", e)));
@@ -313,7 +319,7 @@ pub async fn run_batcher_loop(
         // Use the backend's get_vram_usage if available, otherwise fallback to Orchestrator's NVML
         let vram_info = active_backend.as_ref().unwrap().get_vram_usage()
             .map(|(u, t)| (u, t, t.saturating_sub(u)))
-            .or_else(|| get_vram_info(nvml.as_ref(), 0));
+            .or_else(|| get_vram_info(nvml.as_ref(), gpu_device_index));
 
         let static_alloc = active_backend.as_ref().unwrap().is_statically_allocated();
         
@@ -334,20 +340,7 @@ pub async fn run_batcher_loop(
         } else if let Some((_, _, free_vram)) = vram_info {
                 // This rough heuristic is only for the Candle backend's dynamic memory check.
                 // Llama.cpp calculates this precisely during its static allocation.
-                let bytes_per_element = match config.kv_cache_dtype {
-                    ModelDType::F32 => 4,
-                    ModelDType::F16 | ModelDType::BF16 => 2,
-                };
-                let bytes_per_token = if config.n_head > 0 && config.n_head_kv > 0 {
-                    (config.num_layers * config.n_embd * config.n_head_kv / config.n_head) * bytes_per_element
-                } else {
-                    match &config.arch {
-                        ModelArch::Qwen2 if config.parameters_billions > 10.0 => 150_000,
-                        ModelArch::Qwen2 => 80_000,
-                        ModelArch::Llama if config.parameters_billions < 10.0 => 125_000,
-                        _ => 100_000,
-                    }
-                };
+                let bytes_per_token = config.estimate_kv_bytes_per_token();
                 let safe_free_vram = free_vram.saturating_sub(CANDLE_COMPUTE_MARGIN_BYTES); 
                 let absolute_max_tokens = (safe_free_vram as usize / bytes_per_token).min(active_max_context);
                 
@@ -424,7 +417,7 @@ pub async fn run_batcher_loop(
                 }
             };
 
-            let mut comp_backend = match create_backend(comp_btype) {
+            let mut comp_backend = match create_backend(comp_btype, gpu_device_index) {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = request.responder.send(StreamEvent::Error(format!("Server Error: {}", e)));
@@ -506,7 +499,7 @@ pub async fn run_batcher_loop(
                 }
                 s.remove_model_vram(&request.compressor_model_id);
                 s.log_vram("Free", "Orchestrator", &format!("Released {} from VRAM", request.compressor_model_id), 0);
-            if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), 0) {
+            if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), gpu_device_index) {
                 s.update_nvml(total, used, free);
             }
                 // Mark the main chat model as active again now that the compressor is gone
