@@ -229,24 +229,44 @@ impl LlamaCppEngine {
                             samplers.push(LlamaSampler::dist(params.seed.unwrap_or(42) as u32));
                             let mut sampler = LlamaSampler::chain_simple(samplers);
                             
+                            let mut byte_buffer = Vec::new();
+                            
                             while generated_tokens < max_new_tokens {
-                                let (new_token_id, is_eog, text) = inst.with_dependent_mut(|model, ctx| {
+                                let (new_token_id, is_eog, new_bytes) = inst.with_dependent_mut(|model, ctx| {
                                     let new_token_id = sampler.sample(ctx, logit_index);
                                     sampler.accept(new_token_id);
                                     
                                     let is_eog = model.is_eog_token(new_token_id);
                                     
-                                    let text = if !is_eog {
-                                        model.token_to_piece_bytes(new_token_id, 128, false, None)
-                                            .ok()
-                                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                                    } else { None };
+                                    let new_bytes = if !is_eog {
+                                        model.token_to_piece_bytes(new_token_id, 256, false, None).unwrap_or_default()
+                                    } else { Vec::new() };
                                     
-                                    (new_token_id, is_eog, text)
+                                    (new_token_id, is_eog, new_bytes)
                                 });
 
                                 if is_eog { break; }
-                                if text.is_some_and(|t| tx.send(crate::types::StreamEvent::Token(t)).is_err()) { break; }
+                                
+                                byte_buffer.extend_from_slice(&new_bytes);
+                                match std::str::from_utf8(&byte_buffer) {
+                                    Ok(valid_str) => {
+                                        if tx.send(crate::types::StreamEvent::Token(valid_str.to_string())).is_err() { break; }
+                                        byte_buffer.clear();
+                                    }
+                                    Err(e) => {
+                                        let valid_len = e.valid_up_to();
+                                        if valid_len > 0 {
+                                            let valid_str = unsafe { std::str::from_utf8_unchecked(&byte_buffer[..valid_len]) };
+                                            if tx.send(crate::types::StreamEvent::Token(valid_str.to_string())).is_err() { break; }
+                                            byte_buffer.drain(..valid_len);
+                                        }
+                                        if e.error_len().is_some() {
+                                            let invalid_str = String::from_utf8_lossy(&byte_buffer).into_owned();
+                                            if tx.send(crate::types::StreamEvent::Token(invalid_str)).is_err() { break; }
+                                            byte_buffer.clear();
+                                        }
+                                    }
+                                }
                                 
                                 let mut batch = LlamaBatch::new(1, 1);
                                 if let Err(e) = batch.add(new_token_id, n_cur, &[0], true) { 
@@ -259,6 +279,10 @@ impl LlamaCppEngine {
                                 logit_index = 0;
                                 n_cur += 1;
                                 generated_tokens += 1;
+                            }
+                            
+                            if !byte_buffer.is_empty() {
+                                let _ = tx.send(crate::types::StreamEvent::Token(String::from_utf8_lossy(&byte_buffer).into_owned()));
                             }
                             let _ = tx.send(crate::types::StreamEvent::Done);
                         })();
@@ -293,6 +317,7 @@ impl LlamaCppEngine {
                             }
                             
                             let mut output = String::new();
+                            let mut byte_buffer = Vec::new();
                             let mut n_cur = tokens_list.len() as i32;
                             let max_new_tokens = params.max_tokens.unwrap_or(500) as i32;
                             let mut generated_tokens = 0;
@@ -305,23 +330,40 @@ impl LlamaCppEngine {
                             let mut sampler = LlamaSampler::chain_simple(samplers);
                             
                             while generated_tokens < max_new_tokens {
-                                let (new_token_id, is_eog, text) = inst.with_dependent_mut(|model, ctx| {
+                                let (new_token_id, is_eog, new_bytes) = inst.with_dependent_mut(|model, ctx| {
                                     let new_token_id = sampler.sample(ctx, logit_index);
                                     sampler.accept(new_token_id);
                                     
                                     let is_eog = model.is_eog_token(new_token_id);
                                     
-                                    let text = if !is_eog {
-                                        model.token_to_piece_bytes(new_token_id, 128, false, None)
-                                            .ok()
-                                            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                                    } else { None };
+                                    let new_bytes = if !is_eog {
+                                        model.token_to_piece_bytes(new_token_id, 256, false, None).unwrap_or_default()
+                                    } else { Vec::new() };
                                     
-                                    (new_token_id, is_eog, text)
+                                    (new_token_id, is_eog, new_bytes)
                                 });
                                 
                                 if is_eog { break; }
-                                if let Some(t) = text { output.push_str(&t); }
+                                
+                                byte_buffer.extend_from_slice(&new_bytes);
+                                match std::str::from_utf8(&byte_buffer) {
+                                    Ok(valid_str) => {
+                                        output.push_str(valid_str);
+                                        byte_buffer.clear();
+                                    }
+                                    Err(e) => {
+                                        let valid_len = e.valid_up_to();
+                                        if valid_len > 0 {
+                                            let valid_str = unsafe { std::str::from_utf8_unchecked(&byte_buffer[..valid_len]) };
+                                            output.push_str(valid_str);
+                                            byte_buffer.drain(..valid_len);
+                                        }
+                                        if e.error_len().is_some() {
+                                            output.push_str(&String::from_utf8_lossy(&byte_buffer));
+                                            byte_buffer.clear();
+                                        }
+                                    }
+                                }
                                 
                                 let mut batch = LlamaBatch::new(1, 1);
                                 batch.add(new_token_id, n_cur, &[0], true).map_err(|e| e.to_string())?;
@@ -330,6 +372,10 @@ impl LlamaCppEngine {
                                 logit_index = 0;
                                 n_cur += 1;
                                 generated_tokens += 1;
+                            }
+                            
+                            if !byte_buffer.is_empty() {
+                                output.push_str(&String::from_utf8_lossy(&byte_buffer));
                             }
                             Ok((output, tok_time))
                         })();

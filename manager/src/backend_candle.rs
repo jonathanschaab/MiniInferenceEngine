@@ -248,7 +248,7 @@ pub async fn compress_text(prompt: &str, model: &DynamicModel, tokenizer: &Token
 
         token_scores.sort_by(|a, b| b.2.total_cmp(&a.2));
         if token_scores.len() > target_len { token_scores.truncate(target_len); }
-        token_scores.sort_by(|a, b| a.0.cmp(&b.0));
+        token_scores.sort_by_key(|a| a.0);
 
         let kept_tokens: Vec<u32> = token_scores.into_iter().map(|(_, token, _)| token).collect();
         let compressed_text = tokenizer.decode(&kept_tokens, true).map_err(|e| e.to_string())?;

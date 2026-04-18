@@ -130,6 +130,7 @@ pub async fn run_batcher_loop(
 
     let mut active_model_id = String::new();
     let mut active_backend: Option<ActiveBackend> = None;
+    let mut active_backend_name = String::new();
     let mut active_max_context: usize = 2048; 
     let mut active_model_config: Option<ModelConfig> = None;
     let mut active_memory_strategy = String::new();
@@ -193,7 +194,35 @@ pub async fn run_batcher_loop(
 
         let req_strategy = request.parameters.memory_strategy.clone().unwrap_or_else(|| "offload".to_string());
 
-        let mut needs_reload = active_model_id != request.chat_model_id || active_memory_strategy != req_strategy;
+        let req_b = request.target_backend.as_deref().map(|s| s.to_lowercase());
+        let target_btype_opt = match req_b.as_deref() {
+            Some(b) if b != "auto" => config_for_prompt.supported_backends.iter()
+                .find(|sb| format!("{:?}", sb).to_lowercase() == b)
+                .cloned(),
+            _ => None,
+        };
+
+        let target_btype = match target_btype_opt {
+            Some(b) => b,
+            None => {
+                // Auto selection logic
+                if active_model_id == request.chat_model_id && config_for_prompt.supported_backends.iter().any(|sb| format!("{:?}", sb) == active_backend_name) {
+                    config_for_prompt.supported_backends.iter().find(|sb| format!("{:?}", sb) == active_backend_name).unwrap().clone()
+                } else if config_for_prompt.supported_backends.contains(&BackendType::LlamaCpp) {
+                    BackendType::LlamaCpp
+                } else if let Some(b) = config_for_prompt.supported_backends.first() {
+                    b.clone()
+                } else {
+                    let _ = request.responder.send(StreamEvent::Error("Server Error: No supported backend found for this model.".to_string()));
+                    continue 'main;
+                }
+            }
+        };
+        let target_backend_name = format!("{:?}", target_btype);
+
+        let mut needs_reload = active_model_id != request.chat_model_id 
+            || active_memory_strategy != req_strategy 
+            || active_backend_name != target_backend_name;
         
         if !needs_reload && actual_required_ctx > active_max_context && req_strategy == "offload" {
             println!("🔄 Expanding KV Cache from {} to {} tokens...", active_max_context, target_allocated_ctx);
@@ -229,12 +258,7 @@ pub async fn run_batcher_loop(
             }
 
             let config = config_for_prompt.clone();
-            let btype = request.target_backend.as_ref()
-                .and_then(|req_b| config.supported_backends.iter().find(|sb| format!("{:?}", sb).to_lowercase() == req_b.to_lowercase()))
-                .unwrap_or_else(|| config.supported_backends.first().unwrap())
-                .clone();
-
-            let mut backend = match create_backend(&btype) {
+            let mut backend = match create_backend(&target_btype) {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = request.responder.send(StreamEvent::Error(format!("Server Error: {}", e)));
@@ -259,12 +283,13 @@ pub async fn run_batcher_loop(
             };
 
             let elapsed = load_start.elapsed().as_millis();
-            println!("⏱️ Model loaded in {} ms using {:?}", elapsed, btype);
+            println!("⏱️ Model loaded in {} ms using {:?}", elapsed, target_btype);
             if let Ok(mut t) = telemetry.lock() {
-                t.record_load(request.chat_model_id.clone(), format!("{:?}", btype), elapsed);
+                t.record_load(request.chat_model_id.clone(), target_backend_name.clone(), elapsed);
             }
             
             active_backend = Some(backend);
+            active_backend_name = target_backend_name.clone();
             active_model_id = request.chat_model_id.clone();
             active_max_context = actual_context;
             active_model_config = Some(config);
@@ -273,7 +298,7 @@ pub async fn run_batcher_loop(
             {
                 let mut current_status = lock_status(&status);
                 current_status.active_chat_model_id = Some(active_model_id.clone());
-                current_status.active_backend = Some(format!("{:?}", btype));
+                current_status.active_backend = Some(target_backend_name);
             }
         }
 
@@ -380,9 +405,27 @@ pub async fn run_batcher_loop(
                 }
             };
 
-            let comp_btype = request.target_backend.as_ref()
-                .and_then(|req_b| comp_config.supported_backends.iter().find(|sb| format!("{:?}", sb).to_lowercase() == req_b.to_lowercase()))
-                .unwrap_or_else(|| comp_config.supported_backends.first().unwrap());
+            let req_comp_b = request.target_backend.as_deref().map(|s| s.to_lowercase());
+            let comp_btype_opt = match req_comp_b.as_deref() {
+                Some(b) if b != "auto" => comp_config.supported_backends.iter()
+                    .find(|sb| format!("{:?}", sb).to_lowercase() == b),
+                _ => None,
+            };
+
+            let comp_btype = match comp_btype_opt {
+                Some(b) => b,
+                None => {
+                    // Compressor auto selection logic
+                    if comp_config.supported_backends.contains(&BackendType::LlamaCpp) {
+                        comp_config.supported_backends.iter().find(|sb| **sb == BackendType::LlamaCpp).unwrap()
+                    } else if let Some(b) = comp_config.supported_backends.first() {
+                        b
+                    } else {
+                        let _ = request.responder.send(StreamEvent::Error("Server Error: No supported backend found for compressor model.".to_string()));
+                        continue 'main;
+                    }
+                }
+            };
 
             let mut comp_backend = match create_backend(comp_btype) {
                 Ok(b) => b,
@@ -513,13 +556,9 @@ pub async fn run_batcher_loop(
             
         let elapsed = gen_start.elapsed().as_millis();
         println!("⏱️ Generation completed in {} ms (Tokenization: {} ms)", elapsed, tokenization_time_ms);
-        let active_backend_name = {
-            let s = lock_status(&status);
-            s.active_backend.clone().unwrap_or_else(|| "Unknown".to_string())
-        };
         let offload_pct = active_backend.as_ref().unwrap().get_offload_pct();
         if let Ok(mut t) = telemetry.lock() {
-            t.record_generation(active_model_id.clone(), active_backend_name, request.parameters.clone(), offload_pct, formatted_prompt.len(), token_count, tokenization_time_ms, elapsed);
+            t.record_generation(active_model_id.clone(), active_backend_name.clone(), request.parameters.clone(), offload_pct, formatted_prompt.len(), token_count, tokenization_time_ms, elapsed);
         }
     } // Closes the 'main while loop
 } // Closes the run_batcher_loop function
