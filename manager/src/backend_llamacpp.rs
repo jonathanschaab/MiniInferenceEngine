@@ -50,9 +50,7 @@ enum EngineCommand {
         params: GenerationParameters,
         reply: tokio::sync::oneshot::Sender<Result<(String, u128), String>>,
     },
-    Shutdown {
-        reply: std::sync::mpsc::Sender<()>,
-    },
+    Shutdown,
 }
 
 fn process_utf8_buffer(byte_buffer: &mut Vec<u8>) -> String {
@@ -65,6 +63,7 @@ fn process_utf8_buffer(byte_buffer: &mut Vec<u8>) -> String {
         Err(e) => {
             let valid_len = e.valid_up_to();
             if valid_len > 0 {
+                // SAFETY: e.valid_up_to() guarantees that the slice up to valid_len is valid UTF-8.
                 let valid_str = unsafe { std::str::from_utf8_unchecked(&byte_buffer[..valid_len]) };
                 result.push_str(valid_str);
                 byte_buffer.drain(..valid_len);
@@ -202,11 +201,28 @@ pub struct LlamaCppEngine {
 impl LlamaCppEngine {
     pub fn new(gpu_device_index: u32) -> Result<Self, String> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineCommand>();
+        let (init_tx, init_rx) = std::sync::mpsc::channel();
 
         std::thread::spawn(move || {
-            let backend = LLAMA_BACKEND.get_or_init(|| {
-                LlamaBackend::init().expect("Failed to initialize llama.cpp backend")
-            });
+            let backend = match LLAMA_BACKEND.get() {
+                Some(b) => {
+                    let _ = init_tx.send(Ok(()));
+                    b
+                }
+                None => match LlamaBackend::init() {
+                    Ok(b) => {
+                        let _ = init_tx.send(Ok(()));
+                        LLAMA_BACKEND.get_or_init(|| b)
+                    }
+                    Err(e) => {
+                        let _ = init_tx.send(Err(format!(
+                            "Failed to initialize llama.cpp backend: {}",
+                            e
+                        )));
+                        return;
+                    }
+                },
+            };
 
             let mut instance: Option<LlamaInstance> = None;
             let nvml = nvml_wrapper::Nvml::init().ok();
@@ -283,7 +299,7 @@ impl LlamaCppEngine {
                             if offload_pct > 0.0 {
                                 let offloaded_bytes =
                                     (weights_vram_cost_est as f32 * offload_pct) as i64;
-                                let mut s = status.lock().unwrap();
+                                let mut s = crate::types::lock_status(&status);
                                 s.log_ram(
                                     "Allocate",
                                     "LlamaCpp::Offload",
@@ -300,7 +316,7 @@ impl LlamaCppEngine {
                                     .unwrap_or((0, 0, 0));
 
                             {
-                                let mut s = status.lock().unwrap();
+                                let mut s = crate::types::lock_status(&status);
                                 s.log_vram(
                                     "Allocate",
                                     "LlamaCpp",
@@ -324,7 +340,7 @@ impl LlamaCppEngine {
                             let weights_vram = vram_used_after.saturating_sub(vram_used_before);
 
                             {
-                                let mut s = status.lock().unwrap();
+                                let mut s = crate::types::lock_status(&status);
                                 s.log_vram(
                                     "Allocate",
                                     "LlamaCpp::Weights",
@@ -349,7 +365,7 @@ impl LlamaCppEngine {
                                     final_ctx_len
                                 );
                                 {
-                                    let mut s = status.lock().unwrap();
+                                    let mut s = crate::types::lock_status(&status);
                                     s.log_vram("Measure", "LlamaCpp::Plan", &format!("Reserved 1.5GB Compute Margin. Allocating KV Cache for {} tokens", final_ctx_len), 0);
                                 }
                             } else {
@@ -379,7 +395,7 @@ impl LlamaCppEngine {
                             let kv_vram = vram_used_after_ctx.saturating_sub(vram_used_before_ctx);
 
                             {
-                                let mut s = status.lock().unwrap();
+                                let mut s = crate::types::lock_status(&status);
                                 s.log_vram(
                                     "Allocate",
                                     "LlamaCpp::KVCache",
@@ -448,14 +464,17 @@ impl LlamaCppEngine {
                         })();
                         let _ = reply.send(res);
                     }
-                    EngineCommand::Shutdown { reply } => {
+                    EngineCommand::Shutdown => {
                         drop(instance.take()); // Explicitly drop the Llama model and context
-                        let _ = reply.send(());
                         break;
                     }
                 }
             }
         });
+
+        init_rx
+            .recv()
+            .unwrap_or(Err("Engine thread died before initialization".to_string()))?;
 
         Ok(Self {
             command_tx: tx,
@@ -479,14 +498,7 @@ impl LlamaCppEngine {
 
 impl Drop for LlamaCppEngine {
     fn drop(&mut self) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        if self
-            .command_tx
-            .send(EngineCommand::Shutdown { reply: tx })
-            .is_ok()
-        {
-            let _ = rx.recv(); // Block until the background thread acknowledges shutdown
-        }
+        let _ = self.command_tx.send(EngineCommand::Shutdown);
     }
 }
 

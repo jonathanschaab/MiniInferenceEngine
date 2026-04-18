@@ -89,6 +89,8 @@ pub fn load_engine(
 
         println!("💎 Loading Safetensors instantly via Mmap...");
 
+        // SAFETY: The safetensors file being mapped is cached locally from Hugging Face and
+        // its contents are not modified concurrently while memory mapped by the engine.
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, device)
                 .map_err(|e| format!("Safetensors Mmap failed: {}", e))?
@@ -475,7 +477,7 @@ impl InferenceBackend for CandleEngine {
             crate::get_vram_info(self.nvml.as_ref(), self.gpu_device_index).unwrap_or((0, 0, 0));
 
         {
-            let mut s = status.lock().unwrap();
+            let mut s = crate::types::lock_status(&status);
             s.log_vram(
                 "Allocate",
                 "Candle",
@@ -494,7 +496,7 @@ impl InferenceBackend for CandleEngine {
             crate::get_vram_info(self.nvml.as_ref(), self.gpu_device_index).unwrap_or((0, 0, 0));
         let diff = used_after.saturating_sub(used_before);
         {
-            let mut s = status.lock().unwrap();
+            let mut s = crate::types::lock_status(&status);
             s.log_vram("Allocate", "Candle::Weights", "Model Weights", diff as i64);
             s.set_model_vram(
                 config.id.clone(),
