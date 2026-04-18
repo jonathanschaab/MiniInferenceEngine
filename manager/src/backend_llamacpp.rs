@@ -92,6 +92,10 @@ where
         .with_dependent_mut(|model, _| model.str_to_token(prompt, AddBos::Always))
         .map_err(|e| e.to_string())?;
 
+    if tokens_list.is_empty() {
+        return Err("Prompt resulted in 0 tokens after tokenization".to_string());
+    }
+
     let tok_time = tok_start.elapsed().as_millis();
     on_tokenization_time(tok_time);
 

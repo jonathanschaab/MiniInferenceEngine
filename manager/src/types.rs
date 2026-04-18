@@ -161,12 +161,17 @@ impl EngineStatus {
                 }
             }
 
-            let dynamic_usage = used.saturating_sub(self.baseline_other_vram + static_claimed);
             let active_count = self
                 .models_vram
                 .iter()
                 .filter(|m| !m.is_statically_allocated && m.status == "Active")
                 .count() as u64;
+
+            if active_count == 0 {
+                self.baseline_other_vram = used.saturating_sub(static_claimed);
+            }
+
+            let dynamic_usage = used.saturating_sub(self.baseline_other_vram + static_claimed);
             if let Some(usage_per_model) = dynamic_usage.checked_div(active_count) {
                 for m in self
                     .models_vram

@@ -185,6 +185,7 @@ pub async fn run_batcher_loop(
     let mut active_model_id = String::new();
     let mut active_backend: Option<ActiveBackend> = None;
     let mut active_backend_name = String::new();
+    let mut active_backend_type: Option<BackendType> = None;
     let mut active_max_context: usize = 2048;
     let mut active_model_config: Option<ModelConfig> = None;
     let mut active_memory_strategy = MemoryStrategy::Offload;
@@ -285,13 +286,10 @@ pub async fn run_batcher_loop(
                 // AUTO SELECTION LOGIC
                 // If the requested model is already loaded, stick with its currently active backend to prevent an unnecessary VRAM reload.
                 if active_model_id == request.chat_model_id
-                    && let Some(b) = config_for_prompt.supported_backends.iter().find(|sb| {
-                        active_backend_name
-                            == match sb {
-                                BackendType::Candle => "Candle",
-                                BackendType::LlamaCpp => "LlamaCpp",
-                            }
-                    })
+                    && let Some(b) = config_for_prompt
+                        .supported_backends
+                        .iter()
+                        .find(|&sb| Some(*sb) == active_backend_type)
                 {
                     *b
                 } else if config_for_prompt
@@ -448,6 +446,7 @@ pub async fn run_batcher_loop(
 
             active_backend = Some(backend);
             active_backend_name = target_backend_name.clone();
+            active_backend_type = Some(target_btype);
             active_model_id = request.chat_model_id.clone();
             active_max_context = actual_context;
             active_model_config = Some(config);
