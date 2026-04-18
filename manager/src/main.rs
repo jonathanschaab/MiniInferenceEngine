@@ -1,27 +1,28 @@
+use auth::{AuthStore, require_session};
 use axum::{
-    extract::State,
-    response::{Html, IntoResponse, Redirect},
-    http::StatusCode,
-    routing::{get, post, delete},
     Json, Router,
     body::Body,
-    http::header,
     body::Bytes,
+    extract::State,
+    http::StatusCode,
+    http::header,
+    response::{Html, IntoResponse, Redirect},
+    routing::{delete, get, post},
 };
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_stream::StreamExt;
+use hf_hub::api::sync::Api;
+use oauth2::basic::BasicClient;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use sysinfo::System;
-use tokio::sync::mpsc;
-use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
-use tower_sessions::{MemoryStore, SessionManagerLayer};
-use auth::{AuthStore, require_session};
-use serde::{Deserialize, Serialize};
-use oauth2::basic::BasicClient; // Ensure this is imported for AppState
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tower_sessions::{MemoryStore, SessionManagerLayer}; // Ensure this is imported for AppState
 
 use manager::{
-    get_model_registry, run_batcher_loop, ApiRequest, ModelConfig, UserRequest, EngineStatus, lock_status, TelemetryStore, Message, ModelRole, ModelArch, BenchmarkRequest, StreamEvent
+    ApiRequest, BenchmarkRequest, EngineStatus, Message, ModelArch, ModelConfig, ModelRole,
+    StreamEvent, TelemetryStore, UserRequest, get_model_registry, lock_status, run_batcher_loop,
 };
 
 // --- CONFIGURATION ---
@@ -55,7 +56,10 @@ impl AppConfig {
             serde_json::from_str(&data).unwrap_or_default()
         } else {
             let config = Self::default();
-            let _ = std::fs::write("config.json", serde_json::to_string_pretty(&config).unwrap());
+            let _ = std::fs::write(
+                "config.json",
+                serde_json::to_string_pretty(&config).unwrap(),
+            );
             config
         }
     }
@@ -91,7 +95,6 @@ async fn handle_generate(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ApiRequest>,
 ) -> impl IntoResponse {
-    
     let (response_tx, response_rx) = mpsc::unbounded_channel();
 
     // Package the UI's model choices and the chat history
@@ -109,13 +112,11 @@ async fn handle_generate(
     let _ = state.queue_tx.send(request).await;
 
     // Map the incoming channel into an HTTP streaming body
-    let stream = UnboundedReceiverStream::new(response_rx).map(|event| {
-        match event {
-            StreamEvent::Token(t) => Ok::<_, std::convert::Infallible>(Bytes::from(t)),
-            StreamEvent::TokenizationTime(_) => Ok(Bytes::new()),
-            StreamEvent::Done => Ok(Bytes::new()),
-            StreamEvent::Error(e) => Ok(Bytes::from(format!("Error: {}", e))),
-        }
+    let stream = UnboundedReceiverStream::new(response_rx).map(|event| match event {
+        StreamEvent::Token(t) => Ok::<_, std::convert::Infallible>(Bytes::from(t)),
+        StreamEvent::TokenizationTime(_) => Ok(Bytes::new()),
+        StreamEvent::Done => Ok(Bytes::new()),
+        StreamEvent::Error(e) => Ok(Bytes::from(format!("Error: {}", e))),
     });
 
     axum::response::Response::builder()
@@ -134,14 +135,20 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
 async fn trigger_benchmark(
     State(state): State<Arc<AppState>>,
     user: auth::CurrentUser,
-    Json(payload): Json<BenchmarkRequest>
+    Json(payload): Json<BenchmarkRequest>,
 ) -> impl IntoResponse {
-
     if !user.is_admin {
-        println!("⚠️ Benchmark trigger rejected for non-admin: {}", user.email);
-        return (StatusCode::FORBIDDEN, "Only administrators can run the benchmark suite.").into_response();
+        println!(
+            "⚠️ Benchmark trigger rejected for non-admin: {}",
+            user.email
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "Only administrators can run the benchmark suite.",
+        )
+            .into_response();
     }
-    
+
     // Check if a benchmark is already running
     {
         let mut status = lock_status(&state.engine_status);
@@ -160,32 +167,52 @@ async fn trigger_benchmark(
     let queue_tx = state.queue_tx.clone();
     let engine_status = state.engine_status.clone(); // Clone the Arc so the background thread can reset it
     let selected_models = payload.models;
-    
+
     tokio::spawn(async move {
         println!("🚀 Starting Automated Benchmark Suite...");
         let full_registry = get_model_registry();
-        
-        let default_compressor = full_registry.iter()
+
+        let default_compressor = full_registry
+            .iter()
             .find(|m| m.is_default_compressor)
-            .or_else(|| full_registry.iter().find(|m| m.roles.contains(&ModelRole::ContextCompressor)))
+            .or_else(|| {
+                full_registry
+                    .iter()
+                    .find(|m| m.roles.contains(&ModelRole::ContextCompressor))
+            })
             .map(|m| m.id.clone())
             .unwrap_or_else(|| "llmlingua-2-f16".to_string());
 
-        let default_chat = full_registry.iter()
+        let default_chat = full_registry
+            .iter()
             .find(|m| m.is_default_chat)
-            .or_else(|| full_registry.iter().find(|m| m.roles.contains(&ModelRole::GeneralChat)))
+            .or_else(|| {
+                full_registry
+                    .iter()
+                    .find(|m| m.roles.contains(&ModelRole::GeneralChat))
+            })
             .map(|m| m.id.clone())
             .unwrap_or_else(|| "qwen-2.5-7b".to_string());
 
-        let prompt_generator = full_registry.iter()
+        let prompt_generator = full_registry
+            .iter()
             .find(|m| m.is_default_compressor && m.arch != ModelArch::XLMRoberta)
-            .or_else(|| full_registry.iter().find(|m| m.roles.contains(&ModelRole::GeneralChat) && m.parameters_billions < 4.0))
+            .or_else(|| {
+                full_registry.iter().find(|m| {
+                    m.roles.contains(&ModelRole::GeneralChat) && m.parameters_billions < 4.0
+                })
+            })
             .or_else(|| full_registry.iter().find(|m| m.is_default_chat))
-            .or_else(|| full_registry.iter().find(|m| m.roles.contains(&ModelRole::GeneralChat)))
+            .or_else(|| {
+                full_registry
+                    .iter()
+                    .find(|m| m.roles.contains(&ModelRole::GeneralChat))
+            })
             .map(|m| m.id.clone())
             .unwrap_or_else(|| default_chat.clone());
 
-        let registry: Vec<ModelConfig> = full_registry.into_iter()
+        let registry: Vec<ModelConfig> = full_registry
+            .into_iter()
             .filter(|m| selected_models.contains(&m.id))
             .collect();
 
@@ -204,7 +231,10 @@ async fn trigger_benchmark(
         }
 
         if let Err(e) = tokio::fs::create_dir_all("benchmark_prompts").await {
-            println!("⚠️ Benchmark aborted: Failed to create prompt directory: {}", e);
+            println!(
+                "⚠️ Benchmark aborted: Failed to create prompt directory: {}",
+                e
+            );
             let mut status = lock_status(&engine_status);
             status.benchmark_running = false;
             return;
@@ -215,35 +245,47 @@ async fn trigger_benchmark(
 
         let tokenizer_result = tokio::task::spawn_blocking(|| {
             let api = Api::new().map_err(|e| format!("API Init Error: {}", e))?;
-            let path = api.model("Qwen/Qwen2.5-1.5B-Instruct".to_string())
+            let path = api
+                .model("Qwen/Qwen2.5-1.5B-Instruct".to_string())
                 .get("tokenizer.json")
                 .map_err(|e| format!("Tokenizer Download Error: {}", e))?;
-            
+
             Tokenizer::from_file(path).map_err(|e| format!("Tokenizer Parse Error: {}", e))
-        }).await;
-        
+        })
+        .await;
+
         let mut qwen_tokenizer = None;
-        
+
         match tokenizer_result {
             Ok(Ok(tokenizer)) => {
                 qwen_tokenizer = Some(tokenizer);
             }
             Ok(Err(e)) => {
-                println!("⚠️ Tokenizer initialization failed: {}. Falling back to padding.", e);
+                println!(
+                    "⚠️ Tokenizer initialization failed: {}. Falling back to padding.",
+                    e
+                );
             }
             Err(e) => {
                 // If the spawn_blocking task actually panics, it is caught here as a JoinError
-                println!("⚠️ Thread execution failed: {}. Falling back to padding.", e);
+                println!(
+                    "⚠️ Thread execution failed: {}. Falling back to padding.",
+                    e
+                );
             }
         }
-        
+
         let mut all_sizes = std::collections::HashSet::new();
         for model in registry.iter() {
             let mut sizes = vec![1, 10, 100, 1000, 10000];
             let safe_max = (model.max_context_len as f32 * 0.95) as usize;
             sizes.retain(|&s| s < safe_max);
-            if safe_max > 0 { sizes.push(safe_max); }
-            for s in sizes { all_sizes.insert(s); }
+            if safe_max > 0 {
+                sizes.push(safe_max);
+            }
+            for s in sizes {
+                all_sizes.insert(s);
+            }
         }
 
         let mut sorted_sizes: Vec<usize> = all_sizes.into_iter().collect();
@@ -251,71 +293,102 @@ async fn trigger_benchmark(
 
         for size in sorted_sizes {
             let filename = format!("benchmark_prompts/prompt_{}.txt", size);
-            
+
             if !std::path::Path::new(&filename).exists() {
                 let mut should_save = false;
                 let mut final_content = String::new();
 
                 if size < 1000 {
-                    println!("🧠 Using {} to generate realistic prompt of ~{} tokens...", prompt_generator, size);
+                    println!(
+                        "🧠 Using {} to generate realistic prompt of ~{} tokens...",
+                        prompt_generator, size
+                    );
                     let prompt_instruction = if size <= 50 {
-                        format!("Write a very short technical sentence about Rust. Limit to {} words.", size)
+                        format!(
+                            "Write a very short technical sentence about Rust. Limit to {} words.",
+                            size
+                        )
                     } else {
-                        format!("Write a detailed paragraph about Rust memory management. Target exactly {} words.", size)
+                        format!(
+                            "Write a detailed paragraph about Rust memory management. Target exactly {} words.",
+                            size
+                        )
                     };
 
                     let (seed_tx, mut seed_rx) = mpsc::unbounded_channel();
-                    let _ = queue_tx.send(UserRequest {
-                        chat_model_id: prompt_generator.clone(), 
-                        compressor_model_id: default_compressor.clone(),
-                        messages: vec![Message { role: "user".to_string(), content: prompt_instruction }],
-                        responder: seed_tx,
-                        force_compression: false,
-                        parameters: params.clone(),
-                        target_backend: None,
-                    }).await;
+                    let _ = queue_tx
+                        .send(UserRequest {
+                            chat_model_id: prompt_generator.clone(),
+                            compressor_model_id: default_compressor.clone(),
+                            messages: vec![Message {
+                                role: "user".to_string(),
+                                content: prompt_instruction,
+                            }],
+                            responder: seed_tx,
+                            force_compression: false,
+                            parameters: params.clone(),
+                            target_backend: None,
+                        })
+                        .await;
 
                     let mut generated_seed = String::new();
                     while let Some(ev) = seed_rx.recv().await {
                         match ev {
                             StreamEvent::Token(t) => generated_seed.push_str(&t),
                             StreamEvent::Done => break,
-                            StreamEvent::Error(e) => { generated_seed.push_str(&e); break; },
-                            StreamEvent::TokenizationTime(_) => {}, // Ignore for seed generation
+                            StreamEvent::Error(e) => {
+                                generated_seed.push_str(&e);
+                                break;
+                            }
+                            StreamEvent::TokenizationTime(_) => {} // Ignore for seed generation
                         }
                     }
 
-                    if !generated_seed.is_empty() 
-                        && !generated_seed.starts_with("Server Error") 
-                        && let Some(tokenizer) = &qwen_tokenizer 
-                        && let Ok(encoding) = tokenizer.encode(generated_seed.clone(), true) 
+                    if !generated_seed.is_empty()
+                        && !generated_seed.starts_with("Server Error")
+                        && let Some(tokenizer) = &qwen_tokenizer
+                        && let Ok(encoding) = tokenizer.encode(generated_seed.clone(), true)
                     {
                         let token_len = encoding.get_ids().len();
                         let margin = (size as f32 * 0.35) as usize;
-                        
+
                         if token_len >= size.saturating_sub(margin) && token_len <= size + margin {
                             final_content = generated_seed;
                             should_save = true;
-                            println!("✅ Generated {} tokens (within 35% of {}). Saving.", token_len, size);
+                            println!(
+                                "✅ Generated {} tokens (within 35% of {}). Saving.",
+                                token_len, size
+                            );
                         } else {
-                            println!("⚠️ Generation missed margin: {} tokens (target {}).", token_len, size);
+                            println!(
+                                "⚠️ Generation missed margin: {} tokens (target {}).",
+                                token_len, size
+                            );
                         }
                     }
                 } else {
                     // --- ALGORITHMIC SYNTHESIS FOR LARGE CONTEXT ---
-                    println!("🖨️ Synthesizing highly unique {} token data payload...", size);
+                    println!(
+                        "🖨️ Synthesizing highly unique {} token data payload...",
+                        size
+                    );
                     let mut synthetic_data = String::with_capacity(size * 4);
                     synthetic_data.push_str("=== MULTI-USER SYSTEM DIAGNOSTIC LOG EXPORT ===\n");
-                    
-                    let events = ["PLAYER_CONNECT", "ROOM_TRANSITION", "COMBAT_ACTION", "TELNET_NEGOTIATION", "INVENTORY_SYNC"];
+
+                    let events = [
+                        "PLAYER_CONNECT",
+                        "ROOM_TRANSITION",
+                        "COMBAT_ACTION",
+                        "TELNET_NEGOTIATION",
+                        "INVENTORY_SYNC",
+                    ];
                     let statuses = ["SUCCESS", "TIMEOUT", "DISCONNECT", "INVALID_CMD", "OK"];
-                    
+
                     let mut current_tokens = 0;
                     let mut counter = 0;
                     let mut chunk_buffer = String::with_capacity(8192);
 
                     if let Some(tokenizer) = &qwen_tokenizer {
-                        
                         if let Ok(enc) = tokenizer.encode(synthetic_data.as_str(), true) {
                             current_tokens = enc.get_ids().len();
                         }
@@ -324,34 +397,47 @@ async fn trigger_benchmark(
                             let ev = events[counter % events.len()];
                             let st = statuses[(counter / 3) % statuses.len()];
                             let session_id = uuid::Uuid::new_v4();
-                            
+
                             let log_line = format!(
                                 "[2026-04-11T11:36:{:02}Z] SESSION: {} | EVENT: {} | STATUS: {} | LATENCY: {}ms | ALLOC: {}KB\n",
-                                counter % 60, session_id, ev, st, (counter * 7) % 300, (counter * 13) % 2048
+                                counter % 60,
+                                session_id,
+                                ev,
+                                st,
+                                (counter * 7) % 300,
+                                (counter * 13) % 2048
                             );
-                            
+
                             synthetic_data.push_str(&log_line);
                             chunk_buffer.push_str(&log_line);
-                            
+
                             if counter % 50 == 0 {
-                                let new_tokens = tokenizer.encode(chunk_buffer.as_str(), false)
+                                let new_tokens = tokenizer
+                                    .encode(chunk_buffer.as_str(), false)
                                     .map(|enc| enc.get_ids().len())
                                     .unwrap_or(0);
-                                
-                                current_tokens += if new_tokens > 0 { new_tokens } else { (chunk_buffer.len() / 4).max(1) };
-                                chunk_buffer.clear(); 
+
+                                current_tokens += if new_tokens > 0 {
+                                    new_tokens
+                                } else {
+                                    (chunk_buffer.len() / 4).max(1)
+                                };
+                                chunk_buffer.clear();
                             }
                             counter += 1;
                         }
-                        
+
                         if let Ok(final_encoding) = tokenizer.encode(synthetic_data, true) {
                             let safe_size = size.min(final_encoding.get_ids().len());
                             let exact_slice = &final_encoding.get_ids()[0..safe_size];
-                            
+
                             if let Ok(decoded) = tokenizer.decode(exact_slice, true) {
                                 final_content = decoded;
                                 should_save = true;
-                                println!("✅ Successfully synthesized exactly {} unique tokens.", safe_size);
+                                println!(
+                                    "✅ Successfully synthesized exactly {} unique tokens.",
+                                    safe_size
+                                );
                             } else {
                                 println!("⚠️ Decode failed. Falling back to padding.");
                             }
@@ -368,70 +454,118 @@ async fn trigger_benchmark(
                 }
             }
         }
-        
+
         println!("✅ Setup Phase Complete. Beginning standard benchmark sweeps...");
 
         // --- GENERATIVE MODELS ---
-        for model in registry.iter().filter(|m| m.roles.contains(&ModelRole::GeneralChat) || m.roles.contains(&ModelRole::CodeSpecialist)) {
+        for model in registry.iter().filter(|m| {
+            m.roles.contains(&ModelRole::GeneralChat)
+                || m.roles.contains(&ModelRole::CodeSpecialist)
+        }) {
             let mut test_sizes = vec![1, 10, 100, 1000, 10000];
             let safe_max = (model.max_context_len as f32 * 0.95) as usize;
             test_sizes.retain(|&s| s < safe_max);
-            if safe_max > 0 { test_sizes.push(safe_max); }
+            if safe_max > 0 {
+                test_sizes.push(safe_max);
+            }
 
             for size in test_sizes {
                 let filename = format!("benchmark_prompts/prompt_{}.txt", size);
-                let exact_prompt = tokio::fs::read_to_string(&filename).await.unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
-                
-                for target_b in target_backends.iter() {
-                    let supports = model.supported_backends.iter().any(|b| format!("{:?}", b).to_lowercase() == target_b.to_lowercase());
-                    if !supports { continue; }
+                let exact_prompt = tokio::fs::read_to_string(&filename)
+                    .await
+                    .unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
 
-                    println!("📊 Benchmarking Generative {} using file {} on Backend {}...", model.name, filename, target_b);
-                    
+                for target_b in target_backends.iter() {
+                    let supports = model
+                        .supported_backends
+                        .iter()
+                        .any(|b| format!("{:?}", b).to_lowercase() == target_b.to_lowercase());
+                    if !supports {
+                        continue;
+                    }
+
+                    println!(
+                        "📊 Benchmarking Generative {} using file {} on Backend {}...",
+                        model.name, filename, target_b
+                    );
+
                     let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-                    let _ = queue_tx.send(UserRequest {
-                        chat_model_id: model.id.clone(),
-                        compressor_model_id: default_compressor.clone(),
-                        messages: vec![Message { role: "user".to_string(), content: exact_prompt.clone() }],
-                        responder: response_tx,
-                        force_compression: false,
-                        parameters: params.clone(),
-                        target_backend: Some(target_b.clone()),
-                    }).await;
-                    while let Some(ev) = response_rx.recv().await { if let StreamEvent::Done = ev { break; } }
+                    let _ = queue_tx
+                        .send(UserRequest {
+                            chat_model_id: model.id.clone(),
+                            compressor_model_id: default_compressor.clone(),
+                            messages: vec![Message {
+                                role: "user".to_string(),
+                                content: exact_prompt.clone(),
+                            }],
+                            responder: response_tx,
+                            force_compression: false,
+                            parameters: params.clone(),
+                            target_backend: Some(target_b.clone()),
+                        })
+                        .await;
+                    while let Some(ev) = response_rx.recv().await {
+                        if let StreamEvent::Done = ev {
+                            break;
+                        }
+                    }
                 }
             }
         }
 
         // --- COMPRESSOR MODELS ---
         println!("🚀 Transitioning to Compressor Benchmarks...");
-        for comp_model in registry.iter().filter(|m| m.roles.contains(&ModelRole::ContextCompressor)) {
+        for comp_model in registry
+            .iter()
+            .filter(|m| m.roles.contains(&ModelRole::ContextCompressor))
+        {
             let mut test_sizes = vec![1, 10, 100, 1000, 10000];
             let safe_max = (comp_model.max_context_len as f32 * 0.95) as usize;
             test_sizes.retain(|&s| s < safe_max);
-            if safe_max > 0 { test_sizes.push(safe_max); }
+            if safe_max > 0 {
+                test_sizes.push(safe_max);
+            }
 
             for size in test_sizes {
                 let filename = format!("benchmark_prompts/prompt_{}.txt", size);
-                let exact_prompt = tokio::fs::read_to_string(&filename).await.unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
-                
-                for target_b in target_backends.iter() {
-                    let supports = comp_model.supported_backends.iter().any(|b| format!("{:?}", b).to_lowercase() == target_b.to_lowercase());
-                    if !supports { continue; }
+                let exact_prompt = tokio::fs::read_to_string(&filename)
+                    .await
+                    .unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
 
-                    println!("📊 Benchmarking Compressor {} using file {} on Backend {}...", comp_model.name, filename, target_b);
-                    
+                for target_b in target_backends.iter() {
+                    let supports = comp_model
+                        .supported_backends
+                        .iter()
+                        .any(|b| format!("{:?}", b).to_lowercase() == target_b.to_lowercase());
+                    if !supports {
+                        continue;
+                    }
+
+                    println!(
+                        "📊 Benchmarking Compressor {} using file {} on Backend {}...",
+                        comp_model.name, filename, target_b
+                    );
+
                     let (response_tx, mut response_rx) = mpsc::unbounded_channel();
-                    let _ = queue_tx.send(UserRequest {
-                        chat_model_id: default_chat.clone(), 
-                        compressor_model_id: comp_model.id.clone(),
-                        messages: vec![Message { role: "user".to_string(), content: exact_prompt.clone() }],
-                        responder: response_tx,
-                        force_compression: true, 
-                        parameters: params.clone(),
-                        target_backend: Some(target_b.clone()),
-                    }).await;
-                    while let Some(ev) = response_rx.recv().await { if let StreamEvent::Done = ev { break; } }
+                    let _ = queue_tx
+                        .send(UserRequest {
+                            chat_model_id: default_chat.clone(),
+                            compressor_model_id: comp_model.id.clone(),
+                            messages: vec![Message {
+                                role: "user".to_string(),
+                                content: exact_prompt.clone(),
+                            }],
+                            responder: response_tx,
+                            force_compression: true,
+                            parameters: params.clone(),
+                            target_backend: Some(target_b.clone()),
+                        })
+                        .await;
+                    while let Some(ev) = response_rx.recv().await {
+                        if let StreamEvent::Done = ev {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -445,7 +579,11 @@ async fn trigger_benchmark(
         }
     });
 
-    (StatusCode::ACCEPTED, "Benchmark sweep started in the background.").into_response()
+    (
+        StatusCode::ACCEPTED,
+        "Benchmark sweep started in the background.",
+    )
+        .into_response()
 }
 
 // Route: Serve the Stats UI
@@ -456,7 +594,9 @@ async fn serve_stats_ui(session: tower_sessions::Session) -> Result<Html<&'stati
     Ok(Html(include_str!("../stats.html")))
 }
 
-async fn serve_settings_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+async fn serve_settings_ui(
+    session: tower_sessions::Session,
+) -> Result<Html<&'static str>, Redirect> {
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
@@ -471,38 +611,74 @@ async fn serve_memory_ui(session: tower_sessions::Session) -> Result<Html<&'stat
 }
 
 async fn serve_chat_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
-    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../chat.js")))
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../chat.js"),
+    ))
 }
 
 async fn serve_stats_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
-    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../stats.js")))
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../stats.js"),
+    ))
 }
 
-async fn serve_settings_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
-    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../settings.js")))
+async fn serve_settings_js(
+    session: tower_sessions::Session,
+) -> Result<impl IntoResponse, Redirect> {
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../settings.js"),
+    ))
 }
 
 async fn serve_memory_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
-    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../memory.js")))
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../memory.js"),
+    ))
 }
 
 async fn serve_common_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
-    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../common.js")))
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../common.js"),
+    ))
 }
 
 async fn serve_common_css(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
-    Ok(([(header::CONTENT_TYPE, "text/css")], include_str!("../common.css")))
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("../common.css"),
+    ))
 }
 
 // Route: Serve the Telemetry JSON
 async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetryStore> {
-    let current_data = state.telemetry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let current_data = state
+        .telemetry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     Json(current_data)
 }
 
@@ -515,7 +691,7 @@ async fn main() {
 
     // Initialize the shared state BEFORE spawning the background thread
     let engine_status = Arc::new(Mutex::new(EngineStatus::default()));
-    
+
     // Background VRAM Tracker
     let status_for_nvml = engine_status.clone();
     let vram_tracker_gpu_idx = config.gpu_device_index;
@@ -526,17 +702,24 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
-            
+
             sys.refresh_memory();
             sys.refresh_process(pid);
 
             let mut s = manager::lock_status(&status_for_nvml);
-            
+
             if let Some(process) = sys.process(pid) {
-                s.update_sysinfo(sys.total_memory(), sys.used_memory(), sys.free_memory(), process.memory());
+                s.update_sysinfo(
+                    sys.total_memory(),
+                    sys.used_memory(),
+                    sys.free_memory(),
+                    process.memory(),
+                );
             }
 
-            if let Some((used, total, free)) = manager::get_vram_info(nvml.as_ref(), vram_tracker_gpu_idx) {
+            if let Some((used, total, free)) =
+                manager::get_vram_info(nvml.as_ref(), vram_tracker_gpu_idx)
+            {
                 s.update_nvml(total, used, free);
             }
         }
@@ -564,7 +747,13 @@ async fn main() {
     // Boot up the GPU Orchestrator in the background
     let batcher_gpu_idx = config.gpu_device_index;
     tokio::spawn(async move {
-        run_batcher_loop(rx, status_for_batcher, telemetry_for_batcher, batcher_gpu_idx).await;
+        run_batcher_loop(
+            rx,
+            status_for_batcher,
+            telemetry_for_batcher,
+            batcher_gpu_idx,
+        )
+        .await;
     });
 
     let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -586,7 +775,7 @@ async fn main() {
     let reqwest_client = reqwest::Client::new();
     let oauth_client = auth::build_oauth_client(&config.oauth_redirect_uri);
 
-    let shared_state = Arc::new(AppState { 
+    let shared_state = Arc::new(AppState {
         queue_tx: tx,
         engine_status,
         telemetry,
@@ -611,7 +800,7 @@ async fn main() {
         .route("/auth/logout", get(auth::logout_handler))
         // Protected UIs (They redirect if session is missing)
         .route("/", get(serve_ui))
-        .route("/settings", get(serve_settings_ui)) 
+        .route("/settings", get(serve_settings_ui))
         .route("/stats", get(serve_stats_ui))
         .route("/memory", get(serve_memory_ui))
         .route("/js/chat.js", get(serve_chat_js))
@@ -621,7 +810,10 @@ async fn main() {
         .route("/js/common.js", get(serve_common_js))
         .route("/css/common.css", get(serve_common_css))
         // Settings APIs (They check session manually)
-        .route("/api/settings/keys", get(auth::list_keys_handler).post(auth::create_key_handler))
+        .route(
+            "/api/settings/keys",
+            get(auth::list_keys_handler).post(auth::create_key_handler),
+        )
         .route("/api/settings/keys/:hash", delete(auth::delete_key_handler));
 
     // ENGINE API ROUTES
@@ -632,7 +824,10 @@ async fn main() {
         .route("/api/models", get(get_models))
         .route("/api/status", get(get_status))
         .route("/api/stats/data", get(get_stats_data))
-        .route_layer(axum::middleware::from_fn_with_state(shared_state.clone(), auth::dual_auth_middleware));
+        .route_layer(axum::middleware::from_fn_with_state(
+            shared_state.clone(),
+            auth::dual_auth_middleware,
+        ));
 
     // MERGE & MOUNT
     // Combine them, inject the shared state, and apply the session layer globally
@@ -642,7 +837,9 @@ async fn main() {
         .layer(session_layer);
 
     // Start listening on port 3000
-    let listener = tokio::net::TcpListener::bind(&config.bind_address).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&config.bind_address)
+        .await
+        .unwrap();
     println!("🚀 Server safely listening on {}", config.bind_address);
     axum::serve(listener, app).await.unwrap();
 }

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::types::Message;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 pub enum ModelDType {
@@ -24,15 +24,27 @@ impl PromptFormatter for ModelArch {
         let mut prompt = String::new();
         match self {
             ModelArch::Qwen2 => {
-                for msg in messages { prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content)); }
+                for msg in messages {
+                    prompt.push_str(&format!(
+                        "<|im_start|>{}\n{}<|im_end|>\n",
+                        msg.role, msg.content
+                    ));
+                }
                 prompt.push_str("<|im_start|>assistant\n");
-            },
+            }
             ModelArch::Llama => {
-                for msg in messages { prompt.push_str(&format!("<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>", msg.role, msg.content)); }
+                for msg in messages {
+                    prompt.push_str(&format!(
+                        "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+                        msg.role, msg.content
+                    ));
+                }
                 prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-            },
+            }
             _ => {
-                for msg in messages { prompt.push_str(&format!("{}: {}\n", msg.role, msg.content)); }
+                for msg in messages {
+                    prompt.push_str(&format!("{}: {}\n", msg.role, msg.content));
+                }
                 prompt.push_str("assistant: ");
             }
         }
@@ -71,7 +83,7 @@ pub struct ModelConfig {
     pub arch: ModelArch,
     pub compression_dtype: Option<ModelDType>,
     pub kv_cache_dtype: ModelDType,
-    pub parameters_billions: f32, 
+    pub parameters_billions: f32,
     pub size_on_disk_gb: f32,
     pub supported_backends: Vec<BackendType>,
     #[serde(default)]
@@ -103,12 +115,14 @@ impl ModelConfig {
 // Expose the registry so the web server can send it to the UI
 pub fn get_model_registry() -> Vec<ModelConfig> {
     vec![
-        ModelConfig { 
-            id: "llama-3.1-8b".to_string(), name: "Llama 3.1 (8B)".to_string(),
+        ModelConfig {
+            id: "llama-3.1-8b".to_string(),
+            name: "Llama 3.1 (8B)".to_string(),
             repo: "QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF".to_string(),
             tokenizer_repo: "NousResearch/Meta-Llama-3.1-8B-Instruct".to_string(),
-            filename: "Meta-Llama-3.1-8B-Instruct.Q4_K_M.gguf".to_string(), 
-            max_context_len: 128000, roles: vec![ModelRole::GeneralChat],
+            filename: "Meta-Llama-3.1-8B-Instruct.Q4_K_M.gguf".to_string(),
+            max_context_len: 128000,
+            roles: vec![ModelRole::GeneralChat],
             num_layers: 32,
             n_embd: 4096,
             n_head: 32,
@@ -122,15 +136,15 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             is_default_chat: false,
             is_default_compressor: false,
         },
-        ModelConfig { 
-            id: "qwen-2.5-7b".to_string(), 
+        ModelConfig {
+            id: "qwen-2.5-7b".to_string(),
             name: "Qwen 2.5 (7B)".to_string(),
             // Point to the unified community repo instead of the split official repo
-            repo: "bartowski/Qwen2.5-7B-Instruct-GGUF".to_string(), 
+            repo: "bartowski/Qwen2.5-7B-Instruct-GGUF".to_string(),
             tokenizer_repo: "Qwen/Qwen2.5-7B-Instruct".to_string(),
             // Note the exact capitalization used in the bartowski repo:
-            filename: "Qwen2.5-7B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 128000, 
+            filename: "Qwen2.5-7B-Instruct-Q4_K_M.gguf".to_string(),
+            max_context_len: 128000,
             roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
             num_layers: 28,
             n_embd: 3584,
@@ -145,13 +159,13 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             is_default_chat: true,
             is_default_compressor: false,
         },
-        ModelConfig { 
-            id: "qwen-2.5-14b".to_string(), 
+        ModelConfig {
+            id: "qwen-2.5-14b".to_string(),
             name: "Qwen 2.5 (14B)".to_string(),
-            repo: "bartowski/Qwen2.5-14B-Instruct-GGUF".to_string(), 
+            repo: "bartowski/Qwen2.5-14B-Instruct-GGUF".to_string(),
             tokenizer_repo: "Qwen/Qwen2.5-14B-Instruct".to_string(),
-            filename: "Qwen2.5-14B-Instruct-Q4_K_M.gguf".to_string(), 
-            max_context_len: 131072, 
+            filename: "Qwen2.5-14B-Instruct-Q4_K_M.gguf".to_string(),
+            max_context_len: 131072,
             roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
             num_layers: 48,
             n_embd: 5120,
@@ -166,12 +180,12 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             is_default_chat: false,
             is_default_compressor: false,
         },
-        ModelConfig { 
-            id: "qwen-coder-14b".to_string(), 
+        ModelConfig {
+            id: "qwen-coder-14b".to_string(),
             name: "Qwen2.5 Coder (14B)".to_string(),
-            repo: "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF".to_string(), 
+            repo: "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF".to_string(),
             tokenizer_repo: "Qwen/Qwen2.5-Coder-14B-Instruct".to_string(),
-            filename: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf".to_string(), 
+            filename: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf".to_string(),
             max_context_len: 131072,
             num_layers: 48,
             n_embd: 5120,
@@ -187,12 +201,12 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             is_default_chat: false,
             is_default_compressor: false,
         },
-        ModelConfig { 
-            id: "strand-rust-14b".to_string(), 
+        ModelConfig {
+            id: "strand-rust-14b".to_string(),
             name: "Strand Rust Coder (14B)".to_string(),
-            repo: "mradermacher/Strand-Rust-Coder-14B-v1-GGUF".to_string(), 
+            repo: "mradermacher/Strand-Rust-Coder-14B-v1-GGUF".to_string(),
             tokenizer_repo: "Fortytwo-Network/Strand-Rust-Coder-14B-v1".to_string(),
-            filename: "Strand-Rust-Coder-14B-v1.Q4_K_M.gguf".to_string(), 
+            filename: "Strand-Rust-Coder-14B-v1.Q4_K_M.gguf".to_string(),
             max_context_len: 32768,
             num_layers: 40,
             n_embd: 5120,
@@ -208,13 +222,13 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             is_default_chat: false,
             is_default_compressor: false,
         },
-        ModelConfig { 
-            id: "llmlingua-2-f16".to_string(), 
+        ModelConfig {
+            id: "llmlingua-2-f16".to_string(),
             name: "LLMLingua-2 (F16 - Lean)".to_string(),
-            repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(), 
+            repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
             tokenizer_repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
-            filename: "model.safetensors".to_string(), 
-            max_context_len: 512, 
+            filename: "model.safetensors".to_string(),
+            max_context_len: 512,
             num_layers: 24,
             n_embd: 0,
             n_head: 0,
@@ -229,13 +243,13 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             is_default_chat: false,
             is_default_compressor: false,
         },
-        ModelConfig { 
-            id: "llmlingua-2-f32".to_string(), 
+        ModelConfig {
+            id: "llmlingua-2-f32".to_string(),
             name: "LLMLingua-2 (F32 - Precision)".to_string(),
-            repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(), 
+            repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
             tokenizer_repo: "microsoft/llmlingua-2-xlm-roberta-large-meetingbank".to_string(),
-            filename: "model.safetensors".to_string(), 
-            max_context_len: 512, 
+            filename: "model.safetensors".to_string(),
+            max_context_len: 512,
             num_layers: 24,
             n_embd: 0,
             n_head: 0,
@@ -250,13 +264,13 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             is_default_chat: false,
             is_default_compressor: false,
         },
-        ModelConfig { 
-            id: "qwen-compressor".to_string(), 
+        ModelConfig {
+            id: "qwen-compressor".to_string(),
             name: "Qwen 1.5B (Abstractive)".to_string(),
-            repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".to_string(), 
+            repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".to_string(),
             tokenizer_repo: "Qwen/Qwen2.5-1.5B-Instruct".to_string(),
-            filename: "qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(), 
-            max_context_len: 32768, 
+            filename: "qwen2.5-1.5b-instruct-q4_k_m.gguf".to_string(),
+            max_context_len: 32768,
             num_layers: 28,
             n_embd: 1536,
             n_head: 12,

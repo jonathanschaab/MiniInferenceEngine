@@ -55,11 +55,23 @@ pub struct EngineStatus {
 
 impl EngineStatus {
     pub fn total_engine_vram(&self) -> u64 {
-        self.models_vram.iter().map(|m| m.weights + m.kv_cache + m.compute).sum()
+        self.models_vram
+            .iter()
+            .map(|m| m.weights + m.kv_cache + m.compute)
+            .sum()
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn set_model_vram(&mut self, id: String, backend: String, is_statically_allocated: bool, status: String, weights: u64, kv: u64, comp: u64) {
+    pub fn set_model_vram(
+        &mut self,
+        id: String,
+        backend: String,
+        is_statically_allocated: bool,
+        status: String,
+        weights: u64,
+        kv: u64,
+        comp: u64,
+    ) {
         if let Some(m) = self.models_vram.iter_mut().find(|m| m.id == id) {
             m.weights = weights;
             m.kv_cache = kv;
@@ -68,7 +80,15 @@ impl EngineStatus {
             m.is_statically_allocated = is_statically_allocated;
             m.status = status;
         } else {
-            self.models_vram.push(ModelMemory { id, backend, is_statically_allocated, status, weights, kv_cache: kv, compute: comp });
+            self.models_vram.push(ModelMemory {
+                id,
+                backend,
+                is_statically_allocated,
+                status,
+                weights,
+                kv_cache: kv,
+                compute: comp,
+            });
         }
         self.vram_engine_claimed = self.total_engine_vram();
     }
@@ -85,28 +105,48 @@ impl EngineStatus {
     }
 
     pub fn log_vram(&mut self, action: &str, subsystem: &str, description: &str, bytes: i64) {
-        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         self.vram_events.push(VramEvent {
-            timestamp, action: action.to_string(), subsystem: subsystem.to_string(), description: description.to_string(), bytes,
+            timestamp,
+            action: action.to_string(),
+            subsystem: subsystem.to_string(),
+            description: description.to_string(),
+            bytes,
         });
-        if self.vram_events.len() > 100 { self.vram_events.remove(0); }
+        if self.vram_events.len() > 100 {
+            self.vram_events.remove(0);
+        }
     }
 
     pub fn log_ram(&mut self, action: &str, subsystem: &str, description: &str, bytes: i64) {
-        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         self.ram_events.push(RamEvent {
-            timestamp, action: action.to_string(), subsystem: subsystem.to_string(), description: description.to_string(), bytes,
+            timestamp,
+            action: action.to_string(),
+            subsystem: subsystem.to_string(),
+            description: description.to_string(),
+            bytes,
         });
-        if self.ram_events.len() > 100 { self.ram_events.remove(0); }
+        if self.ram_events.len() > 100 {
+            self.ram_events.remove(0);
+        }
     }
 
     pub fn update_nvml(&mut self, total: u64, used: u64, free: u64) {
         self.vram_total = total;
         self.vram_used = used;
         self.vram_free = free;
-        
-        if self.baseline_other_vram == 0 { self.baseline_other_vram = used; }
-        
+
+        if self.baseline_other_vram == 0 {
+            self.baseline_other_vram = used;
+        }
+
         if self.models_vram.is_empty() {
             self.baseline_other_vram = used;
             self.vram_other_processes = used;
@@ -114,20 +154,33 @@ impl EngineStatus {
         } else {
             let mut static_claimed = 0;
             for m in &self.models_vram {
-                if m.is_statically_allocated { static_claimed += m.weights + m.kv_cache + m.compute; } 
-                else { static_claimed += m.weights; }
+                if m.is_statically_allocated {
+                    static_claimed += m.weights + m.kv_cache + m.compute;
+                } else {
+                    static_claimed += m.weights;
+                }
             }
-            
+
             let dynamic_usage = used.saturating_sub(self.baseline_other_vram + static_claimed);
-            let active_count = self.models_vram.iter().filter(|m| !m.is_statically_allocated && m.status == "Active").count() as u64;
+            let active_count = self
+                .models_vram
+                .iter()
+                .filter(|m| !m.is_statically_allocated && m.status == "Active")
+                .count() as u64;
             if let Some(usage_per_model) = dynamic_usage.checked_div(active_count) {
-                for m in self.models_vram.iter_mut().filter(|m| !m.is_statically_allocated && m.status == "Active") {
+                for m in self
+                    .models_vram
+                    .iter_mut()
+                    .filter(|m| !m.is_statically_allocated && m.status == "Active")
+                {
                     m.kv_cache = usage_per_model;
                 }
             }
             self.vram_engine_claimed = self.total_engine_vram();
             self.vram_other_processes = used.saturating_sub(self.vram_engine_claimed);
-            if self.vram_other_processes < self.baseline_other_vram { self.baseline_other_vram = self.vram_other_processes; }
+            if self.vram_other_processes < self.baseline_other_vram {
+                self.baseline_other_vram = self.vram_other_processes;
+            }
         }
     }
 
@@ -141,7 +194,9 @@ impl EngineStatus {
 }
 
 pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'_, EngineStatus> {
-    status.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Deserialize, Clone)]

@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::fs;
-use tokio::sync::mpsc::UnboundedSender;
 use crate::types::GenerationParameters;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LoadMetric {
@@ -13,7 +13,9 @@ pub struct LoadMetric {
     pub load_time_ms: u128,
 }
 
-fn default_backend() -> String { "Unknown".to_string() }
+fn default_backend() -> String {
+    "Unknown".to_string()
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GenerationMetric {
@@ -55,11 +57,11 @@ impl TelemetryStore {
         if let Ok(json) = serde_json::to_string_pretty(self) {
             if let Some(tx) = &self.writer_tx {
                 // Send payload to the dedicated writer task (Thread-safe & Ordered!)
-                let _ = tx.send(json); 
+                let _ = tx.send(json);
             } else {
                 // FAIL LOUDLY: Include the exact payload that is being dropped!
                 eprintln!(
-                    "⚠️ [TELEMETRY FAULT] Writer channel missing! Dropping metric payload to prevent disk I/O race conditions. Check channel initialization in main.rs.\nDropped Payload:\n{}", 
+                    "⚠️ [TELEMETRY FAULT] Writer channel missing! Dropping metric payload to prevent disk I/O race conditions. Check channel initialization in main.rs.\nDropped Payload:\n{}",
                     json
                 );
             }
@@ -67,8 +69,16 @@ impl TelemetryStore {
     }
 
     pub fn record_load(&mut self, model_id: String, backend: String, load_time_ms: u128) {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        self.loads.push(LoadMetric { timestamp, model_id, backend, load_time_ms });
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.loads.push(LoadMetric {
+            timestamp,
+            model_id,
+            backend,
+            load_time_ms,
+        });
 
         self.unsaved_events += 1;
         if self.unsaved_events >= 5 {
@@ -82,10 +92,33 @@ impl TelemetryStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn record_generation(&mut self, model_id: String, backend: String, parameters: GenerationParameters, offload_pct: f32, prompt_chars: usize, prompt_tokens: usize, tokenization_time_ms: u128, generation_time_ms: u128) {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        self.generations.push(GenerationMetric { timestamp, model_id, backend, parameters, offload_pct, prompt_chars, prompt_tokens, tokenization_time_ms, generation_time_ms });
-        
+    pub fn record_generation(
+        &mut self,
+        model_id: String,
+        backend: String,
+        parameters: GenerationParameters,
+        offload_pct: f32,
+        prompt_chars: usize,
+        prompt_tokens: usize,
+        tokenization_time_ms: u128,
+        generation_time_ms: u128,
+    ) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.generations.push(GenerationMetric {
+            timestamp,
+            model_id,
+            backend,
+            parameters,
+            offload_pct,
+            prompt_chars,
+            prompt_tokens,
+            tokenization_time_ms,
+            generation_time_ms,
+        });
+
         self.unsaved_events += 1;
         if self.unsaved_events >= 5 {
             self.save_to_disk();
