@@ -284,24 +284,9 @@ impl LlamaCppEngine {
                                 if is_eog { break; }
                                 
                                 byte_buffer.extend_from_slice(&new_bytes);
-                                match std::str::from_utf8(&byte_buffer) {
-                                    Ok(valid_str) => {
-                                        if tx.send(crate::types::StreamEvent::Token(valid_str.to_string())).is_err() { break; }
-                                        byte_buffer.clear();
-                                    }
-                                    Err(e) => {
-                                        let valid_len = e.valid_up_to();
-                                        if valid_len > 0 {
-                                            let valid_str = unsafe { std::str::from_utf8_unchecked(&byte_buffer[..valid_len]) };
-                                            if tx.send(crate::types::StreamEvent::Token(valid_str.to_string())).is_err() { break; }
-                                            byte_buffer.drain(..valid_len);
-                                        }
-                                        if e.error_len().is_some() {
-                                            let invalid_str = String::from_utf8_lossy(&byte_buffer).into_owned();
-                                            if tx.send(crate::types::StreamEvent::Token(invalid_str)).is_err() { break; }
-                                            byte_buffer.clear();
-                                        }
-                                    }
+                                let decoded = process_utf8_buffer(&mut byte_buffer);
+                                if !decoded.is_empty() && tx.send(crate::types::StreamEvent::Token(decoded)).is_err() {
+                                    break;
                                 }
                                 
                                 let mut batch = LlamaBatch::new(1, 1);

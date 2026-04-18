@@ -371,7 +371,7 @@
                     updateStatus();
                 } else {
                     typingIndicator.style.display = 'none';
-                    appendMessage("Error: Failed to connect to engine.", false);
+                    aiMessageDiv.textContent = "Error: Failed to connect to engine.";
                     chatHistory.pop(); 
                 }
             }
