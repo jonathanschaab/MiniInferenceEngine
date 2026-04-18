@@ -241,6 +241,10 @@ pub async fn run_batcher_loop(
 
                 match tok_res {
                     Ok(Ok(tok)) => {
+                        if tokenizer_cache.len() >= 5 {
+                            // Simple eviction to prevent memory leak
+                            tokenizer_cache.clear();
+                        }
                         tokenizer_cache
                             .insert(config_for_prompt.tokenizer_repo.clone(), tok.clone());
                         tok.clone()
@@ -847,7 +851,6 @@ pub async fn run_batcher_loop(
         let gen_start = Instant::now();
 
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut tokenization_time_ms: u128 = 0;
         let responder = request.responder;
 
         let gen_fut = active_backend.as_mut().unwrap().generate_stream(
@@ -860,9 +863,10 @@ pub async fn run_batcher_loop(
         // events like 'TokenizationTime' so they don't leak into the web HTTP chunked response!
         let fwd_fut = async {
             let mut terminal_received = false;
+            let mut tok_time: u128 = 0;
             while let Some(ev) = inner_rx.recv().await {
                 match ev {
-                    StreamEvent::TokenizationTime(t) => tokenization_time_ms = t,
+                    StreamEvent::TokenizationTime(t) => tok_time = t,
                     StreamEvent::Done => {
                         terminal_received = true;
                         let _ = responder.send(StreamEvent::Done);
@@ -874,7 +878,9 @@ pub async fn run_batcher_loop(
                         break;
                     }
                     other => {
-                        let _ = responder.send(other);
+                        if responder.send(other).is_err() {
+                            break; // Client disconnected, stop forwarding
+                        }
                     }
                 }
             }
@@ -884,9 +890,11 @@ pub async fn run_batcher_loop(
             if !terminal_received {
                 let _ = responder.send(StreamEvent::Done);
             }
+
+            tok_time
         };
 
-        tokio::join!(gen_fut, fwd_fut);
+        let (_, tokenization_time_ms) = tokio::join!(gen_fut, fwd_fut);
 
         let elapsed = gen_start.elapsed().as_millis();
         println!(
