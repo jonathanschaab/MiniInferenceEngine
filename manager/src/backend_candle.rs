@@ -10,7 +10,7 @@ use hf_hub::api::sync::Api;
 
 use std::sync::{Arc, Mutex};
 use crate::types::EngineStatus;
-use crate::registry::{ModelConfig, ModelArch, CompressionDType, get_model_registry};
+use crate::registry::{ModelConfig, ModelArch, ModelDType, get_model_registry};
 use crate::types::GenerationParameters;
 use crate::types::MemoryStrategy;
 use crate::backend::InferenceBackend;
@@ -68,7 +68,8 @@ pub fn load_engine(model_id: &str, device: &Device) -> Result<(DynamicModel, Tok
         let conf: BertConfig = serde_json::from_str(&config_str).map_err(|e| format!("Bad config JSON: {}", e))?;
         
         let dtype = match config.compression_dtype {
-            Some(CompressionDType::F16) => candle_core::DType::F16,
+            Some(ModelDType::F16) => candle_core::DType::F16,
+            Some(ModelDType::BF16) => candle_core::DType::BF16,
             _ => candle_core::DType::F32,
         };
 
@@ -124,7 +125,7 @@ where
 
     let prompt_length = tokens.len();
     let mut logits_processor = LogitsProcessor::new(
-        params.seed.unwrap_or(299792458),
+        params.seed.unwrap_or_else(rand::random::<u64>),
         params.temperature.map(|t| t as f64),
         params.top_p.map(|p| p as f64),
     );

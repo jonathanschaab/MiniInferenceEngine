@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use oauth2::basic::BasicClient; // Ensure this is imported for AppState
 
 use manager::{
-    get_model_registry, run_batcher_loop, ApiRequest, ModelConfig, UserRequest, EngineStatus, lock_status, TelemetryStore, Message, ModelRole, BenchmarkRequest, StreamEvent
+    get_model_registry, run_batcher_loop, ApiRequest, ModelConfig, UserRequest, EngineStatus, lock_status, TelemetryStore, Message, ModelRole, ModelArch, BenchmarkRequest, StreamEvent
 };
 
 // --- CONFIGURATION ---
@@ -163,14 +163,24 @@ async fn trigger_benchmark(
         let full_registry = get_model_registry();
         
         let default_compressor = full_registry.iter()
-            .find(|m| m.roles.contains(&ModelRole::ContextCompressor))
+            .find(|m| m.is_default_compressor)
+            .or_else(|| full_registry.iter().find(|m| m.roles.contains(&ModelRole::ContextCompressor)))
             .map(|m| m.id.clone())
             .unwrap_or_else(|| "llmlingua-2-f16".to_string());
 
         let default_chat = full_registry.iter()
-            .find(|m| m.roles.contains(&ModelRole::GeneralChat))
+            .find(|m| m.is_default_chat)
+            .or_else(|| full_registry.iter().find(|m| m.roles.contains(&ModelRole::GeneralChat)))
             .map(|m| m.id.clone())
             .unwrap_or_else(|| "qwen-2.5-7b".to_string());
+
+        let prompt_generator = full_registry.iter()
+            .find(|m| m.is_default_compressor && m.arch != ModelArch::XLMRoberta)
+            .or_else(|| full_registry.iter().find(|m| m.roles.contains(&ModelRole::GeneralChat) && m.parameters_billions < 4.0))
+            .or_else(|| full_registry.iter().find(|m| m.is_default_chat))
+            .or_else(|| full_registry.iter().find(|m| m.roles.contains(&ModelRole::GeneralChat)))
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| default_chat.clone());
 
         let registry: Vec<ModelConfig> = full_registry.into_iter()
             .filter(|m| selected_models.contains(&m.id))
@@ -244,7 +254,7 @@ async fn trigger_benchmark(
                 let mut final_content = String::new();
 
                 if size < 1000 {
-                    println!("🧠 Using Qwen 1.5B to generate realistic prompt of ~{} tokens...", size);
+                    println!("🧠 Using {} to generate realistic prompt of ~{} tokens...", prompt_generator, size);
                     let prompt_instruction = if size <= 50 {
                         format!("Write a very short technical sentence about Rust. Limit to {} words.", size)
                     } else {
@@ -253,7 +263,7 @@ async fn trigger_benchmark(
 
                     let (seed_tx, mut seed_rx) = mpsc::unbounded_channel();
                     let _ = queue_tx.send(UserRequest {
-                        chat_model_id: "qwen-compressor".to_string(), 
+                        chat_model_id: prompt_generator.clone(), 
                         compressor_model_id: default_compressor.clone(),
                         messages: vec![Message { role: "user".to_string(), content: prompt_instruction }],
                         responder: seed_tx,

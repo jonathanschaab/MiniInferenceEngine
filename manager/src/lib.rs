@@ -6,6 +6,8 @@ use nvml_wrapper::Nvml;
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 
+const CANDLE_COMPUTE_MARGIN_BYTES: u64 = 500 * 1024 * 1024;
+
 pub mod telemetry;
 pub mod types;
 pub mod registry;
@@ -332,13 +334,21 @@ pub async fn run_batcher_loop(
         } else if let Some((_, _, free_vram)) = vram_info {
                 // This rough heuristic is only for the Candle backend's dynamic memory check.
                 // Llama.cpp calculates this precisely during its static allocation.
-                let bytes_per_token = match &config.arch {
-                    ModelArch::Qwen2 if config.parameters_billions > 10.0 => 150_000,
-                    ModelArch::Qwen2 => 80_000,
-                    ModelArch::Llama if config.parameters_billions < 10.0 => 125_000,
-                    _ => 100_000,
+                let bytes_per_element = match config.kv_cache_dtype {
+                    ModelDType::F32 => 4,
+                    ModelDType::F16 | ModelDType::BF16 => 2,
                 };
-                let safe_free_vram = free_vram.saturating_sub(500 * 1024 * 1024); 
+                let bytes_per_token = if config.n_head > 0 && config.n_head_kv > 0 {
+                    (config.num_layers * config.n_embd * config.n_head_kv / config.n_head) * bytes_per_element
+                } else {
+                    match &config.arch {
+                        ModelArch::Qwen2 if config.parameters_billions > 10.0 => 150_000,
+                        ModelArch::Qwen2 => 80_000,
+                        ModelArch::Llama if config.parameters_billions < 10.0 => 125_000,
+                        _ => 100_000,
+                    }
+                };
+                let safe_free_vram = free_vram.saturating_sub(CANDLE_COMPUTE_MARGIN_BYTES); 
                 let absolute_max_tokens = (safe_free_vram as usize / bytes_per_token).min(active_max_context);
                 
                 println!("🧮 MEMORY CHECK: Free VRAM can hold ~{} tokens.", absolute_max_tokens);

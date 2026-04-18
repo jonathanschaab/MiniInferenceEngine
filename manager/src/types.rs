@@ -119,8 +119,11 @@ impl EngineStatus {
             }
             
             let dynamic_usage = used.saturating_sub(self.baseline_other_vram + static_claimed);
-            if let Some(m) = self.models_vram.iter_mut().find(|m| !m.is_statically_allocated && m.status == "Active") {
-                m.kv_cache = dynamic_usage;
+            let active_count = self.models_vram.iter().filter(|m| !m.is_statically_allocated && m.status == "Active").count() as u64;
+            if let Some(usage_per_model) = dynamic_usage.checked_div(active_count) {
+                for m in self.models_vram.iter_mut().filter(|m| !m.is_statically_allocated && m.status == "Active") {
+                    m.kv_cache = usage_per_model;
+                }
             }
             self.vram_engine_claimed = self.total_engine_vram();
             self.vram_other_processes = used.saturating_sub(self.vram_engine_claimed);

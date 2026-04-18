@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use crate::types::Message;
 
-#[derive(Clone, Serialize, Deserialize)]
-pub enum CompressionDType {
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+pub enum ModelDType {
     F32,
     F16,
+    BF16,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -68,10 +69,15 @@ pub struct ModelConfig {
     pub n_head_kv: usize,
     pub roles: Vec<ModelRole>,
     pub arch: ModelArch,
-    pub compression_dtype: Option<CompressionDType>,
+    pub compression_dtype: Option<ModelDType>,
+    pub kv_cache_dtype: ModelDType,
     pub parameters_billions: f32, 
     pub size_on_disk_gb: f32,
     pub supported_backends: Vec<BackendType>,
+    #[serde(default)]
+    pub is_default_chat: bool,
+    #[serde(default)]
+    pub is_default_compressor: bool,
 }
 
 // Expose the registry so the web server can send it to the UI
@@ -89,9 +95,12 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             n_head_kv: 8,
             arch: ModelArch::Llama,
             compression_dtype: None,
+            kv_cache_dtype: ModelDType::F16,
             parameters_billions: 8.0,
             size_on_disk_gb: 4.58,
             supported_backends: vec![BackendType::Candle, BackendType::LlamaCpp],
+            is_default_chat: false,
+            is_default_compressor: false,
         },
         ModelConfig { 
             id: "qwen-2.5-7b".to_string(), 
@@ -109,9 +118,12 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             n_head_kv: 4,
             arch: ModelArch::Qwen2,
             compression_dtype: None,
+            kv_cache_dtype: ModelDType::F16,
             parameters_billions: 7.61,
             size_on_disk_gb: 4.36,
             supported_backends: vec![BackendType::Candle, BackendType::LlamaCpp],
+            is_default_chat: true,
+            is_default_compressor: false,
         },
         ModelConfig { 
             id: "qwen-2.5-14b".to_string(), 
@@ -127,9 +139,12 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             n_head_kv: 8,
             arch: ModelArch::Qwen2,
             compression_dtype: None,
+            kv_cache_dtype: ModelDType::F16,
             parameters_billions: 14.0,
             size_on_disk_gb: 8.37,
             supported_backends: vec![BackendType::Candle, BackendType::LlamaCpp],
+            is_default_chat: false,
+            is_default_compressor: false,
         },
         ModelConfig { 
             id: "qwen-coder-14b".to_string(), 
@@ -145,9 +160,12 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             roles: vec![ModelRole::CodeSpecialist],
             arch: ModelArch::Qwen2,
             compression_dtype: None,
+            kv_cache_dtype: ModelDType::F16,
             parameters_billions: 14.0,
             size_on_disk_gb: 8.37,
             supported_backends: vec![BackendType::Candle, BackendType::LlamaCpp],
+            is_default_chat: false,
+            is_default_compressor: false,
         },
         ModelConfig { 
             id: "strand-rust-14b".to_string(), 
@@ -163,9 +181,12 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             roles: vec![ModelRole::CodeSpecialist],
             arch: ModelArch::Qwen2,
             compression_dtype: None,
+            kv_cache_dtype: ModelDType::F16,
             parameters_billions: 14.0,
             size_on_disk_gb: 8.37,
             supported_backends: vec![BackendType::Candle, BackendType::LlamaCpp],
+            is_default_chat: false,
+            is_default_compressor: false,
         },
         ModelConfig { 
             id: "llmlingua-2-f16".to_string(), 
@@ -180,10 +201,13 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             n_head_kv: 0,
             roles: vec![ModelRole::ContextCompressor],
             arch: ModelArch::XLMRoberta,
-            compression_dtype: Some(CompressionDType::F16),
+            compression_dtype: Some(ModelDType::F16),
+            kv_cache_dtype: ModelDType::F16,
             parameters_billions: 0.56,
             size_on_disk_gb: 2.08,
             supported_backends: vec![BackendType::Candle],
+            is_default_chat: false,
+            is_default_compressor: false,
         },
         ModelConfig { 
             id: "llmlingua-2-f32".to_string(), 
@@ -198,10 +222,13 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             n_head_kv: 0,
             roles: vec![ModelRole::ContextCompressor],
             arch: ModelArch::XLMRoberta,
-            compression_dtype: Some(CompressionDType::F32),
+            compression_dtype: Some(ModelDType::F32),
+            kv_cache_dtype: ModelDType::F32,
             parameters_billions: 0.56,
             size_on_disk_gb: 2.08,
             supported_backends: vec![BackendType::Candle],
+            is_default_chat: false,
+            is_default_compressor: false,
         },
         ModelConfig { 
             id: "qwen-compressor".to_string(), 
@@ -217,9 +244,12 @@ pub fn get_model_registry() -> Vec<ModelConfig> {
             roles: vec![ModelRole::ContextCompressor],
             arch: ModelArch::Qwen2,
             compression_dtype: None,
+            kv_cache_dtype: ModelDType::F16,
             parameters_billions: 1.54,
             size_on_disk_gb: 1.04,
             supported_backends: vec![BackendType::Candle, BackendType::LlamaCpp],
+            is_default_chat: false,
+            is_default_compressor: true,
         },
     ]
 }
