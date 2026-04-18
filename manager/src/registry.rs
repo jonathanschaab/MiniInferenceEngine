@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::types::Message;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum CompressionDType {
@@ -11,6 +12,31 @@ pub enum ModelArch {
     Llama,
     Qwen2,
     XLMRoberta,
+}
+
+pub trait PromptFormatter {
+    fn format_chat(&self, messages: &[Message]) -> String;
+}
+
+impl PromptFormatter for ModelArch {
+    fn format_chat(&self, messages: &[Message]) -> String {
+        let mut prompt = String::new();
+        match self {
+            ModelArch::Qwen2 => {
+                for msg in messages { prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content)); }
+                prompt.push_str("<|im_start|>assistant\n");
+            },
+            ModelArch::Llama => {
+                for msg in messages { prompt.push_str(&format!("<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>", msg.role, msg.content)); }
+                prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            },
+            _ => {
+                for msg in messages { prompt.push_str(&format!("{}: {}\n", msg.role, msg.content)); }
+                prompt.push_str("assistant: ");
+            }
+        }
+        prompt
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]

@@ -457,6 +457,36 @@ async fn serve_memory_ui(session: tower_sessions::Session) -> Result<Html<&'stat
     Ok(Html(include_str!("../memory.html")))
 }
 
+async fn serve_chat_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
+    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
+    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../chat.js")))
+}
+
+async fn serve_stats_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
+    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
+    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../stats.js")))
+}
+
+async fn serve_settings_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
+    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
+    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../settings.js")))
+}
+
+async fn serve_memory_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
+    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
+    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../memory.js")))
+}
+
+async fn serve_common_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
+    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
+    Ok(([(header::CONTENT_TYPE, "application/javascript")], include_str!("../common.js")))
+}
+
+async fn serve_common_css(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
+    if require_session(session).await.is_err() { return Err(Redirect::to("/auth/login")); }
+    Ok(([(header::CONTENT_TYPE, "text/css")], include_str!("../common.css")))
+}
+
 // Route: Serve the Telemetry JSON
 async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetryStore> {
     let current_data = state.telemetry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
@@ -569,6 +599,12 @@ async fn main() {
         .route("/settings", get(serve_settings_ui)) 
         .route("/stats", get(serve_stats_ui))
         .route("/memory", get(serve_memory_ui))
+        .route("/js/chat.js", get(serve_chat_js))
+        .route("/js/stats.js", get(serve_stats_js))
+        .route("/js/settings.js", get(serve_settings_js))
+        .route("/js/memory.js", get(serve_memory_js))
+        .route("/js/common.js", get(serve_common_js))
+        .route("/css/common.css", get(serve_common_css))
         // Settings APIs (They check session manually)
         .route("/api/settings/keys", get(auth::list_keys_handler).post(auth::create_key_handler))
         .route("/api/settings/keys/:hash", delete(auth::delete_key_handler));

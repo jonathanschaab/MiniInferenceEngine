@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use crate::types::EngineStatus;
 use crate::registry::ModelConfig;
 use crate::types::GenerationParameters;
+use crate::types::MemoryStrategy;
 use crate::backend::InferenceBackend;
 
 self_cell! {
@@ -30,7 +31,7 @@ enum EngineCommand {
     LoadModel {
         config: ModelConfig,
         status: Arc<Mutex<EngineStatus>>,
-        strategy: String,
+        strategy: MemoryStrategy,
         required_ctx: usize,
         reply: tokio::sync::oneshot::Sender<Result<(usize, f32), String>>,
     },
@@ -67,6 +68,99 @@ fn process_utf8_buffer(byte_buffer: &mut Vec<u8>) -> String {
         }
     }
     result
+}
+
+fn run_generation<F>(
+    inst: &mut LlamaInstance,
+    prompt: &str,
+    params: &GenerationParameters,
+    mut on_tokenization_time: impl FnMut(u128),
+    mut on_token: F,
+) -> Result<(String, u128), String>
+where
+    F: FnMut(String) -> Result<(), ()>,
+{
+    let tok_start = std::time::Instant::now();
+    let tokens_list = inst.with_dependent_mut(|model, _| {
+        model.str_to_token(prompt, AddBos::Always)
+    }).map_err(|e| e.to_string())?;
+    
+    let tok_time = tok_start.elapsed().as_millis();
+    on_tokenization_time(tok_time);
+    
+    inst.with_dependent_mut(|_, ctx| ctx.clear_kv_cache());
+
+    let n_batch = inst.with_dependent_mut(|_, ctx| ctx.n_batch() as usize);
+    let mut current_pos = 0;
+    let last_index_of_prompt = tokens_list.len().saturating_sub(1);
+    let mut logit_index = 0;
+    
+    for chunk in tokens_list.chunks(n_batch) {
+        let mut batch = LlamaBatch::new(chunk.len(), 1);
+        for (i, &token) in chunk.iter().enumerate() {
+            let pos = current_pos + i;
+            let is_last = pos == last_index_of_prompt;
+            if is_last { logit_index = i as i32; }
+            batch.add(token, pos as i32, &[0], is_last).map_err(|e| e.to_string())?;
+        }
+        inst.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)).map_err(|e| e.to_string())?;
+        current_pos += chunk.len();
+    }
+    
+    let mut output = String::new();
+    let mut byte_buffer = Vec::new();
+    let mut n_cur = tokens_list.len() as i32;
+    let max_new_tokens = params.max_tokens.unwrap_or(500) as i32;
+    let mut generated_tokens = 0;
+    
+    let mut samplers = Vec::new();
+    if let Some(k) = params.top_k { samplers.push(LlamaSampler::top_k(k as i32)); }
+    if let Some(p) = params.top_p { samplers.push(LlamaSampler::top_p(p, 1)); }
+    if let Some(t) = params.temperature { samplers.push(LlamaSampler::temp(t)); }
+    samplers.push(LlamaSampler::dist(params.seed.unwrap_or(42) as u32));
+    let mut sampler = LlamaSampler::chain_simple(samplers);
+    
+    while generated_tokens < max_new_tokens {
+        let (new_token_id, is_eog, new_bytes) = inst.with_dependent_mut(|model, ctx| {
+            let new_token_id = sampler.sample(ctx, logit_index);
+            sampler.accept(new_token_id);
+            
+            let is_eog = model.is_eog_token(new_token_id);
+            
+            let new_bytes = if !is_eog {
+                model.token_to_piece_bytes(new_token_id, 256, false, None).unwrap_or_default()
+            } else { Vec::new() };
+            
+            (new_token_id, is_eog, new_bytes)
+        });
+
+        if is_eog { break; }
+        
+        byte_buffer.extend_from_slice(&new_bytes);
+        let decoded = process_utf8_buffer(&mut byte_buffer);
+        if !decoded.is_empty() {
+            output.push_str(&decoded);
+            if on_token(decoded).is_err() {
+                break;
+            }
+        }
+        
+        let mut batch = LlamaBatch::new(1, 1);
+        batch.add(new_token_id, n_cur, &[0], true).map_err(|e| e.to_string())?;
+        inst.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)).map_err(|e| e.to_string())?;
+        
+        logit_index = 0;
+        n_cur += 1;
+        generated_tokens += 1;
+    }
+    
+    if !byte_buffer.is_empty() {
+        let remaining = String::from_utf8_lossy(&byte_buffer).into_owned();
+        output.push_str(&remaining);
+        let _ = on_token(remaining);
+    }
+    
+    Ok((output, tok_time))
 }
 
 pub struct LlamaCppEngine {
@@ -125,7 +219,7 @@ impl LlamaCppEngine {
                             let mut n_gpu_layers = config.num_layers as u32;
                             let weights_vram_cost_est = (config.size_on_disk_gb * 1024.0 * 1024.0 * 1024.0) as u64;
 
-                            if strategy == "compress" {
+                            if strategy == MemoryStrategy::Compress {
                                 if weights_vram_cost_est + compute_margin > available_vram {
                                     let vram_for_weights = available_vram.saturating_sub(compute_margin);
                                     let vram_per_layer = weights_vram_cost_est / config.num_layers.max(1) as u64;
@@ -169,7 +263,7 @@ impl LlamaCppEngine {
                                 s.update_nvml(vram_total, vram_used_after, vram_free_after);
                             }
 
-                            if strategy == "compress" {
+                            if strategy == MemoryStrategy::Compress {
                                 let safe_vram_for_kv = vram_free_after.saturating_sub(compute_margin);
                                 let dynamic_max_ctx = if vram_free_after > compute_margin {
                                     (safe_vram_for_kv as usize / bytes_per_token).min(config.max_context_len)
@@ -215,176 +309,32 @@ impl LlamaCppEngine {
                     }
                     EngineCommand::GenerateStream { prompt, params, tx } => {
                         (|| {
-                            let tok_start = std::time::Instant::now();
                             let inst = match instance.as_mut() {
                                 Some(i) => i,
                                 None => { let _ = tx.send(crate::types::StreamEvent::Error("Model not loaded".into())); return; }
                             };
-                            let tokens_list = match inst.with_dependent_mut(|model, _| model.str_to_token(&prompt, AddBos::Always)) {
-                                Ok(t) => t,
-                                Err(e) => { let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); return; }
-                            };
-                            
-                            let tok_time = tok_start.elapsed().as_millis();
-                            let _ = tx.send(crate::types::StreamEvent::TokenizationTime(tok_time));
-                            
-                            inst.with_dependent_mut(|_, ctx| ctx.clear_kv_cache());
-
-                            let n_batch = inst.with_dependent_mut(|_, ctx| ctx.n_batch() as usize);
-                            let mut current_pos = 0;
-                            let last_index_of_prompt = tokens_list.len().saturating_sub(1);
-                            let mut logit_index = 0;
-                            
-                            let mut error = false;
-                            for chunk in tokens_list.chunks(n_batch) {
-                                let mut batch = LlamaBatch::new(chunk.len(), 1);
-                                for (i, &token) in chunk.iter().enumerate() {
-                                    let pos = current_pos + i;
-                                    let is_last = pos == last_index_of_prompt;
-                                    if is_last { logit_index = i as i32; }
-                                    if let Err(e) = batch.add(token, pos as i32, &[0], is_last) { 
-                                        let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); error = true; break; 
-                                    }
-                                }
-                                if error { break; }
-                                if let Err(e) = inst.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)) { 
-                                    let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); error = true; break; 
-                                }
-                                current_pos += chunk.len();
+                            match run_generation(
+                                inst,
+                                &prompt,
+                                &params,
+                                |tok_time| { let _ = tx.send(crate::types::StreamEvent::TokenizationTime(tok_time)); },
+                                |token| { tx.send(crate::types::StreamEvent::Token(token)).map_err(|_| ()) }
+                            ) {
+                                Ok(_) => { let _ = tx.send(crate::types::StreamEvent::Done); },
+                                Err(e) => { let _ = tx.send(crate::types::StreamEvent::Error(e)); }
                             }
-                            if error { return; }
-
-                            let mut n_cur = tokens_list.len() as i32;
-                            let max_new_tokens = params.max_tokens.unwrap_or(500) as i32;
-                            let mut generated_tokens = 0;
-                            
-                            let mut samplers = Vec::new();
-                            if let Some(k) = params.top_k { samplers.push(LlamaSampler::top_k(k as i32)); }
-                            if let Some(p) = params.top_p { samplers.push(LlamaSampler::top_p(p, 1)); }
-                            if let Some(t) = params.temperature { samplers.push(LlamaSampler::temp(t)); }
-                            samplers.push(LlamaSampler::dist(params.seed.unwrap_or(42) as u32));
-                            let mut sampler = LlamaSampler::chain_simple(samplers);
-                            
-                            let mut byte_buffer = Vec::new();
-                            
-                            while generated_tokens < max_new_tokens {
-                                let (new_token_id, is_eog, new_bytes) = inst.with_dependent_mut(|model, ctx| {
-                                    let new_token_id = sampler.sample(ctx, logit_index);
-                                    sampler.accept(new_token_id);
-                                    
-                                    let is_eog = model.is_eog_token(new_token_id);
-                                    
-                                    let new_bytes = if !is_eog {
-                                        model.token_to_piece_bytes(new_token_id, 256, false, None).unwrap_or_default()
-                                    } else { Vec::new() };
-                                    
-                                    (new_token_id, is_eog, new_bytes)
-                                });
-
-                                if is_eog { break; }
-                                
-                                byte_buffer.extend_from_slice(&new_bytes);
-                                let decoded = process_utf8_buffer(&mut byte_buffer);
-                                if !decoded.is_empty() && tx.send(crate::types::StreamEvent::Token(decoded)).is_err() {
-                                    break;
-                                }
-                                
-                                let mut batch = LlamaBatch::new(1, 1);
-                                if let Err(e) = batch.add(new_token_id, n_cur, &[0], true) { 
-                                    let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); break; 
-                                }
-                                if let Err(e) = inst.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)) { 
-                                    let _ = tx.send(crate::types::StreamEvent::Error(e.to_string())); break; 
-                                }
-                                
-                                logit_index = 0;
-                                n_cur += 1;
-                                generated_tokens += 1;
-                            }
-                            
-                            if !byte_buffer.is_empty() {
-                                let _ = tx.send(crate::types::StreamEvent::Token(String::from_utf8_lossy(&byte_buffer).into_owned()));
-                            }
-                            let _ = tx.send(crate::types::StreamEvent::Done);
                         })();
                     }
                     EngineCommand::GenerateText { prompt, params, reply } => {
                         let res = (|| -> Result<(String, u128), String> {
-                            let tok_start = std::time::Instant::now();
                             let inst = instance.as_mut().ok_or("Model not loaded")?;
-                            let tokens_list = inst.with_dependent_mut(|model, _| {
-                                model.str_to_token(&prompt, AddBos::Always)
-                            }).map_err(|e| e.to_string())?;
-
-                            let tok_time = tok_start.elapsed().as_millis();
-                            
-                            inst.with_dependent_mut(|_, ctx| ctx.clear_kv_cache());
-
-                            let n_batch = inst.with_dependent_mut(|_, ctx| ctx.n_batch() as usize);
-                            let mut current_pos = 0;
-                            let last_index_of_prompt = tokens_list.len().saturating_sub(1);
-                            let mut logit_index = 0;
-                            
-                            for chunk in tokens_list.chunks(n_batch) {
-                                let mut batch = LlamaBatch::new(chunk.len(), 1);
-                                for (i, &token) in chunk.iter().enumerate() {
-                                    let pos = current_pos + i;
-                                    let is_last = pos == last_index_of_prompt;
-                                    if is_last { logit_index = i as i32; }
-                                    batch.add(token, pos as i32, &[0], is_last).map_err(|e| e.to_string())?;
-                                }
-                                inst.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)).map_err(|e| e.to_string())?;
-                                current_pos += chunk.len();
-                            }
-                            
-                            let mut output = String::new();
-                            let mut byte_buffer = Vec::new();
-                            let mut n_cur = tokens_list.len() as i32;
-                            let max_new_tokens = params.max_tokens.unwrap_or(500) as i32;
-                            let mut generated_tokens = 0;
-                            
-                            let mut samplers = Vec::new();
-                            if let Some(k) = params.top_k { samplers.push(LlamaSampler::top_k(k as i32)); }
-                            if let Some(p) = params.top_p { samplers.push(LlamaSampler::top_p(p, 1)); }
-                            if let Some(t) = params.temperature { samplers.push(LlamaSampler::temp(t)); }
-                            samplers.push(LlamaSampler::dist(params.seed.unwrap_or(42) as u32));
-                            let mut sampler = LlamaSampler::chain_simple(samplers);
-                            
-                            while generated_tokens < max_new_tokens {
-                                let (new_token_id, is_eog, new_bytes) = inst.with_dependent_mut(|model, ctx| {
-                                    let new_token_id = sampler.sample(ctx, logit_index);
-                                    sampler.accept(new_token_id);
-                                    
-                                    let is_eog = model.is_eog_token(new_token_id);
-                                    
-                                    let new_bytes = if !is_eog {
-                                        model.token_to_piece_bytes(new_token_id, 256, false, None).unwrap_or_default()
-                                    } else { Vec::new() };
-                                    
-                                    (new_token_id, is_eog, new_bytes)
-                                });
-                                
-                                if is_eog { break; }
-                                
-                                byte_buffer.extend_from_slice(&new_bytes);
-                                let decoded = process_utf8_buffer(&mut byte_buffer);
-                                if !decoded.is_empty() {
-                                    output.push_str(&decoded);
-                                }
-                                
-                                let mut batch = LlamaBatch::new(1, 1);
-                                batch.add(new_token_id, n_cur, &[0], true).map_err(|e| e.to_string())?;
-                                inst.with_dependent_mut(|_, ctx| ctx.decode(&mut batch)).map_err(|e| e.to_string())?;
-                                
-                                logit_index = 0;
-                                n_cur += 1;
-                                generated_tokens += 1;
-                            }
-                            
-                            if !byte_buffer.is_empty() {
-                                output.push_str(&String::from_utf8_lossy(&byte_buffer));
-                            }
-                            Ok((output, tok_time))
+                            run_generation(
+                                inst,
+                                &prompt,
+                                &params,
+                                |_| {},
+                                |_| Ok(()),
+                            )
                         })();
                         let _ = reply.send(res);
                     }
@@ -409,12 +359,12 @@ impl LlamaCppEngine {
 
 #[async_trait]
 impl InferenceBackend for LlamaCppEngine {
-    async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, strategy: &str, required_ctx: usize) -> Result<usize, String> {
+    async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, strategy: &MemoryStrategy, required_ctx: usize) -> Result<usize, String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_tx.send(EngineCommand::LoadModel {
             config: config.clone(),
             status,
-            strategy: strategy.to_string(),
+            strategy: strategy.clone(),
             required_ctx,
             reply: tx,
         }).map_err(|_| "Engine thread died".to_string())?;

@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use crate::types::EngineStatus;
 use crate::registry::ModelConfig;
 use crate::types::GenerationParameters;
+use crate::types::MemoryStrategy;
 
 #[async_trait]
 pub trait InferenceBackend: Send + Sync {
     /// Load a model into the backend hardware/memory.
-    async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, strategy: &str, required_ctx: usize) -> Result<usize, String>;
+    async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, strategy: &MemoryStrategy, required_ctx: usize) -> Result<usize, String>;
     
     /// Generate text using the loaded generative model.
     async fn generate_text(&mut self, prompt: &str, params: &GenerationParameters) -> Result<(String, u128), String>;

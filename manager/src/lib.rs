@@ -40,7 +40,7 @@ pub enum ActiveBackend {
 }
 
 impl ActiveBackend {
-    pub async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, strategy: &str, required_ctx: usize) -> Result<usize, String> {
+    pub async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, strategy: &MemoryStrategy, required_ctx: usize) -> Result<usize, String> {
         match self {
             #[cfg(feature = "backend-candle")] ActiveBackend::Candle(b) => b.load_model(config, status, strategy, required_ctx).await,
             #[cfg(feature = "backend-llamacpp")] ActiveBackend::LlamaCpp(b) => b.load_model(config, status, strategy, required_ctx).await,
@@ -101,26 +101,6 @@ pub fn create_backend(btype: &BackendType) -> Result<ActiveBackend, String> {
     }
 }
 
-// Helper: Formats the array into a generic string format
-fn format_chat(messages: &[Message], arch: &ModelArch) -> String {
-    let mut prompt = String::new();
-    match arch {
-        ModelArch::Qwen2 => {
-            for msg in messages { prompt.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", msg.role, msg.content)); }
-            prompt.push_str("<|im_start|>assistant\n");
-        },
-        ModelArch::Llama => {
-            for msg in messages { prompt.push_str(&format!("<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>", msg.role, msg.content)); }
-            prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-        },
-        _ => {
-            for msg in messages { prompt.push_str(&format!("{}: {}\n", msg.role, msg.content)); }
-            prompt.push_str("assistant: ");
-        }
-    }
-    prompt
-}
-
 pub async fn run_batcher_loop(
     mut receiver: mpsc::Receiver<UserRequest>, 
     status: Arc<Mutex<EngineStatus>>,
@@ -133,7 +113,7 @@ pub async fn run_batcher_loop(
     let mut active_backend_name = String::new();
     let mut active_max_context: usize = 2048; 
     let mut active_model_config: Option<ModelConfig> = None;
-    let mut active_memory_strategy = String::new();
+    let mut active_memory_strategy = MemoryStrategy::Offload;
 
     let mut tokenizer_cache: std::collections::HashMap<String, Tokenizer> = std::collections::HashMap::new();
 
@@ -185,14 +165,14 @@ pub async fn run_batcher_loop(
             }
         };
 
-        let formatted_prompt_pre = format_chat(&request.messages, &config_for_prompt.arch);
+        let formatted_prompt_pre = config_for_prompt.arch.format_chat(&request.messages);
         let token_count_pre = tokenizer.encode(formatted_prompt_pre.clone(), true)
             .map(|enc| enc.get_ids().len())
             .unwrap_or_else(|_| formatted_prompt_pre.len() / 4);
         let actual_required_ctx = (token_count_pre + requested_max_tokens).max(2048);
         let target_allocated_ctx = actual_required_ctx + ctx_buffer;
 
-        let req_strategy = request.parameters.memory_strategy.clone().unwrap_or_else(|| "offload".to_string());
+        let req_strategy = request.parameters.memory_strategy.clone().unwrap_or(MemoryStrategy::Offload);
 
         let req_b = request.target_backend.as_deref().map(|s| s.to_lowercase());
         let target_btype_opt = match req_b.as_deref() {
@@ -224,7 +204,7 @@ pub async fn run_batcher_loop(
             || active_memory_strategy != req_strategy 
             || active_backend_name != target_backend_name;
         
-        if !needs_reload && actual_required_ctx > active_max_context && req_strategy == "offload" {
+        if !needs_reload && actual_required_ctx > active_max_context && req_strategy == MemoryStrategy::Offload {
             println!("🔄 Expanding KV Cache from {} to {} tokens...", active_max_context, target_allocated_ctx);
             needs_reload = true;
         }
@@ -268,7 +248,7 @@ pub async fn run_batcher_loop(
             };
 
             let load_start = Instant::now();
-            active_memory_strategy = req_strategy;
+            active_memory_strategy = req_strategy.clone();
 
             let actual_context = match backend.load_model(&config, status.clone(), &active_memory_strategy, target_allocated_ctx).await {
                 Ok(ctx) => ctx,
@@ -311,7 +291,13 @@ pub async fn run_batcher_loop(
             }
         };
 
-        let mut formatted_prompt = format_chat(&request.messages, &config.arch);
+        // Mark the chat model as active now that we are officially processing the prompt
+        {
+            let mut current_status = lock_status(&status);
+            current_status.set_model_status(&active_model_id, "Active");
+        }
+
+        let mut formatted_prompt = config.arch.format_chat(&request.messages);
         
         // Exact token count using the actual Hugging Face tokenizer
         let mut token_count = tokenizer.encode(formatted_prompt.clone(), true)
@@ -439,7 +425,7 @@ pub async fn run_batcher_loop(
             let comp_required_ctx = (token_count + requested_max_tokens).max(2048) + ctx_buffer;
             // --- RECORD COMPRESSOR LOAD TIME ---
             let comp_load_start = Instant::now();
-            if let Err(e) = comp_backend.load_model(&comp_config, status.clone(), "offload", comp_required_ctx).await {
+            if let Err(e) = comp_backend.load_model(&comp_config, status.clone(), &MemoryStrategy::Offload, comp_required_ctx).await {
                 {
                     let mut s = lock_status(&status);
                     s.log_vram("Fail", "Orchestrator", &format!("Failed to allocate VRAM for {}", comp_config.id), 0);
@@ -478,7 +464,7 @@ pub async fn run_batcher_loop(
                     role: "user".to_string(),
                     content: format!("Summarize this text to be shorter:\n{}", formatted_prompt),
                 }];
-                let compression_prompt = format_chat(&compression_messages, &comp_config.arch);
+                let compression_prompt = comp_config.arch.format_chat(&compression_messages);
                 let params = GenerationParameters {
                     max_tokens: Some(target_budget),
                     ..Default::default()
@@ -529,7 +515,7 @@ pub async fn run_batcher_loop(
                 new_messages.push(Message { role: "user".to_string(), content: format!("Review this compressed context:\n{}", summary.trim()) });
             }
             
-            formatted_prompt = format_chat(&new_messages, &config.arch);
+            formatted_prompt = config.arch.format_chat(&new_messages);
             token_count = tokenizer.encode(formatted_prompt.clone(), true)
                 .map(|enc| enc.get_ids().len())
                 .unwrap_or_else(|_| formatted_prompt.len() / 4); // Update exact count for the compressed prompt
@@ -562,6 +548,12 @@ pub async fn run_batcher_loop(
         let offload_pct = active_backend.as_ref().unwrap().get_offload_pct();
         if let Ok(mut t) = telemetry.lock() {
             t.record_generation(active_model_id.clone(), active_backend_name.clone(), request.parameters.clone(), offload_pct, formatted_prompt.len(), token_count, tokenization_time_ms, elapsed);
+        }
+
+        // Mark the model as Idle now that generation is complete
+        {
+            let mut current_status = lock_status(&status);
+            current_status.set_model_status(&active_model_id, "Idle");
         }
     } // Closes the 'main while loop
 } // Closes the run_batcher_loop function

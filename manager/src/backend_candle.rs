@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use crate::types::EngineStatus;
 use crate::registry::{ModelConfig, ModelArch, CompressionDType, get_model_registry};
 use crate::types::GenerationParameters;
+use crate::types::MemoryStrategy;
 use crate::backend::InferenceBackend;
 
 pub struct ExtractiveCompressor {
@@ -101,10 +102,22 @@ pub fn load_engine(model_id: &str, device: &Device) -> Result<(DynamicModel, Tok
     Ok((model, tokenizer, Some(file)))
 }
 
-pub async fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, params: &GenerationParameters) -> Result<(String, u128), String> {
+async fn run_generation_candle<F>(
+    prompt: &str,
+    model: &mut DynamicModel,
+    tokenizer: &Tokenizer,
+    device: &Device,
+    params: &GenerationParameters,
+    mut on_tokenization_time: impl FnMut(u128),
+    mut on_token: F,
+) -> Result<(String, u128), String>
+where
+    F: FnMut(String) -> Result<(), ()>,
+{
     let tok_start = std::time::Instant::now();
     let mut tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
     let tok_time = tok_start.elapsed().as_millis();
+    on_tokenization_time(tok_time);
     
     let eos_strings = ["</s>", "<|endoftext|>", "<|im_end|>", "<|end_of_text|>", "<|eot_id|>"];
     let eos_tokens: Vec<u32> = eos_strings.iter().filter_map(|s| tokenizer.token_to_id(s)).collect();
@@ -136,6 +149,8 @@ pub async fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &T
 
     println!("⚡ Generation started...");
 
+    let mut prev_index = prompt_length;
+
     for index in 0..params.max_tokens.unwrap_or(500) {
         let context_size = if index == 0 { tokens.len() - current_pos } else { 1 };
         let start_pos = tokens.len().saturating_sub(context_size);
@@ -152,56 +167,12 @@ pub async fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &T
         
         tokens.push(next_token);
         if eos_tokens.contains(&next_token) { break; }
-        tokio::task::yield_now().await;
-    }
-    
-    Ok((tokenizer.decode(&tokens[prompt_length..], true).map_err(|e| e.to_string())?, tok_time))
-}
-
-pub async fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, params: &GenerationParameters, tx: tokio::sync::mpsc::UnboundedSender<crate::types::StreamEvent>) -> Result<(), String> {
-    let tok_start = std::time::Instant::now();
-    let mut tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
-    let tok_time = tok_start.elapsed().as_millis();
-    let _ = tx.send(crate::types::StreamEvent::TokenizationTime(tok_time));
-    
-    let eos_strings = ["</s>", "<|endoftext|>", "<|im_end|>", "<|end_of_text|>", "<|eot_id|>"];
-    let eos_tokens: Vec<u32> = eos_strings.iter().filter_map(|s| tokenizer.token_to_id(s)).collect();
-
-    let prompt_length = tokens.len();
-    let mut logits_processor = LogitsProcessor::new(
-        params.seed.unwrap_or(299792458),
-        params.temperature.map(|t| t as f64),
-        params.top_p.map(|p| p as f64),
-    );
-    let prefill_chunk_size = 256; 
-    let mut current_pos = 0;
-
-    if tokens.len() > 1 {
-        for chunk in tokens[..tokens.len() - 1].chunks(prefill_chunk_size) {
-            let input_tensor = Tensor::new(chunk, device).map_err(|e| e.to_string())?.unsqueeze(0).map_err(|e| e.to_string())?.contiguous().map_err(|e| e.to_string())?;
-            let _ = model.forward(&input_tensor, current_pos).map_err(|e| e.to_string())?;
-            current_pos += chunk.len();
-            tokio::task::yield_now().await;
-        }
-    }
-
-    let mut prev_index = prompt_length;
-    for index in 0..params.max_tokens.unwrap_or(500) {
-        let context_size = if index == 0 { tokens.len() - current_pos } else { 1 };
-        let start_pos = tokens.len().saturating_sub(context_size);
-        let input_tensor = Tensor::new(&tokens[start_pos..], device).map_err(|e| e.to_string())?.unsqueeze(0).map_err(|e| e.to_string())?.contiguous().map_err(|e| e.to_string())?;
-        let logits = model.forward(&input_tensor, start_pos).map_err(|e| e.to_string())?;
-        drop(input_tensor);
-        let next_token_logits = logits.squeeze(0).map_err(|e| e.to_string())?;
-        let next_token = logits_processor.sample(&next_token_logits).map_err(|e| e.to_string())?;
-        tokens.push(next_token);
-        if eos_tokens.contains(&next_token) { break; }
         
         let text = tokenizer.decode(&tokens[prev_index..], true).unwrap_or_default();
         // '\u{FFFD}' indicates an incomplete UTF-8 byte sequence across tokens.
         // Wait for the next token to complete the character before flushing.
         if !text.is_empty() && !text.ends_with('\u{FFFD}') {
-            if tx.send(crate::types::StreamEvent::Token(text)).is_err() { break; }
+            if on_token(text).is_err() { break; }
             prev_index = tokens.len();
         }
         tokio::task::yield_now().await;
@@ -211,10 +182,28 @@ pub async fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokeni
     if prev_index < tokens.len() {
         let text = tokenizer.decode(&tokens[prev_index..], true).unwrap_or_default();
         if !text.is_empty() {
-            let _ = tx.send(crate::types::StreamEvent::Token(text));
+            let _ = on_token(text);
         }
     }
 
+    let final_text = tokenizer.decode(&tokens[prompt_length..], true).map_err(|e| e.to_string())?;
+    Ok((final_text, tok_time))
+}
+
+pub async fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, params: &GenerationParameters) -> Result<(String, u128), String> {
+    run_generation_candle(prompt, model, tokenizer, device, params, |_| {}, |_| Ok(())).await
+}
+
+pub async fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, params: &GenerationParameters, tx: tokio::sync::mpsc::UnboundedSender<crate::types::StreamEvent>) -> Result<(), String> {
+    run_generation_candle(
+        prompt,
+        model,
+        tokenizer,
+        device,
+        params,
+        |tok_time| { let _ = tx.send(crate::types::StreamEvent::TokenizationTime(tok_time)); },
+        |token| { tx.send(crate::types::StreamEvent::Token(token)).map_err(|_| ()) }
+    ).await?;
     let _ = tx.send(crate::types::StreamEvent::Done);
     Ok(())
 }
@@ -302,7 +291,7 @@ impl CandleEngine {
 
 #[async_trait]
 impl InferenceBackend for CandleEngine {
-    async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, _strategy: &str, _required_ctx: usize) -> Result<usize, String> {
+    async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, _strategy: &MemoryStrategy, _required_ctx: usize) -> Result<usize, String> {
         let (used_before, total, _) = crate::get_vram_info(self.nvml.as_ref(), 0).unwrap_or((0,0,0));
         
         {

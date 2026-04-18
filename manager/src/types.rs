@@ -147,6 +147,13 @@ pub struct Message {
     pub content: String,
 }
 
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryStrategy {
+    Offload,
+    Compress,
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct GenerationParameters {
     pub temperature: Option<f32>,
@@ -154,7 +161,7 @@ pub struct GenerationParameters {
     pub top_k: Option<usize>,
     pub max_tokens: Option<usize>,
     pub seed: Option<u64>,
-    pub memory_strategy: Option<String>,
+    pub memory_strategy: Option<MemoryStrategy>,
     pub context_buffer: Option<usize>,
 }
 
@@ -166,7 +173,7 @@ impl Default for GenerationParameters {
             top_k: Some(40),
             max_tokens: Some(500),
             seed: None,
-            memory_strategy: Some("offload".to_string()),
+            memory_strategy: Some(MemoryStrategy::Offload),
             context_buffer: Some(1024),
         }
     }
@@ -186,11 +193,6 @@ pub struct BenchmarkRequest {
     pub models: Vec<String>,
     pub parameters: Option<GenerationParameters>,
     pub target_backends: Vec<String>,
-}
-
-#[derive(Serialize)]
-pub struct ApiResponse {
-    pub answer: String,
 }
 
 #[derive(Debug)]
