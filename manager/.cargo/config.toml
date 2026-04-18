@@ -1,5 +1,19 @@
-[build]
+#[build]
+#rustflags = ["-C", "target-feature=+crt-static"]
+
+#[env]
+#CMAKE_TOOLCHAIN_FILE = { value = "static_crt.cmake", relative = true }
+
+# Apply static linking when compiling for the Linux CI target
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Apply static linking when compiling locally for Windows
+[target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [env]
-CMAKE_TOOLCHAIN_FILE = { value = "../static_crt.cmake", relative = true }
+# cmake-rs will automatically pick up these target-specific environment variables
+# while ignoring them when compiling host-level dependencies.
+CMAKE_TOOLCHAIN_FILE_x86_64_unknown_linux_gnu = { value = "static_crt.cmake", relative = true }
+CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_msvc = { value = "static_crt.cmake", relative = true }

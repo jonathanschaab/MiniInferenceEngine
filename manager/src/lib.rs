@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nvml_wrapper::Nvml;
+use hf_hub::api::sync::Api;
+use tokenizers::Tokenizer;
 
 pub mod telemetry;
 pub mod types;
@@ -91,7 +93,7 @@ impl ActiveBackend {
 pub fn create_backend(btype: &BackendType) -> Result<ActiveBackend, String> {
     match btype {
         #[cfg(feature = "backend-candle")]
-        BackendType::Candle => Ok(ActiveBackend::Candle(Box::new(CandleEngine::new()))),
+        BackendType::Candle => Ok(ActiveBackend::Candle(Box::default())),
         #[cfg(feature = "backend-llamacpp")]
         BackendType::LlamaCpp => Ok(ActiveBackend::LlamaCpp(Box::new(LlamaCppEngine::new()?))),
         #[allow(unreachable_patterns)]
@@ -132,6 +134,8 @@ pub async fn run_batcher_loop(
     let mut active_model_config: Option<ModelConfig> = None;
     let mut active_memory_strategy = String::new();
 
+    let mut tokenizer_cache: std::collections::HashMap<String, Tokenizer> = std::collections::HashMap::new();
+
     println!("⚙️  ORCHESTRATOR ONLINE: Waiting for requests...");
 
     'main: while let Some(request) = receiver.recv().await {
@@ -155,8 +159,35 @@ pub async fn run_batcher_loop(
                 continue 'main;
             }
         };
+
+        // Fetch the specific tokenizer to ensure perfect context memory math
+        let tokenizer = match tokenizer_cache.get(&config_for_prompt.tokenizer_repo) {
+            Some(tok) => tok.clone(),
+            None => {
+                let repo = config_for_prompt.tokenizer_repo.clone();
+                let tok_res = tokio::task::spawn_blocking(move || {
+                    let api = Api::new().map_err(|e| e.to_string())?;
+                    let path = api.model(repo).get("tokenizer.json").map_err(|e| e.to_string())?;
+                    Tokenizer::from_file(path).map_err(|e| e.to_string())
+                }).await;
+
+                match tok_res {
+                    Ok(Ok(tok)) => {
+                        tokenizer_cache.insert(config_for_prompt.tokenizer_repo.clone(), tok.clone());
+                        tok.clone()
+                    },
+                    _ => {
+                        let _ = request.responder.send(StreamEvent::Error("Server Error: Failed to load Tokenizer for exact counting.".to_string()));
+                        continue 'main;
+                    }
+                }
+            }
+        };
+
         let formatted_prompt_pre = format_chat(&request.messages, &config_for_prompt.arch);
-        let token_count_pre = formatted_prompt_pre.len() / 4;
+        let token_count_pre = tokenizer.encode(formatted_prompt_pre.clone(), true)
+            .map(|enc| enc.get_ids().len())
+            .unwrap_or_else(|_| formatted_prompt_pre.len() / 4);
         let actual_required_ctx = (token_count_pre + requested_max_tokens).max(2048);
         let target_allocated_ctx = actual_required_ctx + ctx_buffer;
 
@@ -256,8 +287,10 @@ pub async fn run_batcher_loop(
 
         let mut formatted_prompt = format_chat(&request.messages, &config.arch);
         
-        // Approximate token count natively without needing to couple a tokenizer to the orchestrator
-        let mut token_count = formatted_prompt.len() / 4; 
+        // Exact token count using the actual Hugging Face tokenizer
+        let mut token_count = tokenizer.encode(formatted_prompt.clone(), true)
+            .map(|enc| enc.get_ids().len())
+            .unwrap_or_else(|_| formatted_prompt.len() / 4);
 
         // --- THE DYNAMIC MEMORY MANAGER ---
         let mut trigger_compression = false;
@@ -284,8 +317,7 @@ pub async fn run_batcher_loop(
                 trigger_compression = true;
                 dynamic_target_budget = ((token_count as f32 * 0.50) as usize).max(256).min(active_max_context);
             }
-        } else {
-            if let Some((_, _, free_vram)) = vram_info {
+        } else if let Some((_, _, free_vram)) = vram_info {
                 // This rough heuristic is only for the Candle backend's dynamic memory check.
                 // Llama.cpp calculates this precisely during its static allocation.
                 let bytes_per_token = match &config.arch {
@@ -311,8 +343,8 @@ pub async fn run_batcher_loop(
                     trigger_compression = true;
                     dynamic_target_budget = ((token_count as f32 * 0.50) as usize).max(256).min(absolute_max_tokens);
                 }
-            } else {
-                // CPU fallback
+        } else {
+            // CPU fallback
                 if token_count + requested_max_tokens > active_max_context {
                     println!("⚠️ WARNING: Prompt + Max Tokens exceeds KV Cache! Triggering compression.");
                     trigger_compression = true;
@@ -325,7 +357,6 @@ pub async fn run_batcher_loop(
                     trigger_compression = true;
                     dynamic_target_budget = ((token_count as f32 * 0.50) as usize).max(256).min(active_max_context);
                 }
-            }
         }
 
         if trigger_compression {
@@ -400,8 +431,10 @@ pub async fn run_batcher_loop(
             } else {
                 // Abstractive fallback using generative backend
                 let compression_prompt = format!("<|user|>\nSummarize this text to be shorter:\n{}</s>\n<|assistant|>\n", formatted_prompt);
-                let mut params = GenerationParameters::default();
-                params.max_tokens = Some(target_budget);
+                let params = GenerationParameters {
+                    max_tokens: Some(target_budget),
+                    ..Default::default()
+                };
                 
                 match comp_backend.generate_text(&compression_prompt, &params).await {
                     Ok(text) => text,
@@ -451,7 +484,9 @@ pub async fn run_batcher_loop(
             }
             
             formatted_prompt = format_chat(&new_messages, &config.arch);
-            token_count = formatted_prompt.len() / 4; // Update token count for the compressed prompt
+            token_count = tokenizer.encode(formatted_prompt.clone(), true)
+                .map(|enc| enc.get_ids().len())
+                .unwrap_or_else(|_| formatted_prompt.len() / 4); // Update exact count for the compressed prompt
         }
 
         println!("📥 Processing prompt...");

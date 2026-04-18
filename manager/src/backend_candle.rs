@@ -101,13 +101,20 @@ pub fn load_engine(model_id: &str, device: &Device) -> Result<(DynamicModel, Tok
     Ok((model, tokenizer, Some(file)))
 }
 
-pub async fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, max_tokens: usize) -> Result<(String, u128), String> {
+pub async fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, params: &GenerationParameters) -> Result<(String, u128), String> {
     let tok_start = std::time::Instant::now();
     let mut tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
     let tok_time = tok_start.elapsed().as_millis();
     
+    let eos_strings = ["</s>", "<|endoftext|>", "<|im_end|>", "<|end_of_text|>", "<|eot_id|>"];
+    let eos_tokens: Vec<u32> = eos_strings.iter().filter_map(|s| tokenizer.token_to_id(s)).collect();
+
     let prompt_length = tokens.len();
-    let mut logits_processor = LogitsProcessor::new(299792458, None, None);
+    let mut logits_processor = LogitsProcessor::new(
+        params.seed.unwrap_or(299792458),
+        params.temperature.map(|t| t as f64),
+        params.top_p.map(|p| p as f64),
+    );
 
     let prefill_chunk_size = 256; 
     let mut current_pos = 0;
@@ -129,7 +136,7 @@ pub async fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &T
 
     println!("⚡ Generation started...");
 
-    for index in 0..max_tokens {
+    for index in 0..params.max_tokens.unwrap_or(500) {
         let context_size = if index == 0 { tokens.len() - current_pos } else { 1 };
         let start_pos = tokens.len().saturating_sub(context_size);
         
@@ -144,21 +151,28 @@ pub async fn generate_text(prompt: &str, model: &mut DynamicModel, tokenizer: &T
         let next_token = logits_processor.sample(&next_token_logits).map_err(|e| e.to_string())?;
         
         tokens.push(next_token);
-        if next_token == 2 || next_token == 151645 || next_token == 151643 || next_token == 128001 || next_token == 128009 { break; }
+        if eos_tokens.contains(&next_token) { break; }
         tokio::task::yield_now().await;
     }
     
     Ok((tokenizer.decode(&tokens[prompt_length..], true).map_err(|e| e.to_string())?, tok_time))
 }
 
-pub async fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, max_tokens: usize, tx: tokio::sync::mpsc::UnboundedSender<crate::types::StreamEvent>) -> Result<(), String> {
+pub async fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokenizer: &Tokenizer, device: &Device, params: &GenerationParameters, tx: tokio::sync::mpsc::UnboundedSender<crate::types::StreamEvent>) -> Result<(), String> {
     let tok_start = std::time::Instant::now();
     let mut tokens = tokenizer.encode(prompt, true).map_err(|e| e.to_string())?.get_ids().to_vec();
     let tok_time = tok_start.elapsed().as_millis();
     let _ = tx.send(crate::types::StreamEvent::TokenizationTime(tok_time));
     
+    let eos_strings = ["</s>", "<|endoftext|>", "<|im_end|>", "<|end_of_text|>", "<|eot_id|>"];
+    let eos_tokens: Vec<u32> = eos_strings.iter().filter_map(|s| tokenizer.token_to_id(s)).collect();
+
     let prompt_length = tokens.len();
-    let mut logits_processor = LogitsProcessor::new(299792458, None, None);
+    let mut logits_processor = LogitsProcessor::new(
+        params.seed.unwrap_or(299792458),
+        params.temperature.map(|t| t as f64),
+        params.top_p.map(|p| p as f64),
+    );
     let prefill_chunk_size = 256; 
     let mut current_pos = 0;
 
@@ -171,8 +185,8 @@ pub async fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokeni
         }
     }
 
-    let mut prev_decoded_len = 0;
-    for index in 0..max_tokens {
+    let mut prev_index = prompt_length;
+    for index in 0..params.max_tokens.unwrap_or(500) {
         let context_size = if index == 0 { tokens.len() - current_pos } else { 1 };
         let start_pos = tokens.len().saturating_sub(context_size);
         let input_tensor = Tensor::new(&tokens[start_pos..], device).map_err(|e| e.to_string())?.unsqueeze(0).map_err(|e| e.to_string())?.contiguous().map_err(|e| e.to_string())?;
@@ -181,16 +195,26 @@ pub async fn generate_text_stream(prompt: &str, model: &mut DynamicModel, tokeni
         let next_token_logits = logits.squeeze(0).map_err(|e| e.to_string())?;
         let next_token = logits_processor.sample(&next_token_logits).map_err(|e| e.to_string())?;
         tokens.push(next_token);
-        if next_token == 2 || next_token == 151645 || next_token == 151643 || next_token == 128001 || next_token == 128009 { break; }
-        if let Ok(full_decoded) = tokenizer.decode(&tokens[prompt_length..], true) {
-            if full_decoded.len() > prev_decoded_len {
-                let new_text = full_decoded[prev_decoded_len..].to_string();
-                prev_decoded_len = full_decoded.len();
-                if tx.send(crate::types::StreamEvent::Token(new_text)).is_err() { break; }
-            }
+        if eos_tokens.contains(&next_token) { break; }
+        
+        let text = tokenizer.decode(&tokens[prev_index..], true).unwrap_or_default();
+        // '\u{FFFD}' indicates an incomplete UTF-8 byte sequence across tokens.
+        // Wait for the next token to complete the character before flushing.
+        if !text.is_empty() && !text.ends_with('\u{FFFD}') {
+            if tx.send(crate::types::StreamEvent::Token(text)).is_err() { break; }
+            prev_index = tokens.len();
         }
         tokio::task::yield_now().await;
     }
+
+    // Flush any remaining partial characters
+    if prev_index < tokens.len() {
+        let text = tokenizer.decode(&tokens[prev_index..], true).unwrap_or_default();
+        if !text.is_empty() {
+            let _ = tx.send(crate::types::StreamEvent::Token(text));
+        }
+    }
+
     let _ = tx.send(crate::types::StreamEvent::Done);
     Ok(())
 }
@@ -241,6 +265,13 @@ pub struct CandleEngine {
     model: Option<DynamicModel>,
     tokenizer: Option<Tokenizer>,
     _file: Option<std::fs::File>,
+    nvml: Option<nvml_wrapper::Nvml>,
+}
+
+impl Default for CandleEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CandleEngine {
@@ -250,6 +281,7 @@ impl CandleEngine {
             model: None,
             tokenizer: None,
             _file: None,
+            nvml: nvml_wrapper::Nvml::init().ok(),
         }
     }
     
@@ -262,7 +294,7 @@ impl CandleEngine {
             Some(t) => t,
             None => { let _ = tx.send(crate::types::StreamEvent::Error("Tokenizer not loaded".into())); return; }
         };
-        if let Err(e) = generate_text_stream(prompt, model, tokenizer, &self.device, params.max_tokens.unwrap_or(500), tx.clone()).await {
+        if let Err(e) = generate_text_stream(prompt, model, tokenizer, &self.device, params, tx.clone()).await {
             let _ = tx.send(crate::types::StreamEvent::Error(e));
         }
     }
@@ -271,8 +303,7 @@ impl CandleEngine {
 #[async_trait]
 impl InferenceBackend for CandleEngine {
     async fn load_model(&mut self, config: &ModelConfig, status: Arc<Mutex<EngineStatus>>, _strategy: &str, _required_ctx: usize) -> Result<usize, String> {
-        let nvml = nvml_wrapper::Nvml::init().ok();
-        let (used_before, total, _) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0,0,0));
+        let (used_before, total, _) = crate::get_vram_info(self.nvml.as_ref(), 0).unwrap_or((0,0,0));
         
         {
             let mut s = status.lock().unwrap();
@@ -284,12 +315,12 @@ impl InferenceBackend for CandleEngine {
         self.tokenizer = Some(t);
         self._file = f;
 
-        let (used_after, _, free_after) = crate::get_vram_info(nvml.as_ref(), 0).unwrap_or((0,0,0));
+        let (used_after, _, free_after) = crate::get_vram_info(self.nvml.as_ref(), 0).unwrap_or((0,0,0));
         let diff = used_after.saturating_sub(used_before);
         {
             let mut s = status.lock().unwrap();
             s.log_vram("Allocate", "Candle::Weights", "Model Weights", diff as i64);
-            s.set_model_vram(config.id.clone(), "Candle".to_string(), "Active".to_string(), diff, 0, 0);
+            s.set_model_vram(config.id.clone(), "Candle".to_string(), false, "Active".to_string(), diff, 0, 0);
             s.update_nvml(total, used_after, free_after);
         }
         Ok(config.max_context_len)
@@ -298,7 +329,7 @@ impl InferenceBackend for CandleEngine {
     async fn generate_text(&mut self, prompt: &str, params: &GenerationParameters) -> Result<(String, u128), String> {
         let model = self.model.as_mut().ok_or("Model not loaded")?;
         let tokenizer = self.tokenizer.as_ref().ok_or("Tokenizer not loaded")?;
-        generate_text(prompt, model, tokenizer, &self.device, params.max_tokens.unwrap_or(500)).await
+        generate_text(prompt, model, tokenizer, &self.device, params).await
     }
     
     fn supports_extractive_compression(&self) -> bool {

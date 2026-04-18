@@ -23,6 +23,8 @@ pub struct RamEvent {
 pub struct ModelMemory {
     pub id: String,
     pub backend: String,
+    #[serde(default)]
+    pub is_statically_allocated: bool,
     pub status: String,
     pub weights: u64,
     pub kv_cache: u64,
@@ -56,15 +58,17 @@ impl EngineStatus {
         self.models_vram.iter().map(|m| m.weights + m.kv_cache + m.compute).sum()
     }
 
-    pub fn set_model_vram(&mut self, id: String, backend: String, status: String, weights: u64, kv: u64, comp: u64) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_model_vram(&mut self, id: String, backend: String, is_statically_allocated: bool, status: String, weights: u64, kv: u64, comp: u64) {
         if let Some(m) = self.models_vram.iter_mut().find(|m| m.id == id) {
             m.weights = weights;
             m.kv_cache = kv;
             m.compute = comp;
             m.backend = backend;
+            m.is_statically_allocated = is_statically_allocated;
             m.status = status;
         } else {
-            self.models_vram.push(ModelMemory { id, backend, status, weights, kv_cache: kv, compute: comp });
+            self.models_vram.push(ModelMemory { id, backend, is_statically_allocated, status, weights, kv_cache: kv, compute: comp });
         }
         self.vram_engine_claimed = self.total_engine_vram();
     }
@@ -110,12 +114,12 @@ impl EngineStatus {
         } else {
             let mut static_claimed = 0;
             for m in &self.models_vram {
-                if m.backend != "Candle" { static_claimed += m.weights + m.kv_cache + m.compute; } 
+                if m.is_statically_allocated { static_claimed += m.weights + m.kv_cache + m.compute; } 
                 else { static_claimed += m.weights; }
             }
             
             let dynamic_usage = used.saturating_sub(self.baseline_other_vram + static_claimed);
-            if let Some(m) = self.models_vram.iter_mut().find(|m| m.backend == "Candle" && m.status == "Active") {
+            if let Some(m) = self.models_vram.iter_mut().find(|m| !m.is_statically_allocated && m.status == "Active") {
                 m.kv_cache = dynamic_usage;
             }
             self.vram_engine_claimed = self.total_engine_vram();
