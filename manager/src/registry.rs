@@ -99,7 +99,8 @@ impl ModelConfig {
             ModelDType::F16 | ModelDType::BF16 => 2,
         };
         if self.n_head > 0 && self.n_head_kv > 0 {
-            (2 * self.num_layers * self.n_embd * self.n_head_kv / self.n_head) * bytes_per_element
+            (2 * self.num_layers * self.n_embd * self.n_head_kv / self.n_head.max(1))
+                * bytes_per_element
         } else {
             // Fallback heuristics if precise model architecture details are omitted
             match &self.arch {

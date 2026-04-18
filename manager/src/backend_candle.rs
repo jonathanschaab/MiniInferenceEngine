@@ -186,7 +186,7 @@ where
 
     if tokens.len() > 1 {
         // Generalize using Rust's native slice chunks iterator
-        for chunk in tokens[..tokens.len() - 1].chunks(prefill_chunk_size) {
+        for chunk in tokens[..tokens.len().saturating_sub(1)].chunks(prefill_chunk_size) {
             let input_tensor = Tensor::new(chunk, device)
                 .map_err(|e| e.to_string())?
                 .unsqueeze(0)

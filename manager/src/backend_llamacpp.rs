@@ -100,7 +100,7 @@ where
     let last_index_of_prompt = tokens_list.len().saturating_sub(1);
     let mut logit_index = 0;
 
-    for chunk in tokens_list.chunks(n_batch) {
+    for chunk in tokens_list.chunks(n_batch.max(1)) {
         let mut batch = LlamaBatch::new(chunk.len(), 1);
         for (i, &token) in chunk.iter().enumerate() {
             let pos = current_pos + i;
