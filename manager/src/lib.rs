@@ -34,6 +34,35 @@ pub fn get_vram_info(nvml: Option<&Nvml>, device_index: u32) -> Option<(u64, u64
     Some((info.used, info.total, info.free))
 }
 
+pub async fn wait_for_vram_release(
+    nvml: Option<&Nvml>,
+    device_index: u32,
+    vram_before: u64,
+    expected_release_bytes: u64,
+) {
+    if nvml.is_none() || expected_release_bytes == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        return;
+    }
+
+    let start = Instant::now();
+    let timeout = std::time::Duration::from_millis(1500); // 1.5 second max fallback
+
+    // Allow a tiny 16MB variance for OS background processes that might fluctuate concurrently
+    let target_vram = vram_before
+        .saturating_sub(expected_release_bytes)
+        .saturating_add(16 * 1024 * 1024);
+
+    while start.elapsed() < timeout {
+        if let Some((used, _, _)) = get_vram_info(nvml, device_index)
+            && used <= target_vram
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 pub enum ActiveBackend {
     #[cfg(feature = "backend-candle")]
     Candle(Box<CandleEngine>),
@@ -253,7 +282,8 @@ pub async fn run_batcher_loop(
         let target_btype = match target_btype_opt {
             Some(b) => b,
             None => {
-                // Auto selection logic
+                // AUTO SELECTION LOGIC
+                // If the requested model is already loaded, stick with its currently active backend to prevent an unnecessary VRAM reload.
                 if active_model_id == request.chat_model_id
                     && let Some(b) = config_for_prompt.supported_backends.iter().find(|sb| {
                         active_backend_name
@@ -265,11 +295,13 @@ pub async fn run_batcher_loop(
                 {
                     *b
                 } else if config_for_prompt
+                    // If we are loading a different model, the VRAM IO cost is being paid anyway. Default to Llama.cpp for best performance.
                     .supported_backends
                     .contains(&BackendType::LlamaCpp)
                 {
                     BackendType::LlamaCpp
                 } else if let Some(b) = config_for_prompt.supported_backends.first() {
+                    // Fallback to whatever the first supported backend is.
                     *b
                 } else {
                     let _ = request.responder.send(StreamEvent::Error(
@@ -304,7 +336,29 @@ pub async fn run_batcher_loop(
 
             if let Some(backend) = active_backend.take() {
                 let offload_pct = backend.get_offload_pct();
+
+                let expected_release = {
+                    let s = lock_status(&status);
+                    s.models_vram
+                        .iter()
+                        .find(|m| m.id == active_model_id)
+                        .map(|m| m.weights + m.kv_cache + m.compute)
+                        .unwrap_or(0)
+                };
+                let vram_before = get_vram_info(nvml.as_ref(), gpu_device_index)
+                    .map(|(u, _, _)| u)
+                    .unwrap_or(0);
+
                 drop(backend);
+
+                // Dynamically await VRAM cleanup
+                wait_for_vram_release(
+                    nvml.as_ref(),
+                    gpu_device_index,
+                    vram_before,
+                    expected_release,
+                )
+                .await;
 
                 let mut s = lock_status(&status);
                 if offload_pct > 0.0 {
@@ -715,7 +769,28 @@ pub async fn run_batcher_loop(
                 );
             }
 
+            let expected_release = {
+                let s = lock_status(&status);
+                s.models_vram
+                    .iter()
+                    .find(|m| m.id == request.compressor_model_id)
+                    .map(|m| m.weights + m.kv_cache + m.compute)
+                    .unwrap_or(0)
+            };
+            let vram_before = get_vram_info(nvml.as_ref(), gpu_device_index)
+                .map(|(u, _, _)| u)
+                .unwrap_or(0);
+
             drop(comp_backend);
+
+            // Dynamically await exact VRAM cleanup
+            wait_for_vram_release(
+                nvml.as_ref(),
+                gpu_device_index,
+                vram_before,
+                expected_release,
+            )
+            .await;
 
             {
                 let mut s = lock_status(&status);
@@ -785,13 +860,30 @@ pub async fn run_batcher_loop(
         // Concurrently run the backend generator and dynamically intercept internal stream
         // events like 'TokenizationTime' so they don't leak into the web HTTP chunked response!
         let fwd_fut = async {
+            let mut terminal_received = false;
             while let Some(ev) = inner_rx.recv().await {
                 match ev {
                     StreamEvent::TokenizationTime(t) => tokenization_time_ms = t,
+                    StreamEvent::Done => {
+                        terminal_received = true;
+                        let _ = responder.send(StreamEvent::Done);
+                        break;
+                    }
+                    StreamEvent::Error(e) => {
+                        terminal_received = true;
+                        let _ = responder.send(StreamEvent::Error(e));
+                        break;
+                    }
                     other => {
                         let _ = responder.send(other);
                     }
                 }
+            }
+
+            // If the backend panicked or dropped the channel without sending a terminal event,
+            // synthesize one here so the HTTP stream closes gracefully and the UI doesn't hang.
+            if !terminal_received {
+                let _ = responder.send(StreamEvent::Done);
             }
         };
 

@@ -50,6 +50,9 @@ enum EngineCommand {
         params: GenerationParameters,
         reply: tokio::sync::oneshot::Sender<Result<(String, u128), String>>,
     },
+    Shutdown {
+        reply: std::sync::mpsc::Sender<()>,
+    },
 }
 
 fn process_utf8_buffer(byte_buffer: &mut Vec<u8>) -> String {
@@ -239,12 +242,21 @@ impl LlamaCppEngine {
                             let weights_vram_cost_est =
                                 (config.size_on_disk_gb * 1024.0 * 1024.0 * 1024.0) as u64;
 
+                            // Estimate non-layer weights (embeddings, output head, etc.)
+                            // using the exact parameter ratio from the model registry.
+                            let non_layer_ratio = config.non_layer_params_billions
+                                / config.parameters_billions.max(0.001);
+                            let non_layer_weights_est =
+                                (weights_vram_cost_est as f32 * non_layer_ratio) as u64;
+                            let vram_per_layer = (weights_vram_cost_est
+                                .saturating_sub(non_layer_weights_est))
+                                / config.num_layers.max(1) as u64;
+
                             if strategy == MemoryStrategy::Compress {
                                 if weights_vram_cost_est + compute_margin > available_vram {
-                                    let vram_for_weights =
-                                        available_vram.saturating_sub(compute_margin);
-                                    let vram_per_layer =
-                                        weights_vram_cost_est / config.num_layers.max(1) as u64;
+                                    let vram_for_weights = available_vram
+                                        .saturating_sub(compute_margin)
+                                        .saturating_sub(non_layer_weights_est);
                                     n_gpu_layers =
                                         (vram_for_weights / vram_per_layer.max(1)) as u32;
                                 }
@@ -252,12 +264,11 @@ impl LlamaCppEngine {
                                 let kv_vram_cost_per_layer = ((final_ctx_len * bytes_per_token)
                                     as u64)
                                     / config.num_layers.max(1) as u64;
-                                let weights_vram_cost_per_layer =
-                                    weights_vram_cost_est / config.num_layers.max(1) as u64;
                                 let total_cost_per_gpu_layer =
-                                    kv_vram_cost_per_layer + weights_vram_cost_per_layer;
-
-                                let vram_for_layers = available_vram.saturating_sub(compute_margin);
+                                    kv_vram_cost_per_layer + vram_per_layer;
+                                let vram_for_layers = available_vram
+                                    .saturating_sub(compute_margin)
+                                    .saturating_sub(non_layer_weights_est);
                                 n_gpu_layers =
                                     (vram_for_layers / total_cost_per_gpu_layer.max(1)) as u32;
                                 println!(
@@ -437,6 +448,11 @@ impl LlamaCppEngine {
                         })();
                         let _ = reply.send(res);
                     }
+                    EngineCommand::Shutdown { reply } => {
+                        drop(instance.take()); // Explicitly drop the Llama model and context
+                        let _ = reply.send(());
+                        break;
+                    }
                 }
             }
         });
@@ -458,6 +474,19 @@ impl LlamaCppEngine {
             params: params.clone(),
             tx,
         });
+    }
+}
+
+impl Drop for LlamaCppEngine {
+    fn drop(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self
+            .command_tx
+            .send(EngineCommand::Shutdown { reply: tx })
+            .is_ok()
+        {
+            let _ = rx.recv(); // Block until the background thread acknowledges shutdown
+        }
     }
 }
 
