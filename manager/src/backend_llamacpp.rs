@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 const LLAMA_CPP_COMPUTE_MARGIN_BYTES: u64 = 1_500 * 1024 * 1024;
 
 static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+static LLAMA_BACKEND_INIT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 self_cell! {
     struct LlamaInstance {
@@ -222,19 +223,28 @@ impl LlamaCppEngine {
                     let _ = init_tx.send(Ok(()));
                     b
                 }
-                None => match LlamaBackend::init() {
-                    Ok(b) => {
-                        let _ = init_tx.send(Ok(()));
-                        LLAMA_BACKEND.get_or_init(|| b)
+                None => {
+                    let _guard = LLAMA_BACKEND_INIT_MUTEX.lock().unwrap();
+                    match LLAMA_BACKEND.get() {
+                        Some(b) => {
+                            let _ = init_tx.send(Ok(()));
+                            b
+                        }
+                        None => match LlamaBackend::init() {
+                            Ok(b) => {
+                                let _ = init_tx.send(Ok(()));
+                                LLAMA_BACKEND.get_or_init(|| b)
+                            }
+                            Err(e) => {
+                                let _ = init_tx.send(Err(format!(
+                                    "Failed to initialize llama.cpp backend: {}",
+                                    e
+                                )));
+                                return;
+                            }
+                        },
                     }
-                    Err(e) => {
-                        let _ = init_tx.send(Err(format!(
-                            "Failed to initialize llama.cpp backend: {}",
-                            e
-                        )));
-                        return;
-                    }
-                },
+                }
             };
 
             let mut instance: Option<LlamaInstance> = None;

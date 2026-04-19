@@ -39,6 +39,8 @@ pub async fn wait_for_vram_release(
     device_index: u32,
     vram_before: u64,
     expected_release_bytes: u64,
+    model_id: &str,
+    backend_name: &str,
 ) {
     if nvml.is_none() || expected_release_bytes == 0 {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -46,21 +48,26 @@ pub async fn wait_for_vram_release(
     }
 
     let start = Instant::now();
-    let timeout = std::time::Duration::from_millis(1500); // 1.5 second max fallback
+    let timeout = std::time::Duration::from_secs(10); // 10 second max fallback
 
-    // Allow a tiny 16MB variance for OS background processes that might fluctuate concurrently
+    // Allow a 64MB variance for OS background processes and driver caching that might fluctuate concurrently
     let target_vram = vram_before
         .saturating_sub(expected_release_bytes)
-        .saturating_add(16 * 1024 * 1024);
+        .saturating_add(64 * 1024 * 1024);
 
     while start.elapsed() < timeout {
         if let Some((used, _, _)) = get_vram_info(nvml, device_index)
             && used <= target_vram
         {
-            break;
+            return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+
+    println!(
+        "⚠️ WARNING: VRAM release timeout exceeded for {} on {}! System might OOM.",
+        model_id, backend_name
+    );
 }
 
 pub enum ActiveBackend {
@@ -344,7 +351,7 @@ pub async fn run_batcher_loop(
                     s.models_vram
                         .iter()
                         .find(|m| m.id == active_model_id)
-                        .map(|m| m.weights + m.kv_cache + m.compute)
+                        .map(|m| m.weights + m.kv_cache)
                         .unwrap_or(0)
                 };
                 let vram_before = get_vram_info(nvml.as_ref(), gpu_device_index)
@@ -359,6 +366,8 @@ pub async fn run_batcher_loop(
                     gpu_device_index,
                     vram_before,
                     expected_release,
+                    &active_model_id,
+                    &active_backend_name,
                 )
                 .await;
 
@@ -762,7 +771,7 @@ pub async fn run_batcher_loop(
             if let Ok(mut t) = telemetry.lock() {
                 t.record_generation(
                     request.compressor_model_id.clone(),
-                    comp_btype_str,
+                    comp_btype_str.clone(),
                     request.parameters.clone(),
                     comp_offload_pct,
                     formatted_prompt.len(),
@@ -777,7 +786,7 @@ pub async fn run_batcher_loop(
                 s.models_vram
                     .iter()
                     .find(|m| m.id == request.compressor_model_id)
-                    .map(|m| m.weights + m.kv_cache + m.compute)
+                    .map(|m| m.weights + m.kv_cache)
                     .unwrap_or(0)
             };
             let vram_before = get_vram_info(nvml.as_ref(), gpu_device_index)
@@ -792,6 +801,8 @@ pub async fn run_batcher_loop(
                 gpu_device_index,
                 vram_before,
                 expected_release,
+                &request.compressor_model_id,
+                &comp_btype_str,
             )
             .await;
 
