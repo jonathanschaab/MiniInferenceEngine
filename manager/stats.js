@@ -21,6 +21,7 @@ async function openBenchmarkModal() {
                 <label class="model-item">
                     <input type="checkbox" class="model-cb" value="${m.id}" data-backends="${backendsStr}" checked>
                     ${m.name} <span style="color: #6c7086; margin-left: 5px;">(${m.arch})</span>
+                    <span class="incompatible-warning" style="display: none; color: #f38ba8; margin-left: auto; font-size: 0.85em; font-style: italic;">(Incompatible)</span>
                 </label>
             `;
             m.supported_backends.forEach(b => allBackends.add(b));
@@ -61,8 +62,9 @@ function updateBenchmarkCompatibility() {
         cb.disabled = !supported;
         cb.parentElement.style.opacity = supported ? "1" : "0.5";
         
-        if (!supported) {
-            cb.checked = false;
+        const warningSpan = cb.parentElement.querySelector('.incompatible-warning');
+        if (warningSpan) {
+            warningSpan.style.display = supported ? 'none' : 'inline';
         }
     });
 }
@@ -72,8 +74,8 @@ function closeModal() {
 }
 
 async function submitBenchmark() {
-    // Gather all checked boxes
-    const checkboxes = document.querySelectorAll('#model-checkbox-list input:checked');
+    // Gather all checked boxes that are currently compatible (not disabled)
+    const checkboxes = document.querySelectorAll('#model-checkbox-list input:checked:not(:disabled)');
     const selectedModels = Array.from(checkboxes).map(cb => cb.value);
 
     if (selectedModels.length === 0) {

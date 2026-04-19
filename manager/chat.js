@@ -166,6 +166,16 @@ async function sendMessage() {
     const text = inputField.value.trim();
     if (!text) return;
 
+    // Grab the IDs from the UI dropdowns
+    const chatModelId = document.getElementById('chat-model-select').value;
+    const compModelId = document.getElementById('compressor-model-select').value;
+    const targetBackend = document.getElementById('backend-select').value;
+
+    if (!chatModelId || !compModelId) {
+        alert("Please select a valid chat model and compressor model. Check your backend compatibility if options are disabled.");
+        return;
+    }
+
     appendMessage(text, true);
     chatHistory.push({ role: "user", content: text });
     
@@ -184,11 +194,6 @@ async function sendMessage() {
     chatContainer.appendChild(aiMessageDiv);
 
     try {
-        // Grab the IDs from the UI dropdowns
-        const chatModelId = document.getElementById('chat-model-select').value;
-        const compModelId = document.getElementById('compressor-model-select').value;
-        const targetBackend = document.getElementById('backend-select').value;
-
         // Grab parameters
         const parameters = getGenerationParameters();
 
