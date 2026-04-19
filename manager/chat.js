@@ -136,6 +136,7 @@ function updateDropdownCompatibility() {
     });
     if (backendSelect.options[backendSelect.selectedIndex]?.disabled) {
         backendSelect.value = ''; // Fallback to Auto
+        Array.from(chatSelect.options).forEach(opt => opt.disabled = false);
     }
 }
 
