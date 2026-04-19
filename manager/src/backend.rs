@@ -46,3 +46,36 @@ pub trait InferenceBackend: Send + Sync {
     /// Returns the percentage of the model/KV cache that was offloaded to the CPU (0.0 to 1.0).
     fn get_offload_pct(&self) -> f32;
 }
+
+pub fn process_utf8_buffer(byte_buffer: &mut Vec<u8>) -> String {
+    let mut result = String::new();
+    loop {
+        if byte_buffer.is_empty() {
+            break;
+        }
+        match std::str::from_utf8(byte_buffer) {
+            Ok(valid_str) => {
+                result.push_str(valid_str);
+                byte_buffer.clear();
+                break;
+            }
+            Err(e) => {
+                let valid_len = e.valid_up_to();
+                if valid_len > 0 {
+                    // SAFETY: e.valid_up_to() guarantees that the slice up to valid_len is valid UTF-8.
+                    let valid_str =
+                        unsafe { std::str::from_utf8_unchecked(&byte_buffer[..valid_len]) };
+                    result.push_str(valid_str);
+                    byte_buffer.drain(..valid_len);
+                }
+                if let Some(error_len) = e.error_len() {
+                    result.push('\u{FFFD}'); // Standard replacement character
+                    byte_buffer.drain(..error_len);
+                } else {
+                    break; // Incomplete sequence, wait for more bytes
+                }
+            }
+        }
+    }
+    result
+}

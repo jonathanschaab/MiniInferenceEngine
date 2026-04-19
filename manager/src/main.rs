@@ -611,66 +611,46 @@ async fn serve_memory_ui(session: tower_sessions::Session) -> Result<Html<&'stat
     Ok(Html(include_str!("../memory.html")))
 }
 
-async fn serve_chat_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
-    }
-    Ok((
+async fn serve_chat_js() -> impl IntoResponse {
+    (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../chat.js"),
-    ))
+    )
 }
 
-async fn serve_stats_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
-    }
-    Ok((
+async fn serve_stats_js() -> impl IntoResponse {
+    (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../stats.js"),
-    ))
+    )
 }
 
-async fn serve_settings_js(
-    session: tower_sessions::Session,
-) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
-    }
-    Ok((
+async fn serve_settings_js() -> impl IntoResponse {
+    (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../settings.js"),
-    ))
+    )
 }
 
-async fn serve_memory_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
-    }
-    Ok((
+async fn serve_memory_js() -> impl IntoResponse {
+    (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../memory.js"),
-    ))
+    )
 }
 
-async fn serve_common_js(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
-    }
-    Ok((
+async fn serve_common_js() -> impl IntoResponse {
+    (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../common.js"),
-    ))
+    )
 }
 
-async fn serve_common_css(session: tower_sessions::Session) -> Result<impl IntoResponse, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
-    }
-    Ok((
+async fn serve_common_css() -> impl IntoResponse {
+    (
         [(header::CONTENT_TYPE, "text/css")],
         include_str!("../common.css"),
-    ))
+    )
 }
 
 // Route: Serve the Telemetry JSON

@@ -206,7 +206,7 @@ where
 
     println!("⚡ Generation started...");
 
-    let mut prev_index = prompt_length;
+    let mut byte_buffer = Vec::new();
 
     for index in 0..params.max_tokens.unwrap_or(500) {
         let context_size = if index == 0 {
@@ -245,27 +245,48 @@ where
             break;
         }
 
-        let text = tokenizer
-            .decode(&tokens[prev_index..], true)
-            .unwrap_or_default();
-        // '\u{FFFD}' indicates an incomplete UTF-8 byte sequence across tokens.
-        // Wait for the next token to complete the character before flushing.
-        if !text.is_empty() && !text.ends_with('\u{FFFD}') {
-            if on_token(text).is_err() {
+        // Extract piece bytes to feed into our byte-level UTF-8 buffer.
+        // HF tokenizers do not natively expose raw bytes per token, so we approximate it
+        // by extracting SentencePiece byte fallbacks, and falling back to decode() for others.
+        let mut piece_bytes = Vec::new();
+        if let Some(t_str) = tokenizer.id_to_token(next_token) {
+            if t_str.starts_with("<0x") && t_str.ends_with('>') && t_str.len() == 6 {
+                if let Ok(b) = u8::from_str_radix(&t_str[3..5], 16) {
+                    piece_bytes.push(b);
+                } else {
+                    piece_bytes.extend_from_slice(t_str.as_bytes());
+                }
+            } else {
+                piece_bytes.extend_from_slice(
+                    tokenizer
+                        .decode(&[next_token], false)
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+            }
+        } else {
+            piece_bytes.extend_from_slice(
+                tokenizer
+                    .decode(&[next_token], false)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+        }
+
+        byte_buffer.extend_from_slice(&piece_bytes);
+        let decoded = crate::process_utf8_buffer(&mut byte_buffer);
+        if !decoded.is_empty()
+            && on_token(decoded).is_err() {
                 break;
             }
-            prev_index = tokens.len();
-        }
         tokio::task::yield_now().await;
     }
 
     // Flush any remaining partial characters
-    if prev_index < tokens.len() {
-        let text = tokenizer
-            .decode(&tokens[prev_index..], true)
-            .unwrap_or_default();
-        if !text.is_empty() {
-            let _ = on_token(text);
+    if !byte_buffer.is_empty() {
+        let remaining = String::from_utf8_lossy(&byte_buffer).into_owned();
+        if !remaining.is_empty() {
+            let _ = on_token(remaining);
         }
     }
 
