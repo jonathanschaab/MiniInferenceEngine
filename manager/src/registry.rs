@@ -81,6 +81,7 @@ pub struct ModelConfig {
     pub n_embd: usize,
     pub n_head: usize,
     pub n_head_kv: usize,
+    pub head_dim: usize,
     pub roles: Vec<ModelRole>,
     pub arch: ModelArch,
     pub compression_dtype: Option<ModelDType>,
@@ -102,7 +103,7 @@ impl ModelConfig {
             ModelDType::F16 | ModelDType::BF16 => 2,
         };
         if self.n_head > 0 && self.n_head_kv > 0 {
-            (2 * self.num_layers * self.n_embd * self.n_head_kv / self.n_head.max(1))
+            (2 * self.num_layers * self.head_dim * self.n_head_kv)
                 * bytes_per_element
         } else {
             // Fallback heuristics if precise model architecture details are omitted
@@ -110,7 +111,7 @@ impl ModelConfig {
                 ModelArch::Qwen2 if self.parameters_billions > 10.0 => 150_000,
                 ModelArch::Qwen2 => 80_000,
                 ModelArch::Llama if self.parameters_billions < 10.0 => 125_000,
-                ModelArch::GptOss => 35_000,
+                ModelArch::GptOss => 49_000,
                 _ => 100_000,
             }
         }
@@ -134,6 +135,7 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 n_embd: 4096,
                 n_head: 32,
                 n_head_kv: 8,
+                head_dim: 128,
                 arch: ModelArch::Llama,
                 compression_dtype: None,
                 kv_cache_dtype: ModelDType::F16,
@@ -158,6 +160,7 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 n_embd: 3584,
                 n_head: 28,
                 n_head_kv: 4,
+                head_dim: 128,
                 arch: ModelArch::Qwen2,
                 compression_dtype: None,
                 kv_cache_dtype: ModelDType::F16,
@@ -180,6 +183,7 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 n_embd: 5120,
                 n_head: 40,
                 n_head_kv: 8,
+                head_dim: 128,
                 arch: ModelArch::Qwen2,
                 compression_dtype: None,
                 kv_cache_dtype: ModelDType::F16,
@@ -201,6 +205,7 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 n_embd: 5120,
                 n_head: 40,
                 n_head_kv: 8,
+                head_dim: 128,
                 roles: vec![ModelRole::CodeSpecialist],
                 arch: ModelArch::Qwen2,
                 compression_dtype: None,
@@ -223,6 +228,7 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 n_embd: 5120,
                 n_head: 40,
                 n_head_kv: 8,
+                head_dim: 128,
                 roles: vec![ModelRole::CodeSpecialist],
                 arch: ModelArch::Qwen2,
                 compression_dtype: None,
@@ -245,6 +251,7 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 n_embd: 0,
                 n_head: 0,
                 n_head_kv: 0,
+                head_dim: 0,
                 roles: vec![ModelRole::ContextCompressor],
                 arch: ModelArch::XLMRoberta,
                 compression_dtype: Some(ModelDType::F16),
@@ -267,6 +274,7 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 n_embd: 0,
                 n_head: 0,
                 n_head_kv: 0,
+                head_dim: 0,
                 roles: vec![ModelRole::ContextCompressor],
                 arch: ModelArch::XLMRoberta,
                 compression_dtype: Some(ModelDType::F32),
@@ -289,6 +297,7 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 n_embd: 1536,
                 n_head: 12,
                 n_head_kv: 2,
+                head_dim: 128,
                 roles: vec![ModelRole::ContextCompressor],
                 arch: ModelArch::Qwen2,
                 compression_dtype: None,
@@ -314,6 +323,7 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 n_embd: 2880,
                 n_head: 64,
                 n_head_kv: 8,
+                head_dim: 64,
                 roles: vec![ModelRole::GeneralChat],
                 arch: ModelArch::GptOss,
                 compression_dtype: None,
