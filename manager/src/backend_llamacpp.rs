@@ -51,7 +51,9 @@ enum EngineCommand {
         params: GenerationParameters,
         reply: tokio::sync::oneshot::Sender<Result<(String, u128), String>>,
     },
-    Shutdown,
+    Shutdown {
+        reply: std::sync::mpsc::Sender<()>,
+    },
 }
 
 fn run_generation<F>(
@@ -454,8 +456,9 @@ impl LlamaCppEngine {
                         })();
                         let _ = reply.send(res);
                     }
-                    EngineCommand::Shutdown => {
+                    EngineCommand::Shutdown { reply } => {
                         drop(instance.take()); // Explicitly drop the Llama model and context
+                        let _ = reply.send(());
                         break;
                     }
                 }
@@ -478,17 +481,32 @@ impl LlamaCppEngine {
         params: &GenerationParameters,
         tx: tokio::sync::mpsc::UnboundedSender<crate::types::StreamEvent>,
     ) {
-        let _ = self.command_tx.send(EngineCommand::GenerateStream {
-            prompt: prompt.to_string(),
-            params: params.clone(),
-            tx,
-        });
+        if self
+            .command_tx
+            .send(EngineCommand::GenerateStream {
+                prompt: prompt.to_string(),
+                params: params.clone(),
+                tx: tx.clone(),
+            })
+            .is_err()
+        {
+            let _ = tx.send(crate::types::StreamEvent::Error(
+                "Engine thread died".into(),
+            ));
+        }
     }
 }
 
 impl Drop for LlamaCppEngine {
     fn drop(&mut self) {
-        let _ = self.command_tx.send(EngineCommand::Shutdown);
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self
+            .command_tx
+            .send(EngineCommand::Shutdown { reply: tx })
+            .is_ok()
+        {
+            let _ = rx.recv();
+        }
     }
 }
 

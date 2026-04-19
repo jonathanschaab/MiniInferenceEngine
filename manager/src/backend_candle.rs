@@ -275,10 +275,9 @@ where
 
         byte_buffer.extend_from_slice(&piece_bytes);
         let decoded = crate::process_utf8_buffer(&mut byte_buffer);
-        if !decoded.is_empty()
-            && on_token(decoded).is_err() {
-                break;
-            }
+        if !decoded.is_empty() && on_token(decoded).is_err() {
+            break;
+        }
         tokio::task::yield_now().await;
     }
 
