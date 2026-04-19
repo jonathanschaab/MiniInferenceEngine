@@ -16,9 +16,10 @@ async function openBenchmarkModal() {
         
         const allBackends = new Set();
         models.forEach(m => {
+            const backendsStr = m.supported_backends.join(',');
             listDiv.innerHTML += `
                 <label class="model-item">
-                    <input type="checkbox" value="${m.id}" checked>
+                    <input type="checkbox" class="model-cb" value="${m.id}" data-backends="${backendsStr}" checked>
                     ${m.name} <span style="color: #6c7086; margin-left: 5px;">(${m.arch})</span>
                 </label>
             `;
@@ -29,16 +30,39 @@ async function openBenchmarkModal() {
         backendDiv.innerHTML = '';
         allBackends.forEach(b => {
             backendDiv.innerHTML += `
-                <label class="model-item"><input type="checkbox" value="${b}" checked> ${b}</label>
+                <label class="model-item"><input type="checkbox" class="backend-cb" value="${b}" checked> ${b}</label>
             `;
         });
         
+        // Add listeners to auto-grey out incompatible models
+        document.querySelectorAll('.backend-cb').forEach(cb => {
+            cb.addEventListener('change', updateBenchmarkCompatibility);
+        });
+
+        updateBenchmarkCompatibility();
+
         // Show the modal
         document.getElementById('benchmark-modal').style.display = 'flex';
     } catch (e) {
         console.error("Failed to load models for modal", e);
         alert("Failed to fetch model registry.");
     }
+}
+
+function updateBenchmarkCompatibility() {
+    const checkedBackends = Array.from(document.querySelectorAll('.backend-cb:checked')).map(cb => cb.value);
+    
+    document.querySelectorAll('.model-cb').forEach(cb => {
+        const supportedBackends = cb.dataset.backends ? cb.dataset.backends.split(',') : [];
+        const supported = supportedBackends.some(b => checkedBackends.includes(b));
+        
+        cb.disabled = !supported;
+        cb.parentElement.style.opacity = supported ? "1" : "0.5";
+        
+        if (!supported) {
+            cb.checked = false;
+        }
+    });
 }
 
 function closeModal() {

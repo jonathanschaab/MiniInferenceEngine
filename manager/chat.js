@@ -68,24 +68,77 @@ async function initializeUI() {
 
         models.forEach(m => {
             if (m.roles.includes("GeneralChat") || m.roles.includes("CodeSpecialist")) {
-                chatSelect.add(new Option(`Chat: ${m.name}`, m.id));
+                let opt = new Option(`Chat: ${m.name}`, m.id);
+                opt.dataset.backends = m.supported_backends.map(b => b.toLowerCase()).join(',');
+                chatSelect.add(opt);
             }
             if (m.roles.includes("ContextCompressor")) {
-                compSelect.add(new Option(`Compressor: ${m.name}`, m.id));
+                let opt = new Option(`Compressor: ${m.name}`, m.id);
+                opt.dataset.backends = m.supported_backends.map(b => b.toLowerCase()).join(',');
+                compSelect.add(opt);
             }
         });
 
         if (status.active_chat_model_id) {
             chatSelect.value = status.active_chat_model_id;
+        } else {
+            const defChat = models.find(m => m.is_default_chat);
+            if (defChat) chatSelect.value = defChat.id;
         }
         if (status.last_compressor_model_id) {
             compSelect.value = status.last_compressor_model_id;
+        } else {
+            const defComp = models.find(m => m.is_default_compressor);
+            if (defComp) compSelect.value = defComp.id;
         }
+
+        chatSelect.addEventListener('change', updateDropdownCompatibility);
+        compSelect.addEventListener('change', updateDropdownCompatibility);
+        backendSelect.addEventListener('change', updateDropdownCompatibility);
+
+        updateDropdownCompatibility();
 
         updateStatus();
     } catch (err) {
         console.error("Failed to execute UI initialization:", err);
     }
+}
+
+function updateDropdownCompatibility() {
+    const chatSelect = document.getElementById('chat-model-select');
+    const compSelect = document.getElementById('compressor-model-select');
+    const backendSelect = document.getElementById('backend-select');
+
+    const selectedBackend = backendSelect.value;
+    
+    // 1. Filter models based on selected backend (Only Chat models, Compressor fallbacks are handled by the orchestrator)
+    if (selectedBackend) {
+        Array.from(chatSelect.options).forEach(opt => {
+            const supported = opt.dataset.backends && opt.dataset.backends.split(',').includes(selectedBackend);
+            opt.disabled = !supported;
+            if (!supported && opt.selected) {
+                chatSelect.value = Array.from(chatSelect.options).find(o => !o.disabled)?.value || '';
+            }
+        });
+    } else {
+        Array.from(chatSelect.options).forEach(opt => opt.disabled = false);
+    }
+
+    // 2. Filter backends based on selected Chat model
+    const chatOpt = chatSelect.options[chatSelect.selectedIndex];
+    
+    const chatBackends = chatOpt && chatOpt.dataset.backends ? chatOpt.dataset.backends.split(',') : [];
+
+    Array.from(backendSelect.options).forEach(opt => {
+        if (opt.value === '') { opt.disabled = false; return; } // Auto is always allowed
+        
+        let supported = chatOpt && chatBackends.includes(opt.value);
+        
+        opt.disabled = !supported;
+        if (!supported && opt.selected) {
+            backendSelect.value = ''; // Fallback to Auto
+        }
+    });
 }
 
 inputField.addEventListener('input', function() {

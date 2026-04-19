@@ -14,6 +14,7 @@ pub enum ModelArch {
     Llama,
     Qwen2,
     XLMRoberta,
+    GptOss,
 }
 
 pub trait PromptFormatter {
@@ -24,7 +25,7 @@ impl PromptFormatter for ModelArch {
     fn format_chat(&self, messages: &[Message]) -> String {
         let mut prompt = String::new();
         match self {
-            ModelArch::Qwen2 => {
+            ModelArch::Qwen2 | ModelArch::GptOss => {
                 for msg in messages {
                     prompt.push_str(&format!(
                         "<|im_start|>{}\n{}<|im_end|>\n",
@@ -297,6 +298,28 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 supported_backends: vec![BackendType::Candle, BackendType::LlamaCpp],
                 is_default_chat: false,
                 is_default_compressor: true,
+            },
+            ModelConfig {
+                id: "gpt-oss-20b".to_string(),
+                name: "GPT-OSS (20B)".to_string(),
+                repo: "unsloth/gpt-oss-20b-GGUF".to_string(),
+                tokenizer_repo: "openai/gpt-oss-20b".to_string(),
+                filename: "gpt-oss-20b-Q4_K_M.gguf".to_string(),
+                max_context_len: 131072,
+                num_layers: 24,
+                n_embd: 2880,
+                n_head: 64,
+                n_head_kv: 8,
+                roles: vec![ModelRole::GeneralChat],
+                arch: ModelArch::GptOss,
+                compression_dtype: None,
+                kv_cache_dtype: ModelDType::F16,
+                parameters_billions: 20.9,
+                non_layer_params_billions: 1.5,
+                size_on_disk_gb: 11.6,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
             },
         ]
     })
