@@ -16,7 +16,7 @@ async function openBenchmarkModal() {
         
         const allBackends = new Set();
         models.forEach(m => {
-            const backendsStr = m.supported_backends.join(',');
+            const backendsStr = m.supported_backends.map(b => b.toLowerCase()).join(',');
             listDiv.innerHTML += `
                 <label class="model-item">
                     <input type="checkbox" class="model-cb" value="${m.id}" data-backends="${backendsStr}" checked>
@@ -30,7 +30,7 @@ async function openBenchmarkModal() {
         backendDiv.innerHTML = '';
         allBackends.forEach(b => {
             backendDiv.innerHTML += `
-                <label class="model-item"><input type="checkbox" class="backend-cb" value="${b}" checked> ${b}</label>
+                <label class="model-item"><input type="checkbox" class="backend-cb" value="${b.toLowerCase()}" checked> ${b}</label>
             `;
         });
         

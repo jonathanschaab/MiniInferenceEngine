@@ -93,7 +93,6 @@ async function initializeUI() {
         }
 
         chatSelect.addEventListener('change', updateDropdownCompatibility);
-        compSelect.addEventListener('change', updateDropdownCompatibility);
         backendSelect.addEventListener('change', updateDropdownCompatibility);
 
         updateDropdownCompatibility();
@@ -106,7 +105,6 @@ async function initializeUI() {
 
 function updateDropdownCompatibility() {
     const chatSelect = document.getElementById('chat-model-select');
-    const compSelect = document.getElementById('compressor-model-select');
     const backendSelect = document.getElementById('backend-select');
 
     const selectedBackend = backendSelect.value;
