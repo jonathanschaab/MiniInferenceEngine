@@ -9,18 +9,28 @@ axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 nvml-wrapper = "0.12.1"
+sysinfo = "0.30"
+self_cell = "1.2.2"
 
 # The Hugging Face Stack
-candle-core = { version = "0.10.2", features = ["cuda"] }
-candle-nn = "0.10.2"
-candle-transformers = { version = "0.10.2", features = ["cuda"] }
+candle-core = { version = "0.10.2", features = ["cuda"], optional = true }
+candle-nn = { version = "0.10.2", optional = true }
+candle-transformers = { version = "0.10.2", features = ["cuda"], optional = true }
 hf-hub = "0.5.0"        # To download the model files automatically
 tokenizers = "0.22.2"   # To convert text to integer IDs
 uuid = { version = "1.23.0", features = ["v4"] }
 oauth2 = { version = "4.4", features = ["reqwest"] }
 tower-sessions = "0.12"
-reqwest = { version = "0.13.2", features = ["json"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["native-tls", "json"] }
 rand = "0.8.5"
 base64 = "0.22.1"
 sha2 = "0.11.0"
 hex = "0.4.3"
+async-trait = "0.1.79"
+llama-cpp-2 = { version = "0.1.143", optional = true }
+tokio-stream = "0.1"
+
+[features]
+default = ["backend-candle"]
+backend-candle = ["candle-core", "candle-nn", "candle-transformers"]
+backend-llamacpp = ["llama-cpp-2", "llama-cpp-2/cuda"]

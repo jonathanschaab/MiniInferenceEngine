@@ -5,62 +5,61 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Engine Telemetry</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/css/common.css">
     <style>
-        body { font-family: system-ui, sans-serif; background: #1e1e2e; color: #cdd6f4; margin: 0; }
-        header { background: #11111b; padding: 15px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #313244; }
-        header h1 { margin: 0; font-size: 1.4rem; color: #cdd6f4; }
-        button, select { 
-            font-family: inherit; 
-            font-size: 0.9rem; 
-        }
-        
-        button { 
-            border-radius: 6px; 
-            border: none; 
-            font-weight: bold; 
-            cursor: pointer; 
-            transition: 0.2s; 
-            color: #11111b; 
-            display: inline-flex; 
-            align-items: center; 
-            justify-content: center;
-        }
-        
-        button:hover { 
-            filter: brightness(1.15); 
-        }
-        table { width: 100%; border-collapse: collapse; margin-bottom: 40px; background: #181825; border-radius: 8px; overflow: hidden; }
-        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #313244; }
-        th { background: #11111b; font-weight: bold; color: #89b4fa; }
         .chart-container { background: #181825; padding: 20px; border-radius: 8px; margin-bottom: 30px; height: 400px; }
-        .modal-overlay {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.7); display: none; justify-content: center; align-items: center; z-index: 1000;
-        }
-        .modal-content {
-            background: #1e1e2e; padding: 20px; border-radius: 8px; width: 450px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
-        }
-        .modal-content h2 { margin-top: 0; border-bottom: 1px solid #45475a; padding-bottom: 10px; }
         .model-list { max-height: 300px; overflow-y: auto; margin-bottom: 20px; background: #11111b; padding: 10px; border-radius: 4px; }
         .model-item { display: flex; align-items: center; margin-bottom: 8px; font-size: 0.95em; }
         .model-item input { margin-right: 10px; transform: scale(1.2); }
-        .modal-actions { display: flex; justify-content: space-between; }
-        .btn-cancel { background: #45475a; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
-        .btn-run { background: #a6e3a1; color: #11111b; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
     </style>
 </head>
 <body>
     <header>
         <h1>Engine Telemetry Dashboard</h1>
         <div style="display: flex; gap: 15px; align-items: center;">
-            <button id="btn-run-benchmark" onclick="openBenchmarkModal()" style="background: #89b4fa; height: 30px; padding: 0 10px;">▶ Run Benchmark Suite</button>
-            
             <button onclick="window.location.href='/'" style="background: #89b4fa; height: 30px; padding: 0 10px;">💬 Chat</button>
+            <button onclick="window.location.href='/memory'" style="background: #f9e2af; height: 30px; padding: 0 10px;">💾 Memory</button>
             <button onclick="window.location.href='/settings'" style="background: #a6e3a1; height: 30px; padding: 0 10px;">⚙️ Settings</button>
             <button onclick="window.location.href='/auth/logout'" style="background: #45475a; color: white; height: 30px; padding: 0 10px;">Logout</button>
         </div>
     </header>
+
+    <!-- Session Control Bar -->
+    <div style="background: #181825; padding: 10px 20px; border-bottom: 1px solid #313244; display: flex; gap: 15px; align-items: center; justify-content: space-between;">
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button id="btn-run-benchmark" onclick="openBenchmarkModal()" style="background: #89b4fa; height: 30px; padding: 0 10px;">▶ Run Benchmark</button>
+        </div>
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button onclick="document.getElementById('parameters-panel').style.display = document.getElementById('parameters-panel').style.display === 'none' ? 'flex' : 'none'" style="background: #89dceb; height: 30px; padding: 0 10px;">🎛️ Parameters</button>
+        </div>
+    </div>
+
+    <div id="parameters-panel" style="display: none; background: #181825; padding: 15px 20px; border-bottom: 1px solid #313244; gap: 20px; flex-wrap: wrap; align-items: center; font-size: 0.9rem;">
+        <div class="param-group">
+            <label for="param-temp">Temperature: <span id="val-temp">0.7</span></label>
+            <input type="range" id="param-temp" min="0" max="2" step="0.1" value="0.7" oninput="document.getElementById('val-temp').innerText=this.value">
+        </div>
+        <div class="param-group">
+            <label for="param-top-p">Top-P: <span id="val-top-p">0.95</span></label>
+            <input type="range" id="param-top-p" min="0" max="1" step="0.05" value="0.95" oninput="document.getElementById('val-top-p').innerText=this.value">
+        </div>
+        <div class="param-group">
+            <label for="param-top-k">Top-K:</label>
+            <input type="number" id="param-top-k" min="1" max="100" value="40" style="width: 60px;">
+        </div>
+        <div class="param-group">
+            <label for="param-max-tokens">Max Tokens:</label>
+            <input type="number" id="param-max-tokens" min="1" max="8192" value="500" style="width: 80px;">
+        </div>
+        <div class="param-group">
+            <label for="param-seed">Seed (Optional):</label>
+            <input type="number" id="param-seed" placeholder="Random" style="width: 100px;">
+        </div>
+        <div class="param-group">
+            <label for="param-context-buffer">Ctx Buffer:</label>
+            <input type="number" id="param-context-buffer" min="0" max="128000" value="1024" style="width: 80px;">
+        </div>
+    </div>
 
     <div style="padding: 20px;">
 
@@ -75,7 +74,6 @@
                     <th>Parameters</th>
                     <th>Size on Disk</th>
                     <th>Max Context</th>
-                    <th>Avg Load Time (VRAM)</th>
                 </tr>
             </thead>
             <tbody id="model-table-body"></tbody>
@@ -89,11 +87,18 @@
             <canvas id="tokenChart"></canvas>
         </div>
 
+        <div class="chart-container">
+            <canvas id="tokTimeChart"></canvas>
+        </div>
+
         <div id="benchmark-modal" class="modal-overlay">
             <div class="modal-content">
                 <h2>Select Models to Benchmark</h2>
                 <div id="model-checkbox-list" class="model-list">
-                    </div>
+                </div>
+                <h2>Select Backends</h2>
+                <div id="backend-checkbox-list" class="model-list" style="margin-bottom: 20px;">
+                </div>
                 <div class="modal-actions">
                     <button class="btn-cancel" onclick="closeModal()">Cancel</button>
                     <button class="btn-run" onclick="submitBenchmark()">Run Selected</button>
@@ -102,229 +107,7 @@
         </div>
     </div>
 
-    <script>
-        const colorPalette = ['#89b4fa', '#f38ba8', '#a6e3a1', '#f9e2af', '#cba6f7', '#94e2d5'];
-
-        async function openBenchmarkModal() {
-            if (isBenchmarking) {
-                alert("A benchmark is already running!");
-                return;
-            }
-
-            try {
-                // Fetch the current roster
-                const res = await fetch('/api/models');
-                const models = await res.json();
-                
-                const listDiv = document.getElementById('model-checkbox-list');
-                listDiv.innerHTML = ''; // Clear previous list
-                
-                models.forEach(m => {
-                    listDiv.innerHTML += `
-                        <label class="model-item">
-                            <input type="checkbox" value="${m.id}" checked>
-                            ${m.name} <span style="color: #6c7086; margin-left: 5px;">(${m.arch})</span>
-                        </label>
-                    `;
-                });
-                
-                // Show the modal
-                document.getElementById('benchmark-modal').style.display = 'flex';
-            } catch (e) {
-                console.error("Failed to load models for modal", e);
-                alert("Failed to fetch model registry.");
-            }
-        }
-
-        function closeModal() {
-            document.getElementById('benchmark-modal').style.display = 'none';
-        }
-
-        async function submitBenchmark() {
-            // Gather all checked boxes
-            const checkboxes = document.querySelectorAll('#model-checkbox-list input:checked');
-            const selectedModels = Array.from(checkboxes).map(cb => cb.value);
-
-            if (selectedModels.length === 0) {
-                alert("Please select at least one model to benchmark.");
-                return;
-            }
-
-            closeModal();
-
-            // Fire the updated POST request
-            const res = await fetch('/api/stats/collect', { 
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ models: selectedModels })
-            });
-
-            if (res.status === 409) {
-                alert("A benchmark is already running in the background!");
-            } else {
-                checkStatus(); // Instantly lock the UI
-            }
-        }
-
-        async function loadDashboard() {
-            const [modelsRes, statsRes] = await Promise.all([
-                fetch('/api/models'),
-                fetch('/api/stats/data')
-            ]);
-            
-            const models = await modelsRes.json();
-            const stats = await statsRes.json();
-            
-            populateTable(models, stats.loads);
-            renderSpeedChart(models, stats.generations);
-            renderTokenChart(models, stats.generations);
-        }
-
-        function populateTable(models, loads) {
-            const tbody = document.getElementById('model-table-body');
-            
-            // Calculate average load times
-            const loadAverages = {};
-            loads.forEach(l => {
-                if (!loadAverages[l.model_id]) loadAverages[l.model_id] = { sum: 0, count: 0 };
-                loadAverages[l.model_id].sum += l.load_time_ms;
-                loadAverages[l.model_id].count++;
-            });
-
-            models.forEach(m => {
-                const avgLoad = loadAverages[m.id] ? Math.round(loadAverages[m.id].sum / loadAverages[m.id].count) + " ms" : "No Data";
-                tbody.innerHTML += `
-                    <tr>
-                        <td>${m.name}</td>
-                        <td>${m.parameters_billions}B</td>
-                        <td>${m.size_on_disk_gb} GB</td>
-                        <td>${m.max_context_len.toLocaleString()}</td>
-                        <td>${avgLoad}</td>
-                    </tr>
-                `;
-            });
-        }
-
-        function renderSpeedChart(models, generations) {
-            const datasets = models.map((m, i) => {
-                const modelData = generations.filter(g => g.model_id === m.id);
-                // Group by prompt size to calculate averages
-                const grouped = {};
-                modelData.forEach(g => {
-                    const bucket = g.prompt_tokens;
-                    if (!grouped[bucket]) grouped[bucket] = { sum: 0, count: 0 };
-                    grouped[bucket].sum += g.generation_time_ms;
-                    grouped[bucket].count++;
-                });
-
-                const dataPoints = Object.keys(grouped).map(tokens => ({
-                    x: parseInt(tokens),
-                    y: grouped[tokens].sum / grouped[tokens].count
-                })).sort((a, b) => a.x - b.x);
-
-                return {
-                    label: m.name,
-                    data: dataPoints,
-                    borderColor: colorPalette[i % colorPalette.length],
-                    backgroundColor: colorPalette[i % colorPalette.length],
-                    tension: 0.3,
-                    showLine: true
-                };
-            }).filter(d => d.data.length > 0);
-
-            new Chart(document.getElementById('speedChart'), {
-                type: 'scatter',
-                data: { datasets },
-                options: {
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: { title: { display: true, text: 'Average Generation Time vs. Prompt Tokens', color: '#cdd6f4' }, legend: { labels: { color: '#cdd6f4' } } },
-                    scales: {
-                        x: { type: 'logarithmic', title: { display: true, text: 'Prompt Size (Tokens) - Log Scale', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } },
-                        y: { title: { display: true, text: 'Generation Time (ms)', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } }
-                    }
-                }
-            });
-        }
-
-        function renderTokenChart(models, generations) {
-            const datasets = models.map((m, i) => {
-                const modelData = generations.filter(g => g.model_id === m.id);
-                // Compare Raw Characters to Parsed Tokens
-                const dataPoints = modelData.map(g => ({
-                    x: g.prompt_chars,
-                    y: g.prompt_tokens
-                })).sort((a, b) => a.x - b.x);
-
-                return {
-                    label: m.name,
-                    data: dataPoints,
-                    borderColor: colorPalette[i % colorPalette.length],
-                    backgroundColor: colorPalette[i % colorPalette.length],
-                    tension: 0.3,
-                    showLine: true
-                };
-            }).filter(d => d.data.length > 0);
-
-            new Chart(document.getElementById('tokenChart'), {
-                type: 'scatter',
-                data: { datasets },
-                options: {
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: { title: { display: true, text: 'Tokenizer Efficiency (Tokens vs. Raw Characters)', color: '#cdd6f4' }, legend: { labels: { color: '#cdd6f4' } } },
-                    scales: {
-                        x: { type: 'logarithmic', title: { display: true, text: 'File Size (Raw Characters) - Log Scale', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } },
-                        y: { type: 'logarithmic', title: { display: true, text: 'Required Tokens', color: '#cdd6f4' }, grid: { color: '#313244' }, ticks: { color: '#a6adc8' } }
-                    }
-                }
-            });
-        }
-
-        window.onload = loadDashboard;
-
-        let isBenchmarking = false;
-
-        async function checkStatus() {
-            try {
-                const res = await fetch('/api/status');
-                const status = await res.json();
-                
-                const btn = document.getElementById('benchmark-btn');
-                const banner = document.getElementById('benchmark-banner');
-                
-                if (status.benchmark_running) {
-                    if (!isBenchmarking) {
-                        isBenchmarking = true;
-                        btn.disabled = true;
-                        btn.innerText = "⏳ Benchmark Running...";
-                        btn.style.background = "#f38ba8"; 
-                        btn.style.cursor = "not-allowed";
-                        if (banner) banner.style.display = "block";
-                    }
-                } else {
-                    if (isBenchmarking) {
-                        // The benchmark just finished! Reset UI and reload the graphs.
-                        isBenchmarking = false;
-                        btn.disabled = false;
-                        btn.innerText = "▶ Run Benchmark Suite";
-                        btn.style.background = "#89b4fa"; 
-                        btn.style.cursor = "pointer";
-                        if (banner) banner.style.display = "none";
-                        loadDashboard(); 
-                    }
-                }
-            } catch (e) {
-                console.error("Failed to fetch engine status", e);
-            }
-        }
-
-        // Poll the server every 2 seconds
-        setInterval(checkStatus, 2000);
-
-        // Call checkStatus immediately on load alongside the dashboard
-        window.onload = () => {
-            loadDashboard();
-            checkStatus();
-        };
-    </script>
+    <script src="/js/common.js"></script>
+    <script src="/js/stats.js"></script>
 </body>
 </html>

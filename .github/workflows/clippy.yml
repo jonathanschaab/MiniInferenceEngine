@@ -11,6 +11,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      - name: Install System Dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake clang libclang-dev
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.18
       - name: Install Rust toolchain
@@ -21,4 +23,4 @@ jobs:
         working-directory: manager
         env:
           CUDA_COMPUTE_CAP: "86" # Bypasses nvidia-smi auto-detection since runners lack GPUs
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings

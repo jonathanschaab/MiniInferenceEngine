@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VRAM Tracker</title>
+    <link rel="stylesheet" href="/css/common.css">
+    <style>
+        .tab-container { display: flex; border-bottom: 1px solid #313244; }
+        .tab { padding: 10px 20px; cursor: pointer; color: #a6adc8; font-weight: bold; }
+        .tab.active { color: #89b4fa; border-bottom: 2px solid #89b4fa; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        .container { padding: 20px; max-width: 1200px; margin: 0 auto; }
+        
+        .vram-bar-container { width: 100%; height: 40px; background: #313244; border-radius: 8px; display: flex; overflow: hidden; margin-top: 20px; border: 2px solid #45475a;}
+        .vram-weights { background: #89b4fa; height: 100%; transition: width 0.5s ease-out; display: flex; align-items: center; justify-content: center; color: #11111b; font-weight: bold; font-size: 0.85rem; overflow: hidden; white-space: nowrap;}
+        .vram-kv { background: #a6e3a1; height: 100%; transition: width 0.5s ease-out; display: flex; align-items: center; justify-content: center; color: #11111b; font-weight: bold; font-size: 0.85rem; overflow: hidden; white-space: nowrap;}
+        .vram-compute { background: #f9e2af; height: 100%; transition: width 0.5s ease-out; display: flex; align-items: center; justify-content: center; color: #11111b; font-weight: bold; font-size: 0.85rem; overflow: hidden; white-space: nowrap;}
+        .vram-other { background: #f38ba8; height: 100%; transition: width 0.5s ease-out; display: flex; align-items: center; justify-content: center; color: #11111b; font-weight: bold; font-size: 0.85rem; overflow: hidden; white-space: nowrap;}
+        .vram-free { background: #181825; height: 100%; transition: width 0.5s ease-out; display: flex; align-items: center; justify-content: center; color: #a6adc8; font-weight: bold; font-size: 0.85rem; overflow: hidden; white-space: nowrap;}
+
+        .ram-bar-container { width: 100%; height: 40px; background: #313244; border-radius: 8px; display: flex; overflow: hidden; margin-top: 20px; border: 2px solid #45475a;}
+        .ram-process { background: #a6e3a1; height: 100%; transition: width 0.5s ease-out; display: flex; align-items: center; justify-content: center; color: #11111b; font-weight: bold; font-size: 0.85rem; overflow: hidden; white-space: nowrap;}
+        .ram-other { background: #f38ba8; height: 100%; transition: width 0.5s ease-out; display: flex; align-items: center; justify-content: center; color: #11111b; font-weight: bold; font-size: 0.85rem; overflow: hidden; white-space: nowrap;}
+        .ram-free { background: #181825; height: 100%; transition: width 0.5s ease-out; display: flex; align-items: center; justify-content: center; color: #a6adc8; font-weight: bold; font-size: 0.85rem; overflow: hidden; white-space: nowrap;}
+        
+        .legend { display: flex; gap: 20px; margin-top: 10px; font-size: 0.9rem;}
+        .legend-item { display: flex; align-items: center; gap: 8px; color: #a6adc8;}
+        .legend-color { width: 15px; height: 15px; border-radius: 3px; }
+
+        .model-cards { display: flex; gap: 20px; margin-top: 30px; flex-wrap: wrap; }
+        .model-card { background: #313244; padding: 20px; border-radius: 8px; min-width: 300px; border-left: 5px solid #89b4fa; }
+        .model-card h3 { margin: 0 0 15px 0; font-size: 1.1rem; color: #89b4fa; }
+        .model-stat { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 0.9rem; }
+        .status-active { color: #a6e3a1; font-weight: bold; }
+        .status-idle { color: #6c7086; font-style: italic; }
+
+        /* Local Overrides for Table Styling */
+        table { margin-top: 40px; }
+        td { font-family: monospace; }
+        th { text-transform: uppercase; font-size: 0.85rem; }
+
+        .log-allocate { color: #f38ba8; }
+        .log-free { color: #a6e3a1; }
+        .log-measure { color: #89b4fa; }
+        .log-fail { color: #f38ba8; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Live Memory Dashboard</h1>
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button onclick="window.location.href='/'" style="background: #89b4fa; height: 30px; padding: 0 10px;">💬 Chat</button>
+            <button onclick="window.location.href='/stats'" style="background: #cba6f7; height: 30px; padding: 0 10px;">📊 Stats</button>
+            <button onclick="window.location.href='/settings'" style="background: #a6e3a1; height: 30px; padding: 0 10px;">⚙️ Settings</button>
+        </div>
+    </header>
+
+    <div class="tab-container">
+        <div class="tab active" onclick="switchTab('vram')">GPU VRAM</div>
+        <div class="tab" onclick="switchTab('ram')">System RAM</div>
+    </div>
+
+    <div id="vram-view" class="tab-content active">
+        <div class="container">
+            <h2>Physical VRAM Allocation</h2>
+            <div class="vram-bar-container">
+                <div id="bar-weights" class="vram-weights"></div>
+                <div id="bar-kv" class="vram-kv"></div>
+                <div id="bar-compute" class="vram-compute"></div>
+                <div id="bar-other" class="vram-other"></div>
+                <div id="bar-free" class="vram-free"></div>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-color" style="background: #89b4fa;"></div><span id="txt-weights">Weights</span></div>
+                <div class="legend-item"><div class="legend-color" style="background: #a6e3a1;"></div><span id="txt-kv">KV Cache</span></div>
+                <div class="legend-item"><div class="legend-color" style="background: #f9e2af;"></div><span id="txt-compute">Compute Margin</span></div>
+                <div class="legend-item"><div class="legend-color" style="background: #f38ba8;"></div><span id="txt-other">Other Processes</span></div>
+                <div class="legend-item"><div class="legend-color" style="background: #181825; border: 1px solid #45475a;"></div><span id="txt-free">Free VRAM</span></div>
+            </div>
+
+            <div id="loaded-models-container" class="model-cards"></div>
+
+            <table style="margin-top: 50px;">
+                <thead>
+                    <tr>
+                        <th>Timestamp</th>
+                        <th>Action</th>
+                        <th>Subsystem</th>
+                        <th>Description</th>
+                        <th>Size (MB)</th>
+                    </tr>
+                </thead>
+                <tbody id="vram-log-body"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="ram-view" class="tab-content">
+        <div class="container">
+            <h2>System RAM Allocation</h2>
+            <div class="ram-bar-container">
+                <div id="bar-ram-process" class="ram-process"></div>
+                <div id="bar-ram-other" class="ram-other"></div>
+                <div id="bar-ram-free" class="ram-free"></div>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-color" style="background: #a6e3a1;"></div><span id="txt-ram-process">Engine Process</span></div>
+                <div class="legend-item"><div class="legend-color" style="background: #f38ba8;"></div><span id="txt-ram-other">OS / Other Processes</span></div>
+                <div class="legend-item"><div class="legend-color" style="background: #181825; border: 1px solid #45475a;"></div><span id="txt-ram-free">Free RAM</span></div>
+            </div>
+
+            <table style="margin-top: 50px;">
+                <thead>
+                    <tr>
+                        <th>Timestamp</th>
+                        <th>Action</th>
+                        <th>Subsystem</th>
+                        <th>Description</th>
+                        <th>Size (MB)</th>
+                    </tr>
+                </thead>
+                <tbody id="ram-log-body"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/memory.js"></script>
+</body>
+</html>
