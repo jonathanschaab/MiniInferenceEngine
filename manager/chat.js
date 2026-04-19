@@ -123,7 +123,7 @@ function updateDropdownCompatibility() {
     }
 
     // 2. Filter backends based on selected Chat model
-    const chatOpt = chatSelect.options[chatSelect.selectedIndex];
+    const chatOpt = chatSelect.selectedIndex >= 0 ? chatSelect.options[chatSelect.selectedIndex] : null;
     
     const chatBackends = chatOpt && chatOpt.dataset.backends ? chatOpt.dataset.backends.split(',') : [];
 
