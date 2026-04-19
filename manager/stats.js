@@ -12,12 +12,12 @@ async function openBenchmarkModal() {
         const models = await res.json();
         
         const listDiv = document.getElementById('model-checkbox-list');
-        listDiv.innerHTML = ''; // Clear previous list
         
         const allBackends = new Set();
+        let modelsHtml = '';
         models.forEach(m => {
             const backendsStr = m.supported_backends.map(b => b.toLowerCase()).join(',');
-            listDiv.innerHTML += `
+            modelsHtml += `
                 <label class="model-item">
                     <input type="checkbox" class="model-cb" value="${m.id}" data-backends="${backendsStr}" checked>
                     ${m.name} <span style="color: #6c7086; margin-left: 5px;">(${m.arch})</span>
@@ -25,14 +25,16 @@ async function openBenchmarkModal() {
             `;
             m.supported_backends.forEach(b => allBackends.add(b));
         });
+        listDiv.innerHTML = modelsHtml;
         
         const backendDiv = document.getElementById('backend-checkbox-list');
-        backendDiv.innerHTML = '';
+        let backendsHtml = '';
         allBackends.forEach(b => {
-            backendDiv.innerHTML += `
+            backendsHtml += `
                 <label class="model-item"><input type="checkbox" class="backend-cb" value="${b.toLowerCase()}" checked> ${b}</label>
             `;
         });
+        backendDiv.innerHTML = backendsHtml;
         
         // Add listeners to auto-grey out incompatible models
         document.querySelectorAll('.backend-cb').forEach(cb => {
