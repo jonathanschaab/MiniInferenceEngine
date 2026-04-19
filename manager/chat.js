@@ -116,10 +116,10 @@ function updateDropdownCompatibility() {
         Array.from(chatSelect.options).forEach(opt => {
             const supported = opt.dataset.backends && opt.dataset.backends.split(',').includes(selectedBackend);
             opt.disabled = !supported;
-            if (!supported && opt.selected) {
-                chatSelect.value = Array.from(chatSelect.options).find(o => !o.disabled)?.value || '';
-            }
         });
+        if (chatSelect.options[chatSelect.selectedIndex]?.disabled) {
+            chatSelect.value = Array.from(chatSelect.options).find(o => !o.disabled)?.value || '';
+        }
     } else {
         Array.from(chatSelect.options).forEach(opt => opt.disabled = false);
     }
@@ -135,10 +135,10 @@ function updateDropdownCompatibility() {
         let supported = chatOpt && chatBackends.includes(opt.value);
         
         opt.disabled = !supported;
-        if (!supported && opt.selected) {
-            backendSelect.value = ''; // Fallback to Auto
-        }
     });
+    if (backendSelect.options[backendSelect.selectedIndex]?.disabled) {
+        backendSelect.value = ''; // Fallback to Auto
+    }
 }
 
 inputField.addEventListener('input', function() {

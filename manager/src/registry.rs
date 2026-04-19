@@ -300,6 +300,9 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                 is_default_compressor: true,
             },
             ModelConfig {
+                // This is a Mixture of Experts (MoE) model where only a subset of the layers are active per input,
+                // so the effective parameters and memory usage are much lower than a standard 20B model.
+                // It's an interesting stress test for our dynamic memory management and offloading strategies.
                 id: "gpt-oss-20b".to_string(),
                 name: "GPT-OSS (20B)".to_string(),
                 repo: "unsloth/gpt-oss-20b-GGUF".to_string(),
