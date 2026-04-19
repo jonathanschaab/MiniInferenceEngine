@@ -110,6 +110,7 @@ impl ModelConfig {
                 ModelArch::Qwen2 if self.parameters_billions > 10.0 => 150_000,
                 ModelArch::Qwen2 => 80_000,
                 ModelArch::Llama if self.parameters_billions < 10.0 => 125_000,
+                ModelArch::GptOss => 35_000,
                 _ => 100_000,
             }
         }
