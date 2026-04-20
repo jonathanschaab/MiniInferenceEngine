@@ -9,7 +9,7 @@ use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
 
 use crate::backend::InferenceBackend;
-use crate::registry::{ModelArch, ModelConfig, ModelDType, get_model_registry};
+use crate::registry::{ModelArch, ModelConfig, ModelDType};
 use crate::types::EngineStatus;
 use crate::types::GenerationParameters;
 use crate::types::MemoryStrategy;
@@ -53,14 +53,9 @@ impl DynamicModel {
 }
 
 pub fn load_engine(
-    model_id: &str,
+    config: &ModelConfig,
     device: &Device,
 ) -> Result<(DynamicModel, Tokenizer, Option<std::fs::File>), String> {
-    let config = get_model_registry()
-        .iter()
-        .find(|c| c.id == model_id)
-        .ok_or_else(|| format!("Model ID {} not found in registry", model_id))?;
-
     let api = Api::new().map_err(|e| e.to_string())?;
 
     if config.filename.ends_with(".safetensors") {
@@ -506,7 +501,7 @@ impl InferenceBackend for CandleEngine {
             );
         }
 
-        let (m, t, f) = load_engine(&config.id, &self.device)?;
+        let (m, t, f) = load_engine(config, &self.device)?;
         self.model = Some(m);
         self.tokenizer = Some(t);
         self._file = f;

@@ -226,6 +226,7 @@ pub async fn run_batcher_loop(
         let requested_max_tokens = request.parameters.max_tokens.unwrap_or(500);
         let ctx_buffer = request.parameters.context_buffer.unwrap_or(0);
         let mut config_for_prompt = match get_model_registry()
+            .await
             .iter()
             .find(|c| c.id == request.chat_model_id)
         {
@@ -615,6 +616,7 @@ pub async fn run_batcher_loop(
             }
 
             let comp_config = match get_model_registry()
+                .await
                 .iter()
                 .find(|c| c.id == request.compressor_model_id)
             {

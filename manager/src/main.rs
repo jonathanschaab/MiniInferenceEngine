@@ -87,7 +87,7 @@ async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>
 
 // Send the model roster to the Javascript dropdowns
 async fn get_models() -> Json<Vec<ModelConfig>> {
-    Json(get_model_registry().to_vec())
+    Json(get_model_registry().await.to_vec())
 }
 
 // Handle incoming chat requests
@@ -170,7 +170,7 @@ async fn trigger_benchmark(
 
     tokio::spawn(async move {
         println!("🚀 Starting Automated Benchmark Suite...");
-        let full_registry = get_model_registry();
+        let full_registry = get_model_registry().await;
 
         let default_compressor = full_registry
             .iter()
@@ -769,6 +769,11 @@ async fn main() {
     // Initialize global pooled clients once!
     let reqwest_client = reqwest::Client::new();
     let oauth_client = auth::build_oauth_client(&config.oauth_redirect_uri);
+
+    // Eagerly initialize the model registry in the background
+    tokio::spawn(async {
+        manager::get_model_registry().await;
+    });
 
     let shared_state = Arc::new(AppState {
         queue_tx: tx,

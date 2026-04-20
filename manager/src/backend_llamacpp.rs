@@ -259,7 +259,7 @@ impl LlamaCppEngine {
 
                             let compute_margin: u64 = LLAMA_CPP_COMPUTE_MARGIN_BYTES;
                             let mut final_ctx_len =
-                                required_ctx.min(config.max_context_len).max(2048);
+                                required_ctx.max(2048).min(config.max_context_len);
                             let mut n_gpu_layers = config.num_layers as u32;
                             let weights_vram_cost_est =
                                 (config.size_on_disk_gb * 1024.0 * 1024.0 * 1024.0) as u64;

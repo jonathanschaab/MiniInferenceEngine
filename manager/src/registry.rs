@@ -1,7 +1,7 @@
 use crate::types::Message;
-use hf_hub::api::sync::Api;
+use hf_hub::api::tokio::Api;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use tokio::sync::OnceCell;
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
 pub enum ModelDType {
@@ -160,9 +160,9 @@ struct ModelRegistration {
 }
 
 // Expose the registry so the web server can send it to the UI
-pub fn get_model_registry() -> &'static [ModelConfig] {
-    static REGISTRY: OnceLock<Vec<ModelConfig>> = OnceLock::new();
-    REGISTRY.get_or_init(|| {
+pub async fn get_model_registry() -> &'static [ModelConfig] {
+    static REGISTRY: OnceCell<Vec<ModelConfig>> = OnceCell::const_new();
+    REGISTRY.get_or_init(|| async {
         let api_opt = Api::new().ok();
         if api_opt.is_none() {
             println!("⚠️ WARNING: Failed to init HF API. Offline mode fallback active.");
@@ -310,17 +310,16 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
             },
         ];
 
-        let configs: Vec<ModelConfig> = std::thread::scope(|s| {
-            let mut handles = Vec::new();
+        let mut handles = Vec::new();
 
-            for reg in registrations {
-                let api_ref = api_opt.as_ref();
-                let cache_ref = &cache;
+        for reg in registrations {
+            let api_opt = api_opt.clone();
+            let cache = cache.clone();
 
-                handles.push(s.spawn(move || {
-                    let mut provenance = std::collections::HashMap::new();
+            handles.push(tokio::spawn(async move {
+                let mut provenance = std::collections::HashMap::new();
 
-                    let mut arch = reg.overrides.arch;
+                let mut arch = reg.overrides.arch;
                     let mut kv_cache_dtype = reg.overrides.kv_cache_dtype;
                     let mut max_context_len = reg.overrides.max_context_len;
                     let mut sliding_window = reg.overrides.sliding_window;
@@ -349,21 +348,21 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                     check_override(head_dim.is_some(), "head_dim");
                     check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
 
-                    // 1. Check if GGUF is cached locally to get exact size instantly
-                    if size_on_disk_gb.is_none()
-                        && let Some(gguf_path) = cache_ref.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename)
-                            && let Ok(meta) = std::fs::metadata(&gguf_path) {
-                                size_on_disk_gb = Some(meta.len() as f32 / 1024.0 / 1024.0 / 1024.0);
+                // 1. Check if GGUF is cached locally to get exact size instantly
+                if size_on_disk_gb.is_none()
+                    && let Some(gguf_path) = cache.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename)
+                        && let Ok(meta) = tokio::fs::metadata(&gguf_path).await {
+                            size_on_disk_gb = Some(meta.len() as f32 / 1024.0 / 1024.0 / 1024.0);
                             provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
-                            }
+                        }
 
-                    // 2. Fetch config.json from tokenizer repo to dynamically populate architectural details
-                    if num_layers.is_none() || n_head.is_none() || arch.is_none() || kv_cache_dtype.is_none() || max_context_len.is_none() || sliding_window.is_none() || rope_scaling_factor.is_none() || original_max_position_embeddings.is_none() {
-                        if let Some(api) = api_ref {
-                            match api.model(reg.tokenizer_repo.to_string()).get("config.json") {
-                                Ok(config_path) => {
-                                    if let Ok(config_str) = std::fs::read_to_string(config_path)
-                                        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                // 2. Fetch config.json from tokenizer repo to dynamically populate architectural details
+                if num_layers.is_none() || n_head.is_none() || arch.is_none() || kv_cache_dtype.is_none() || max_context_len.is_none() || sliding_window.is_none() || rope_scaling_factor.is_none() || original_max_position_embeddings.is_none() {
+                    if let Some(api) = &api_opt {
+                        match api.model(reg.tokenizer_repo.to_string()).get("config.json").await {
+                            Ok(config_path) => {
+                                if let Ok(config_str) = tokio::fs::read_to_string(config_path).await
+                                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
                                         let get_u64 = |key: &str| -> Option<usize> {
                                             match json.get(key) {
                                                 Some(val) if !val.is_null() => {
@@ -495,13 +494,13 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                                             }
                                         }
                                     }
-                                }
-                                Err(e) => println!("⚠️ WARNING: Failed to fetch config.json for {}: {}", reg.id, e),
                             }
-                        } else {
-                            println!("⚠️ WARNING: HF API not initialized, skipping remote config.json fetch for {}", reg.id);
+                            Err(e) => println!("⚠️ WARNING: Failed to fetch config.json for {}: {}", reg.id, e),
                         }
+                    } else {
+                        println!("⚠️ WARNING: HF API not initialized, skipping remote config.json fetch for {}", reg.id);
                     }
+                }
 
                     let n_head_val = n_head.unwrap_or(1);
                     let n_embd_val = n_embd.unwrap_or(4096);
@@ -524,6 +523,12 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                         let scaled_ctx = (orig_ctx as f32 * factor) as usize;
                         max_yarn_context = max_yarn_context.max(scaled_ctx);
                     }
+
+                    let fallback_size_gb = match reg.compression_dtype {
+                        Some(ModelDType::F32) => reg.parameters_billions * 4.0,
+                        Some(ModelDType::F16) | Some(ModelDType::BF16) => reg.parameters_billions * 2.0,
+                        None => reg.parameters_billions * 0.65, // Assume typical Q4_K_M GGUF
+                    };
 
                     ModelConfig {
                         id: reg.id.to_string(),
@@ -551,15 +556,17 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
                         head_dim: head_dim.unwrap_or(n_embd_val / n_head_val.max(1)),
                         parameters_billions: reg.parameters_billions,
                         non_layer_params_billions: reg.non_layer_params_billions,
-                        size_on_disk_gb: size_on_disk_gb.unwrap_or(5.0),
+                        size_on_disk_gb: size_on_disk_gb.unwrap_or(fallback_size_gb),
                         provenance,
                     }
                 }));
             }
 
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+        let mut configs = Vec::new();
+        for h in handles {
+            configs.push(h.await.unwrap());
+        }
 
         configs
-    })
+    }).await.as_slice()
 }
