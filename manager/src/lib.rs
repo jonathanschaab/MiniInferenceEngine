@@ -70,6 +70,32 @@ pub async fn wait_for_vram_release(
     );
 }
 
+async fn get_exact_token_count(
+    prompt: &str,
+    config: &ModelConfig,
+    target_btype: &BackendType,
+    tokenizer: &Tokenizer,
+) -> usize {
+    if *target_btype == BackendType::LlamaCpp {
+        #[cfg(feature = "backend-llamacpp")]
+        {
+            let cfg = config.clone();
+            let p = prompt.to_string();
+            let res = tokio::task::spawn_blocking(move || {
+                crate::backend_llamacpp::count_tokens_vocab_only(&cfg, &p)
+            })
+            .await;
+            if let Ok(Ok(count)) = res {
+                return count;
+            }
+        }
+    }
+    tokenizer
+        .encode(prompt.to_string(), true)
+        .map(|enc| enc.get_ids().len())
+        .unwrap_or_else(|_| prompt.len() / 4)
+}
+
 pub enum ActiveBackend {
     #[cfg(feature = "backend-candle")]
     Candle(Box<CandleEngine>),
@@ -218,11 +244,11 @@ pub async fn run_batcher_loop(
 
         let requested_max_tokens = request.parameters.max_tokens.unwrap_or(500);
         let ctx_buffer = request.parameters.context_buffer.unwrap_or(0);
-        let config_for_prompt = match get_model_registry()
+        let mut config_for_prompt = match get_model_registry()
             .iter()
             .find(|c| c.id == request.chat_model_id)
         {
-            Some(c) => c,
+            Some(c) => c.clone(),
             None => {
                 let _ = request.responder.send(StreamEvent::Error(
                     "Server Error: Active model missing from registry.".to_string(),
@@ -230,6 +256,11 @@ pub async fn run_batcher_loop(
                 continue 'main;
             }
         };
+
+        let req_yarn = request.parameters.yarn_enabled.unwrap_or(true);
+        if req_yarn {
+            config_for_prompt.max_context_len = config_for_prompt.max_yarn_context;
+        }
 
         // Fetch the specific tokenizer to ensure perfect context memory math
         let tokenizer = match tokenizer_cache.get(&config_for_prompt.tokenizer_repo) {
@@ -266,20 +297,6 @@ pub async fn run_batcher_loop(
                 }
             }
         };
-
-        let formatted_prompt_pre = config_for_prompt.arch.format_chat(&request.messages);
-        let token_count_pre = tokenizer
-            .encode(formatted_prompt_pre.clone(), true)
-            .map(|enc| enc.get_ids().len())
-            .unwrap_or_else(|_| formatted_prompt_pre.len() / 4);
-        let actual_required_ctx = (token_count_pre + requested_max_tokens).max(2048);
-        let target_allocated_ctx = actual_required_ctx + ctx_buffer;
-
-        let req_strategy = request
-            .parameters
-            .memory_strategy
-            .clone()
-            .unwrap_or(MemoryStrategy::Offload);
 
         let req_b = request.target_backend.as_deref().map(|s| s.to_lowercase());
         let target_btype_opt = match req_b.as_deref() {
@@ -321,6 +338,23 @@ pub async fn run_batcher_loop(
             }
         };
         let target_backend_name = format!("{:?}", target_btype);
+
+        let formatted_prompt_pre = config_for_prompt.arch.format_chat(&request.messages);
+        let token_count_pre = get_exact_token_count(
+            &formatted_prompt_pre,
+            &config_for_prompt,
+            &target_btype,
+            &tokenizer,
+        )
+        .await;
+        let actual_required_ctx = (token_count_pre + requested_max_tokens).max(2048);
+        let target_allocated_ctx = actual_required_ctx + ctx_buffer;
+
+        let req_strategy = request
+            .parameters
+            .memory_strategy
+            .clone()
+            .unwrap_or(MemoryStrategy::Offload);
 
         let mut needs_reload = active_model_id != request.chat_model_id
             || active_memory_strategy != req_strategy
@@ -491,11 +525,9 @@ pub async fn run_batcher_loop(
 
         let mut formatted_prompt = config.arch.format_chat(&request.messages);
 
-        // Exact token count using the actual Hugging Face tokenizer
-        let mut token_count = tokenizer
-            .encode(formatted_prompt.clone(), true)
-            .map(|enc| enc.get_ids().len())
-            .unwrap_or_else(|_| formatted_prompt.len() / 4);
+        // Exact token count using the active backend's tokenizer if available
+        let mut token_count =
+            get_exact_token_count(&formatted_prompt, config, &target_btype, &tokenizer).await;
 
         // --- THE DYNAMIC MEMORY MANAGER ---
         let mut trigger_compression = false;
@@ -852,10 +884,8 @@ pub async fn run_batcher_loop(
             }
 
             formatted_prompt = config.arch.format_chat(&new_messages);
-            token_count = tokenizer
-                .encode(formatted_prompt.clone(), true)
-                .map(|enc| enc.get_ids().len())
-                .unwrap_or_else(|_| formatted_prompt.len() / 4); // Update exact count for the compressed prompt
+            token_count =
+                get_exact_token_count(&formatted_prompt, config, &target_btype, &tokenizer).await;
         }
 
         println!("📥 Processing prompt...");

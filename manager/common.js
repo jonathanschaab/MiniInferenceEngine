@@ -25,5 +25,7 @@ function getGenerationParameters() {
     params.seed = seedVal !== "" ? parseInt(seedVal) : null;
     const memStrategyEl = document.getElementById('param-memory-strategy');
     if (memStrategyEl) params.memory_strategy = memStrategyEl.value;
+    const yarnEnabledEl = document.getElementById('param-yarn-enabled');
+    if (yarnEnabledEl) params.yarn_enabled = yarnEnabledEl.checked;
     return params;
 }

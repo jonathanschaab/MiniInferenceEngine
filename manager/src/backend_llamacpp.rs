@@ -35,7 +35,7 @@ self_cell! {
 
 enum EngineCommand {
     LoadModel {
-        config: ModelConfig,
+        config: Box<ModelConfig>,
         status: Arc<Mutex<EngineStatus>>,
         strategy: MemoryStrategy,
         required_ctx: usize,
@@ -73,6 +73,15 @@ where
 
     if tokens_list.is_empty() {
         return Err("Prompt resulted in 0 tokens after tokenization".to_string());
+    }
+
+    let max_ctx = inst.with_dependent_mut(|_, ctx| ctx.n_ctx());
+    if tokens_list.len() >= max_ctx as usize {
+        return Err(format!(
+            "Prompt size ({} tokens) exceeds the allocated KV cache size ({} tokens).",
+            tokens_list.len(),
+            max_ctx
+        ));
     }
 
     let tok_time = tok_start.elapsed().as_millis();
@@ -125,6 +134,11 @@ where
     let mut sampler = LlamaSampler::chain_simple(samplers);
 
     while generated_tokens < max_new_tokens {
+        if n_cur >= max_ctx as i32 {
+            println!("⚠️ Reached maximum context length of {} tokens.", max_ctx);
+            break;
+        }
+
         let (new_token_id, is_eog, new_bytes) = inst.with_dependent_mut(|model, ctx| {
             let new_token_id = sampler.sample(ctx, logit_index);
             sampler.accept(new_token_id);
@@ -174,6 +188,40 @@ where
     }
 
     Ok((output, tok_time))
+}
+
+pub fn count_tokens_vocab_only(config: &ModelConfig, prompt: &str) -> Result<usize, String> {
+    let api = hf_hub::api::sync::Api::new().map_err(|e| e.to_string())?;
+    let repo = api.model(config.repo.clone());
+    let weights_path = repo
+        .get(&config.filename)
+        .map_err(|e| format!("Missing weights: {}", e))?;
+
+    let backend = match LLAMA_BACKEND.get() {
+        Some(b) => b,
+        None => {
+            let _guard = LLAMA_BACKEND_INIT_MUTEX.lock().unwrap();
+            match LLAMA_BACKEND.get() {
+                Some(b) => b,
+                None => match LlamaBackend::init() {
+                    Ok(b) => LLAMA_BACKEND.get_or_init(|| b),
+                    Err(e) => return Err(format!("Failed to init llama backend: {}", e)),
+                },
+            }
+        }
+    };
+
+    let model_params = LlamaModelParams::default()
+        .with_vocab_only(true)
+        .with_n_gpu_layers(0);
+
+    let model = LlamaModel::load_from_file(backend, &weights_path, &model_params)
+        .map_err(|e| format!("Failed to load vocab: {}", e))?;
+
+    let tokens_list = model
+        .str_to_token(prompt, AddBos::Always)
+        .map_err(|e| e.to_string())?;
+    Ok(tokens_list.len())
 }
 
 pub struct LlamaCppEngine {
@@ -245,7 +293,7 @@ impl LlamaCppEngine {
 
                             let compute_margin: u64 = LLAMA_CPP_COMPUTE_MARGIN_BYTES;
                             let mut final_ctx_len =
-                                required_ctx.max(2048).min(config.max_context_len);
+                                required_ctx.min(config.max_context_len).max(2048);
                             let mut n_gpu_layers = config.num_layers as u32;
                             let weights_vram_cost_est =
                                 (config.size_on_disk_gb * 1024.0 * 1024.0 * 1024.0) as u64;
@@ -522,7 +570,7 @@ impl InferenceBackend for LlamaCppEngine {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_tx
             .send(EngineCommand::LoadModel {
-                config: config.clone(),
+                config: Box::new(config.clone()),
                 status,
                 strategy: strategy.clone(),
                 required_ctx,
