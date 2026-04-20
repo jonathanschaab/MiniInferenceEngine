@@ -559,7 +559,10 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
 
         let mut configs = Vec::new();
         for h in handles {
-            configs.push(h.await.unwrap());
+            match h.await {
+                Ok(config) => configs.push(config),
+                Err(e) => println!("⚠️ WARNING: Task failed to join during model resolution: {}", e),
+            }
         }
 
         lock.write().await.extend(configs);
