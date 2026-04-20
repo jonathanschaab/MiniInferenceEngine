@@ -303,6 +303,23 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     ..Default::default()
                 },
             },
+            ModelRegistration {
+                id: "qwen-3.6-35b-a3b",
+                name: "Qwen 3.6 (35B-A3B)",
+                repo: "unsloth/Qwen3.6-35B-A3B-GGUF",
+                tokenizer_repo: "Qwen/Qwen3.6-35B-A3B",
+                filename: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+                roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 35.0,
+                non_layer_params_billions: 1.5,
+                overrides: ModelOverrides {
+                    ..Default::default()
+                },
+            },
         ];
 
         let mut handles = Vec::new();
@@ -358,8 +375,12 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                             Ok(config_path) => {
                                 if let Ok(config_str) = tokio::fs::read_to_string(config_path).await
                                     && let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                                        let get_val = |key: &str| -> Option<&serde_json::Value> {
+                                            json.get("text_config").and_then(|tc| tc.get(key)).or_else(|| json.get(key))
+                                        };
+
                                         let get_u64 = |key: &str| -> Option<usize> {
-                                            match json.get(key) {
+                                            match get_val(key) {
                                                 Some(val) if !val.is_null() => {
                                                     if let Some(v) = val.as_u64() {
                                                         Some(v as usize)
@@ -378,7 +399,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                         };
 
                                         let get_str = |key: &str| -> Option<String> {
-                                            match json.get(key) {
+                                            match get_val(key) {
                                                 Some(val) if !val.is_null() => {
                                                     if let Some(v) = val.as_str() {
                                                         Some(v.to_string())
@@ -401,7 +422,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                             && let Some(model_type) = get_str("model_type") {
                                                 arch = match model_type.as_str() {
                                                     "llama" => Some(ModelArch::Llama),
-                                                    "qwen2" => Some(ModelArch::Qwen2),
+                                                    "qwen2" | "qwen3_5_moe" | "qwen3_5_moe_text" => Some(ModelArch::Qwen2),
                                                     "xlm-roberta" => Some(ModelArch::XLMRoberta),
                                                     "gpt_oss" => Some(ModelArch::GptOss),
                                                     _ => {
@@ -432,7 +453,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                             }
                                         }
                                         if (rope_scaling_factor.is_none() || original_max_position_embeddings.is_none())
-                                            && let Some(rope_scaling) = json.get("rope_scaling")
+                                        && let Some(rope_scaling) = get_val("rope_scaling")
                                                 && rope_scaling.is_object() {
                                                     if rope_scaling_factor.is_none()
                                                         && let Some(factor) = rope_scaling.get("factor").and_then(|v| v.as_f64()) {
