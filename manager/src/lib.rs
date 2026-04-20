@@ -70,26 +70,7 @@ pub async fn wait_for_vram_release(
     );
 }
 
-async fn get_exact_token_count(
-    prompt: &str,
-    config: &ModelConfig,
-    target_btype: &BackendType,
-    tokenizer: &Tokenizer,
-) -> usize {
-    if *target_btype == BackendType::LlamaCpp {
-        #[cfg(feature = "backend-llamacpp")]
-        {
-            let cfg = config.clone();
-            let p = prompt.to_string();
-            let res = tokio::task::spawn_blocking(move || {
-                crate::backend_llamacpp::count_tokens_vocab_only(&cfg, &p)
-            })
-            .await;
-            if let Ok(Ok(count)) = res {
-                return count;
-            }
-        }
-    }
+fn get_exact_token_count(prompt: &str, tokenizer: &Tokenizer) -> usize {
     tokenizer
         .encode(prompt.to_string(), true)
         .map(|enc| enc.get_ids().len())
@@ -340,13 +321,7 @@ pub async fn run_batcher_loop(
         let target_backend_name = format!("{:?}", target_btype);
 
         let formatted_prompt_pre = config_for_prompt.arch.format_chat(&request.messages);
-        let token_count_pre = get_exact_token_count(
-            &formatted_prompt_pre,
-            &config_for_prompt,
-            &target_btype,
-            &tokenizer,
-        )
-        .await;
+        let token_count_pre = get_exact_token_count(&formatted_prompt_pre, &tokenizer);
         let actual_required_ctx = (token_count_pre + requested_max_tokens).max(2048);
         let target_allocated_ctx = actual_required_ctx + ctx_buffer;
 
@@ -526,8 +501,7 @@ pub async fn run_batcher_loop(
         let mut formatted_prompt = config.arch.format_chat(&request.messages);
 
         // Exact token count using the active backend's tokenizer if available
-        let mut token_count =
-            get_exact_token_count(&formatted_prompt, config, &target_btype, &tokenizer).await;
+        let mut token_count = get_exact_token_count(&formatted_prompt, &tokenizer);
 
         // --- THE DYNAMIC MEMORY MANAGER ---
         let mut trigger_compression = false;
@@ -884,8 +858,7 @@ pub async fn run_batcher_loop(
             }
 
             formatted_prompt = config.arch.format_chat(&new_messages);
-            token_count =
-                get_exact_token_count(&formatted_prompt, config, &target_btype, &tokenizer).await;
+            token_count = get_exact_token_count(&formatted_prompt, &tokenizer);
         }
 
         println!("📥 Processing prompt...");

@@ -163,7 +163,10 @@ struct ModelRegistration {
 pub fn get_model_registry() -> &'static [ModelConfig] {
     static REGISTRY: OnceLock<Vec<ModelConfig>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let api = Api::new().expect("Failed to init HF API");
+        let api_opt = Api::new().ok();
+        if api_opt.is_none() {
+            println!("⚠️ WARNING: Failed to init HF API. Offline mode fallback active.");
+        }
         let cache = hf_hub::Cache::default();
 
         let registrations = vec![
@@ -307,242 +310,255 @@ pub fn get_model_registry() -> &'static [ModelConfig] {
             },
         ];
 
-        let mut configs = Vec::new();
+        let configs: Vec<ModelConfig> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
 
-        for reg in registrations {
-            let mut provenance = std::collections::HashMap::new();
+            for reg in registrations {
+                let api_ref = api_opt.as_ref();
+                let cache_ref = &cache;
 
-            let mut arch = reg.overrides.arch;
-            let mut kv_cache_dtype = reg.overrides.kv_cache_dtype;
-            let mut max_context_len = reg.overrides.max_context_len;
-            let mut sliding_window = reg.overrides.sliding_window;
-            let mut rope_scaling_factor = reg.overrides.rope_scaling_factor;
-            let mut original_max_position_embeddings = reg.overrides.original_max_position_embeddings;
-            let mut num_layers = reg.overrides.num_layers;
-            let mut n_embd = reg.overrides.n_embd;
-            let mut n_head = reg.overrides.n_head;
-            let mut n_head_kv = reg.overrides.n_head_kv;
-            let mut head_dim = reg.overrides.head_dim;
-            let mut size_on_disk_gb = reg.overrides.size_on_disk_gb;
+                handles.push(s.spawn(move || {
+                    let mut provenance = std::collections::HashMap::new();
 
-            let mut check_override = |opt: bool, name: &str| {
-                if opt { provenance.insert(name.to_string(), "override".to_string()); }
-            };
-            check_override(arch.is_some(), "arch");
-            check_override(kv_cache_dtype.is_some(), "kv_cache_dtype");
-            check_override(max_context_len.is_some(), "max_context_len");
-            check_override(sliding_window.is_some(), "sliding_window");
-            check_override(rope_scaling_factor.is_some(), "rope_scaling_factor");
-            check_override(original_max_position_embeddings.is_some(), "original_max_position_embeddings");
-            check_override(num_layers.is_some(), "num_layers");
-            check_override(n_embd.is_some(), "n_embd");
-            check_override(n_head.is_some(), "n_head");
-            check_override(n_head_kv.is_some(), "n_head_kv");
-            check_override(head_dim.is_some(), "head_dim");
-            check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
+                    let mut arch = reg.overrides.arch;
+                    let mut kv_cache_dtype = reg.overrides.kv_cache_dtype;
+                    let mut max_context_len = reg.overrides.max_context_len;
+                    let mut sliding_window = reg.overrides.sliding_window;
+                    let mut rope_scaling_factor = reg.overrides.rope_scaling_factor;
+                    let mut original_max_position_embeddings = reg.overrides.original_max_position_embeddings;
+                    let mut num_layers = reg.overrides.num_layers;
+                    let mut n_embd = reg.overrides.n_embd;
+                    let mut n_head = reg.overrides.n_head;
+                    let mut n_head_kv = reg.overrides.n_head_kv;
+                    let mut head_dim = reg.overrides.head_dim;
+                    let mut size_on_disk_gb = reg.overrides.size_on_disk_gb;
 
-            // 1. Check if GGUF is cached locally to get exact size instantly
-            if size_on_disk_gb.is_none()
-                && let Some(gguf_path) = cache.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename)
-                    && let Ok(meta) = std::fs::metadata(&gguf_path) {
-                        size_on_disk_gb = Some(meta.len() as f32 / 1024.0 / 1024.0 / 1024.0);
-                    provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
-                    }
+                    let mut check_override = |opt: bool, name: &str| {
+                        if opt { provenance.insert(name.to_string(), "override".to_string()); }
+                    };
+                    check_override(arch.is_some(), "arch");
+                    check_override(kv_cache_dtype.is_some(), "kv_cache_dtype");
+                    check_override(max_context_len.is_some(), "max_context_len");
+                    check_override(sliding_window.is_some(), "sliding_window");
+                    check_override(rope_scaling_factor.is_some(), "rope_scaling_factor");
+                    check_override(original_max_position_embeddings.is_some(), "original_max_position_embeddings");
+                    check_override(num_layers.is_some(), "num_layers");
+                    check_override(n_embd.is_some(), "n_embd");
+                    check_override(n_head.is_some(), "n_head");
+                    check_override(n_head_kv.is_some(), "n_head_kv");
+                    check_override(head_dim.is_some(), "head_dim");
+                    check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
 
-            // 2. Fetch config.json from tokenizer repo to dynamically populate architectural details
-            if num_layers.is_none() || n_head.is_none() || arch.is_none() || kv_cache_dtype.is_none() || max_context_len.is_none() || sliding_window.is_none() || rope_scaling_factor.is_none() || original_max_position_embeddings.is_none() {
-                match api.model(reg.tokenizer_repo.to_string()).get("config.json") {
-                    Ok(config_path) => {
-                        if let Ok(config_str) = std::fs::read_to_string(config_path)
-                            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                            let get_u64 = |key: &str| -> Option<usize> {
-                                match json.get(key) {
-                                    Some(val) if !val.is_null() => {
-                                        if let Some(v) = val.as_u64() {
-                                            Some(v as usize)
-                                        } else {
-                                            println!("⚠️ WARNING: Invalid format for '{}' in config.json for {}", key, reg.id);
-                                            None
-                                        }
-                                    }
-                                    _ => {
-                                        if key != "head_dim" && key != "num_key_value_heads" && key != "sliding_window" {
-                                            println!("⚠️ WARNING: Missing '{}' in config.json for {}", key, reg.id);
-                                        }
-                                        None
-                                    }
-                                }
-                            };
-
-                            let get_str = |key: &str| -> Option<String> {
-                                match json.get(key) {
-                                    Some(val) if !val.is_null() => {
-                                        if let Some(v) = val.as_str() {
-                                            Some(v.to_string())
-                                        } else {
-                                            println!("⚠️ WARNING: Invalid format for '{}' in config.json for {}", key, reg.id);
-                                            None
-                                        }
-                                    }
-                                    _ => {
-                                        if key != "dtype" && key != "torch_dtype" {
-                                            println!("⚠️ WARNING: Missing '{}' in config.json for {}", key, reg.id);
-                                        }
-                                        None
-                                    }
-                                }
-                            };
-
-                            // 1. Resolve arch first to inform subsequent parsing rules
-                            if arch.is_none()
-                                && let Some(model_type) = get_str("model_type") {
-                                    arch = match model_type.as_str() {
-                                        "llama" => Some(ModelArch::Llama),
-                                        "qwen2" => Some(ModelArch::Qwen2),
-                                        "xlm-roberta" => Some(ModelArch::XLMRoberta),
-                                        "gpt_oss" => Some(ModelArch::GptOss),
-                                        _ => {
-                                            println!("⚠️ WARNING: Unrecognized 'model_type' ({}) in config.json for {}", model_type, reg.id);
-                                            None
-                                        }
-                                    };
-                                    if arch.is_some() {
-                                        provenance.insert("arch".to_string(), "config.json".to_string());
-                                    }
-                                }
-
-                            if max_context_len.is_none()
-                                && let Some(v) = get_u64("max_position_embeddings")
-                                    .or_else(|| get_u64("model_max_length"))
-                                    .or_else(|| get_u64("max_sequence_length"))
-                                    .or_else(|| get_u64("max_seq_len"))
-                                    .or_else(|| get_u64("seq_length")) {
-                                    max_context_len = Some(v);
-                                    provenance.insert("max_context_len".to_string(), "config.json".to_string());
-                                }
-                            if sliding_window.is_none() && arch == Some(ModelArch::Qwen2) {
-                                if let Some(v) = get_u64("sliding_window") {
-                                    sliding_window = Some(v);
-                                    provenance.insert("sliding_window".to_string(), "config.json".to_string());
-                                } else {
-                                    println!("⚠️ WARNING: Missing 'sliding_window' in config.json for {}", reg.id);
-                                }
+                    // 1. Check if GGUF is cached locally to get exact size instantly
+                    if size_on_disk_gb.is_none()
+                        && let Some(gguf_path) = cache_ref.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename)
+                            && let Ok(meta) = std::fs::metadata(&gguf_path) {
+                                size_on_disk_gb = Some(meta.len() as f32 / 1024.0 / 1024.0 / 1024.0);
+                            provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
                             }
-                            if (rope_scaling_factor.is_none() || original_max_position_embeddings.is_none())
-                                && let Some(rope_scaling) = json.get("rope_scaling")
-                                    && rope_scaling.is_object() {
-                                        if rope_scaling_factor.is_none()
-                                            && let Some(factor) = rope_scaling.get("factor").and_then(|v| v.as_f64()) {
-                                                rope_scaling_factor = Some(factor as f32);
-                                                provenance.insert("rope_scaling_factor".to_string(), "config.json".to_string());
+
+                    // 2. Fetch config.json from tokenizer repo to dynamically populate architectural details
+                    if num_layers.is_none() || n_head.is_none() || arch.is_none() || kv_cache_dtype.is_none() || max_context_len.is_none() || sliding_window.is_none() || rope_scaling_factor.is_none() || original_max_position_embeddings.is_none() {
+                        if let Some(api) = api_ref {
+                            match api.model(reg.tokenizer_repo.to_string()).get("config.json") {
+                                Ok(config_path) => {
+                                    if let Ok(config_str) = std::fs::read_to_string(config_path)
+                                        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                                        let get_u64 = |key: &str| -> Option<usize> {
+                                            match json.get(key) {
+                                                Some(val) if !val.is_null() => {
+                                                    if let Some(v) = val.as_u64() {
+                                                        Some(v as usize)
+                                                    } else {
+                                                        println!("⚠️ WARNING: Invalid format for '{}' in config.json for {}", key, reg.id);
+                                                        None
+                                                    }
+                                                }
+                                                _ => {
+                                                    if key != "head_dim" && key != "num_key_value_heads" && key != "sliding_window" {
+                                                        println!("⚠️ WARNING: Missing '{}' in config.json for {}", key, reg.id);
+                                                    }
+                                                    None
+                                                }
                                             }
-                                        if original_max_position_embeddings.is_none()
-                                            && let Some(orig_ctx) = rope_scaling.get("original_max_position_embeddings").and_then(|v| v.as_u64()) {
-                                                original_max_position_embeddings = Some(orig_ctx as usize);
-                                                provenance.insert("original_max_position_embeddings".to_string(), "config.json".to_string());
+                                        };
+
+                                        let get_str = |key: &str| -> Option<String> {
+                                            match json.get(key) {
+                                                Some(val) if !val.is_null() => {
+                                                    if let Some(v) = val.as_str() {
+                                                        Some(v.to_string())
+                                                    } else {
+                                                        println!("⚠️ WARNING: Invalid format for '{}' in config.json for {}", key, reg.id);
+                                                        None
+                                                    }
+                                                }
+                                                _ => {
+                                                    if key != "dtype" && key != "torch_dtype" {
+                                                        println!("⚠️ WARNING: Missing '{}' in config.json for {}", key, reg.id);
+                                                    }
+                                                    None
+                                                }
                                             }
-                                    }
-                            if num_layers.is_none()
-                                && let Some(v) = get_u64("num_hidden_layers") {
-                                    num_layers = Some(v);
-                                    provenance.insert("num_layers".to_string(), "config.json".to_string());
-                                }
-                            if n_embd.is_none()
-                                && let Some(v) = get_u64("hidden_size") {
-                                    n_embd = Some(v);
-                                    provenance.insert("n_embd".to_string(), "config.json".to_string());
-                                }
-                            if n_head.is_none()
-                                && let Some(v) = get_u64("num_attention_heads") {
-                                    n_head = Some(v);
-                                    provenance.insert("n_head".to_string(), "config.json".to_string());
-                                }
-                            if n_head_kv.is_none()
-                                && let Some(v) = get_u64("num_key_value_heads").or(n_head) {
-                                    n_head_kv = Some(v);
-                                    provenance.insert("n_head_kv".to_string(), "config.json".to_string());
-                                }
-                            if head_dim.is_none()
-                                && let Some(v) = get_u64("head_dim") {
-                                    head_dim = Some(v);
-                                    provenance.insert("head_dim".to_string(), "config.json".to_string());
-                                }
-                            if kv_cache_dtype.is_none() {
-                                if let Some(dt) = get_str("dtype").or_else(|| get_str("torch_dtype")) {
-                                    kv_cache_dtype = match dt.as_str() {
-                                        "float16" => Some(ModelDType::F16),
-                                        "bfloat16" => Some(ModelDType::BF16),
-                                        "float32" => Some(ModelDType::F32),
-                                        _ => {
-                                            println!("⚠️ WARNING: Unrecognized dtype ({}) in config.json for {}", dt, reg.id);
-                                            None
+                                        };
+
+                                        // 1. Resolve arch first to inform subsequent parsing rules
+                                        if arch.is_none()
+                                            && let Some(model_type) = get_str("model_type") {
+                                                arch = match model_type.as_str() {
+                                                    "llama" => Some(ModelArch::Llama),
+                                                    "qwen2" => Some(ModelArch::Qwen2),
+                                                    "xlm-roberta" => Some(ModelArch::XLMRoberta),
+                                                    "gpt_oss" => Some(ModelArch::GptOss),
+                                                    _ => {
+                                                        println!("⚠️ WARNING: Unrecognized 'model_type' ({}) in config.json for {}", model_type, reg.id);
+                                                        None
+                                                    }
+                                                };
+                                                if arch.is_some() {
+                                                    provenance.insert("arch".to_string(), "config.json".to_string());
+                                                }
+                                            }
+
+                                        if max_context_len.is_none()
+                                            && let Some(v) = get_u64("max_position_embeddings")
+                                                .or_else(|| get_u64("model_max_length"))
+                                                .or_else(|| get_u64("max_sequence_length"))
+                                                .or_else(|| get_u64("max_seq_len"))
+                                                .or_else(|| get_u64("seq_length")) {
+                                                max_context_len = Some(v);
+                                                provenance.insert("max_context_len".to_string(), "config.json".to_string());
+                                            }
+                                        if sliding_window.is_none() && arch == Some(ModelArch::Qwen2) {
+                                            if let Some(v) = get_u64("sliding_window") {
+                                                sliding_window = Some(v);
+                                                provenance.insert("sliding_window".to_string(), "config.json".to_string());
+                                            } else {
+                                                println!("⚠️ WARNING: Missing 'sliding_window' in config.json for {}", reg.id);
+                                            }
                                         }
-                                    };
-                                    if kv_cache_dtype.is_some() {
-                                        provenance.insert("kv_cache_dtype".to_string(), "config.json".to_string());
+                                        if (rope_scaling_factor.is_none() || original_max_position_embeddings.is_none())
+                                            && let Some(rope_scaling) = json.get("rope_scaling")
+                                                && rope_scaling.is_object() {
+                                                    if rope_scaling_factor.is_none()
+                                                        && let Some(factor) = rope_scaling.get("factor").and_then(|v| v.as_f64()) {
+                                                            rope_scaling_factor = Some(factor as f32);
+                                                            provenance.insert("rope_scaling_factor".to_string(), "config.json".to_string());
+                                                        }
+                                                    if original_max_position_embeddings.is_none()
+                                                        && let Some(orig_ctx) = rope_scaling.get("original_max_position_embeddings").and_then(|v| v.as_u64()) {
+                                                            original_max_position_embeddings = Some(orig_ctx as usize);
+                                                            provenance.insert("original_max_position_embeddings".to_string(), "config.json".to_string());
+                                                        }
+                                                }
+                                        if num_layers.is_none()
+                                            && let Some(v) = get_u64("num_hidden_layers") {
+                                                num_layers = Some(v);
+                                                provenance.insert("num_layers".to_string(), "config.json".to_string());
+                                            }
+                                        if n_embd.is_none()
+                                            && let Some(v) = get_u64("hidden_size") {
+                                                n_embd = Some(v);
+                                                provenance.insert("n_embd".to_string(), "config.json".to_string());
+                                            }
+                                        if n_head.is_none()
+                                            && let Some(v) = get_u64("num_attention_heads") {
+                                                n_head = Some(v);
+                                                provenance.insert("n_head".to_string(), "config.json".to_string());
+                                            }
+                                        if n_head_kv.is_none()
+                                            && let Some(v) = get_u64("num_key_value_heads").or(n_head) {
+                                                n_head_kv = Some(v);
+                                                provenance.insert("n_head_kv".to_string(), "config.json".to_string());
+                                            }
+                                        if head_dim.is_none()
+                                            && let Some(v) = get_u64("head_dim") {
+                                                head_dim = Some(v);
+                                                provenance.insert("head_dim".to_string(), "config.json".to_string());
+                                            }
+                                        if kv_cache_dtype.is_none() {
+                                            if let Some(dt) = get_str("dtype").or_else(|| get_str("torch_dtype")) {
+                                                kv_cache_dtype = match dt.as_str() {
+                                                    "float16" => Some(ModelDType::F16),
+                                                    "bfloat16" => Some(ModelDType::BF16),
+                                                    "float32" => Some(ModelDType::F32),
+                                                    _ => {
+                                                        println!("⚠️ WARNING: Unrecognized dtype ({}) in config.json for {}", dt, reg.id);
+                                                        None
+                                                    }
+                                                };
+                                                if kv_cache_dtype.is_some() {
+                                                    provenance.insert("kv_cache_dtype".to_string(), "config.json".to_string());
+                                                }
+                                            } else {
+                                                println!("⚠️ WARNING: Missing both 'dtype' and 'torch_dtype' in config.json for {}", reg.id);
+                                            }
+                                        }
                                     }
-                                } else {
-                                    println!("⚠️ WARNING: Missing both 'dtype' and 'torch_dtype' in config.json for {}", reg.id);
                                 }
+                                Err(e) => println!("⚠️ WARNING: Failed to fetch config.json for {}: {}", reg.id, e),
                             }
+                        } else {
+                            println!("⚠️ WARNING: HF API not initialized, skipping remote config.json fetch for {}", reg.id);
                         }
                     }
-                    Err(e) => println!("⚠️ WARNING: Failed to fetch config.json for {}: {}", reg.id, e),
-                }
+
+                    let n_head_val = n_head.unwrap_or(1);
+                    let n_embd_val = n_embd.unwrap_or(4096);
+
+                    for name in &["arch", "kv_cache_dtype", "max_context_len", "sliding_window", "rope_scaling_factor", "original_max_position_embeddings", "num_layers", "n_embd", "n_head", "n_head_kv", "head_dim", "size_on_disk_gb"] {
+                        if !provenance.contains_key(*name) {
+                            provenance.insert(name.to_string(), "fallback".to_string());
                         }
+                    }
 
-            let n_head_val = n_head.unwrap_or(1);
-            let n_embd_val = n_embd.unwrap_or(4096);
+                    let arch_val = arch.unwrap_or(ModelArch::Llama);
+                    let max_context_len_val = max_context_len.unwrap_or(8192);
 
-            for name in &["arch", "kv_cache_dtype", "max_context_len", "sliding_window", "rope_scaling_factor", "original_max_position_embeddings", "num_layers", "n_embd", "n_head", "n_head_kv", "head_dim", "size_on_disk_gb"] {
-                if !provenance.contains_key(*name) {
-                    provenance.insert(name.to_string(), "fallback".to_string());
-                }
+                    let mut max_yarn_context = max_context_len_val;
+                    if arch_val == ModelArch::Qwen2 {
+                        if let Some(sw) = sliding_window {
+                            max_yarn_context = max_yarn_context.max(sw);
+                        }
+                    } else if let (Some(factor), Some(orig_ctx)) = (rope_scaling_factor, original_max_position_embeddings) {
+                        let scaled_ctx = (orig_ctx as f32 * factor) as usize;
+                        max_yarn_context = max_yarn_context.max(scaled_ctx);
+                    }
+
+                    ModelConfig {
+                        id: reg.id.to_string(),
+                        name: reg.name.to_string(),
+                        repo: reg.repo.to_string(),
+                        tokenizer_repo: reg.tokenizer_repo.to_string(),
+                        filename: reg.filename.to_string(),
+                        roles: reg.roles,
+                        arch: arch_val,
+                        compression_dtype: reg.compression_dtype,
+                        kv_cache_dtype: kv_cache_dtype.unwrap_or(ModelDType::F16),
+                        supported_backends: reg.supported_backends,
+                        is_default_chat: reg.is_default_chat,
+                        is_default_compressor: reg.is_default_compressor,
+
+                        max_context_len: max_context_len_val,
+                        max_yarn_context,
+                        sliding_window,
+                        rope_scaling_factor,
+                        original_max_position_embeddings,
+                        num_layers: num_layers.unwrap_or(32),
+                        n_embd: n_embd_val,
+                        n_head: n_head_val,
+                        n_head_kv: n_head_kv.unwrap_or(n_head_val),
+                        head_dim: head_dim.unwrap_or(n_embd_val / n_head_val.max(1)),
+                        parameters_billions: reg.parameters_billions,
+                        non_layer_params_billions: reg.non_layer_params_billions,
+                        size_on_disk_gb: size_on_disk_gb.unwrap_or(5.0),
+                        provenance,
+                    }
+                }));
             }
 
-            let arch_val = arch.unwrap_or(ModelArch::Llama);
-            let max_context_len_val = max_context_len.unwrap_or(8192);
-
-            let mut max_yarn_context = max_context_len_val;
-            if arch_val == ModelArch::Qwen2 {
-                if let Some(sw) = sliding_window {
-                    max_yarn_context = max_yarn_context.max(sw);
-                }
-            } else if let (Some(factor), Some(orig_ctx)) = (rope_scaling_factor, original_max_position_embeddings) {
-                let scaled_ctx = (orig_ctx as f32 * factor) as usize;
-                max_yarn_context = max_yarn_context.max(scaled_ctx);
-            }
-
-            configs.push(ModelConfig {
-                id: reg.id.to_string(),
-                name: reg.name.to_string(),
-                repo: reg.repo.to_string(),
-                tokenizer_repo: reg.tokenizer_repo.to_string(),
-                filename: reg.filename.to_string(),
-                roles: reg.roles,
-                arch: arch_val,
-                compression_dtype: reg.compression_dtype,
-                kv_cache_dtype: kv_cache_dtype.unwrap_or(ModelDType::F16),
-                supported_backends: reg.supported_backends,
-                is_default_chat: reg.is_default_chat,
-                is_default_compressor: reg.is_default_compressor,
-
-                max_context_len: max_context_len_val,
-                max_yarn_context,
-                sliding_window,
-                rope_scaling_factor,
-                original_max_position_embeddings,
-                num_layers: num_layers.unwrap_or(32),
-                n_embd: n_embd_val,
-                n_head: n_head_val,
-                n_head_kv: n_head_kv.unwrap_or(n_head_val),
-                head_dim: head_dim.unwrap_or(n_embd_val / n_head_val.max(1)),
-                parameters_billions: reg.parameters_billions,
-                non_layer_params_billions: reg.non_layer_params_billions,
-                size_on_disk_gb: size_on_disk_gb.unwrap_or(5.0),
-                provenance,
-            });
-        }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
         configs
     })

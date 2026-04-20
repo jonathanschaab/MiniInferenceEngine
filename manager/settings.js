@@ -9,11 +9,11 @@ async function loadKeys() {
     const keys = await res.json();
     
     const tbody = document.getElementById('keys-tbody');
-    tbody.innerHTML = '';
+    let tbodyHtml = '';
     keys.forEach(record => {
         const shortHash = record.hash.substring(0, 16) + '...';
         const desc = record.description ? record.description : '<span style="color: #6c7086; font-style: italic;">None</span>';
-        tbody.innerHTML += `
+        tbodyHtml += `
             <tr>
                 <td style="font-weight: bold;">${record.name}</td>
                 <td>${desc}</td>
@@ -22,6 +22,7 @@ async function loadKeys() {
             </tr>
         `;
     });
+    tbody.innerHTML = DOMPurify.sanitize(tbodyHtml);
 }
 
 function openKeyModal() {

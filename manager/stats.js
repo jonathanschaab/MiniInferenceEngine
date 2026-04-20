@@ -26,7 +26,7 @@ async function openBenchmarkModal() {
             `;
             m.supported_backends.forEach(b => allBackends.add(b));
         });
-        listDiv.innerHTML = modelsHtml;
+        listDiv.innerHTML = DOMPurify.sanitize(modelsHtml);
         
         const backendDiv = document.getElementById('backend-checkbox-list');
         let backendsHtml = '';
@@ -35,7 +35,7 @@ async function openBenchmarkModal() {
                 <label class="model-item"><input type="checkbox" class="backend-cb" value="${b.toLowerCase()}" checked> ${b}</label>
             `;
         });
-        backendDiv.innerHTML = backendsHtml;
+        backendDiv.innerHTML = DOMPurify.sanitize(backendsHtml);
         
         // Add listeners to auto-grey out incompatible models
         document.querySelectorAll('.backend-cb').forEach(cb => {
@@ -151,7 +151,7 @@ function populateTable(models, loads) {
         theadHTML += `<th>Avg Load (${b})</th>`;
     });
     theadHTML += `</tr>`;
-    thead.innerHTML = theadHTML;
+    thead.innerHTML = DOMPurify.sanitize(theadHTML);
 
     const loadAverages = {};
     loads.forEach(l => {
@@ -162,6 +162,7 @@ function populateTable(models, loads) {
         loadAverages[l.model_id][b].count++;
     });
 
+    let tbodyHTML = '';
     models.forEach(m => {
         let rowHTML = `<tr>
             <td>${m.name}</td>
@@ -177,8 +178,9 @@ function populateTable(models, loads) {
             }
         });
         rowHTML += `</tr>`;
-        tbody.innerHTML += rowHTML;
+        tbodyHTML += rowHTML;
     });
+    tbody.innerHTML = DOMPurify.sanitize(tbodyHTML);
 }
 
 function renderSpeedChart(models, generations) {

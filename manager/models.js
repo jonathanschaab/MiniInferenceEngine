@@ -20,7 +20,7 @@ async function loadModels() {
             const rolesStr = model.roles.join(', ');
             const backendsStr = model.supported_backends.join(', ');
 
-            card.innerHTML = `
+            const cardHtml = `
                 <div class="model-header">
                     <div>
                         <h2 style="margin:0; color: #fab387;">${model.name}</h2>
@@ -44,6 +44,7 @@ async function loadModels() {
                     <div class="setting-item"><span>Size on Disk</span> <span>${model.size_on_disk_gb.toFixed(2)} GB ${getBadge(model.provenance.size_on_disk_gb)}</span></div>
                 </div>
             `;
+            card.innerHTML = DOMPurify.sanitize(cardHtml, { ADD_ATTR: ['target'] });
             container.appendChild(card);
         });
     } catch (e) {

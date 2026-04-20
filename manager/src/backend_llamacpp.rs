@@ -190,40 +190,6 @@ where
     Ok((output, tok_time))
 }
 
-pub fn count_tokens_vocab_only(config: &ModelConfig, prompt: &str) -> Result<usize, String> {
-    let api = hf_hub::api::sync::Api::new().map_err(|e| e.to_string())?;
-    let repo = api.model(config.repo.clone());
-    let weights_path = repo
-        .get(&config.filename)
-        .map_err(|e| format!("Missing weights: {}", e))?;
-
-    let backend = match LLAMA_BACKEND.get() {
-        Some(b) => b,
-        None => {
-            let _guard = LLAMA_BACKEND_INIT_MUTEX.lock().unwrap();
-            match LLAMA_BACKEND.get() {
-                Some(b) => b,
-                None => match LlamaBackend::init() {
-                    Ok(b) => LLAMA_BACKEND.get_or_init(|| b),
-                    Err(e) => return Err(format!("Failed to init llama backend: {}", e)),
-                },
-            }
-        }
-    };
-
-    let model_params = LlamaModelParams::default()
-        .with_vocab_only(true)
-        .with_n_gpu_layers(0);
-
-    let model = LlamaModel::load_from_file(backend, &weights_path, &model_params)
-        .map_err(|e| format!("Failed to load vocab: {}", e))?;
-
-    let tokens_list = model
-        .str_to_token(prompt, AddBos::Always)
-        .map_err(|e| e.to_string())?;
-    Ok(tokens_list.len())
-}
-
 pub struct LlamaCppEngine {
     command_tx: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     offload_pct: f32,
