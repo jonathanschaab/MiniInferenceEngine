@@ -375,9 +375,12 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                             Ok(config_path) => {
                                 if let Ok(config_str) = tokio::fs::read_to_string(config_path).await
                                     && let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                                        let get_val = |key: &str| -> Option<&serde_json::Value> {
+                                            json.get("text_config").and_then(|tc| tc.get(key)).or_else(|| json.get(key))
+                                        };
+
                                         let get_u64 = |key: &str| -> Option<usize> {
-                                            let val_opt = json.get("text_config").and_then(|tc| tc.get(key)).or_else(|| json.get(key));
-                                            match val_opt {
+                                            match get_val(key) {
                                                 Some(val) if !val.is_null() => {
                                                     if let Some(v) = val.as_u64() {
                                                         Some(v as usize)
@@ -396,8 +399,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                         };
 
                                         let get_str = |key: &str| -> Option<String> {
-                                            let val_opt = json.get("text_config").and_then(|tc| tc.get(key)).or_else(|| json.get(key));
-                                            match val_opt {
+                                            match get_val(key) {
                                                 Some(val) if !val.is_null() => {
                                                     if let Some(v) = val.as_str() {
                                                         Some(v.to_string())
@@ -451,7 +453,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                             }
                                         }
                                         if (rope_scaling_factor.is_none() || original_max_position_embeddings.is_none())
-                                        && let Some(rope_scaling) = json.get("text_config").and_then(|tc| tc.get("rope_scaling")).or_else(|| json.get("rope_scaling"))
+                                        && let Some(rope_scaling) = get_val("rope_scaling")
                                                 && rope_scaling.is_object() {
                                                     if rope_scaling_factor.is_none()
                                                         && let Some(factor) = rope_scaling.get("factor").and_then(|v| v.as_f64()) {
