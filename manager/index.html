@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mini Inference Engine</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
     <link rel="stylesheet" href="/css/common.css">
     <style>
         /* Page Layout */
@@ -77,6 +78,7 @@
     <header>
         <h1>Mini Inference Engine <span id="engine-status-indicator" class="status"></span></h1>
         <div style="display: flex; gap: 15px; align-items: center;">
+            <button onclick="window.location.href='/models'" style="background: #fab387; height: 30px; padding: 0 10px;">🤖 Models</button>
             <button onclick="window.location.href='/memory'" style="background: #f9e2af; height: 30px; padding: 0 10px;">💾 Memory</button>
             <button onclick="window.location.href='/stats'" style="background: #cba6f7; height: 30px; padding: 0 10px;">📊 Stats</button>
             <button onclick="window.location.href='/settings'" style="background: #a6e3a1; height: 30px; padding: 0 10px;">⚙️ Settings</button>
@@ -128,6 +130,10 @@
                 <option value="offload">CPU Offload (Max Context)</option>
                 <option value="compress">Compression (Max Speed)</option>
             </select>
+        </div>
+        <div class="param-group">
+            <label for="param-yarn-enabled">YaRN Extension:</label>
+            <input type="checkbox" id="param-yarn-enabled" checked style="width: 20px; height: 20px; cursor: pointer;">
         </div>
     </div>
 

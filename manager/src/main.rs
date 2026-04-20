@@ -87,7 +87,7 @@ async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>
 
 // Send the model roster to the Javascript dropdowns
 async fn get_models() -> Json<Vec<ModelConfig>> {
-    Json(get_model_registry().to_vec())
+    Json(get_model_registry().await)
 }
 
 // Handle incoming chat requests
@@ -170,7 +170,7 @@ async fn trigger_benchmark(
 
     tokio::spawn(async move {
         println!("🚀 Starting Automated Benchmark Suite...");
-        let full_registry = get_model_registry();
+        let full_registry = get_model_registry().await;
 
         let default_compressor = full_registry
             .iter()
@@ -604,6 +604,13 @@ async fn serve_settings_ui(
     Ok(Html(include_str!("../settings.html")))
 }
 
+async fn serve_models_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok(Html(include_str!("../models.html")))
+}
+
 async fn serve_memory_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
@@ -622,6 +629,13 @@ async fn serve_stats_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../stats.js"),
+    )
+}
+
+async fn serve_models_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../models.js"),
     )
 }
 
@@ -756,6 +770,11 @@ async fn main() {
     let reqwest_client = reqwest::Client::new();
     let oauth_client = auth::build_oauth_client(&config.oauth_redirect_uri);
 
+    // Eagerly initialize the model registry in the background
+    tokio::spawn(async {
+        manager::get_model_registry().await;
+    });
+
     let shared_state = Arc::new(AppState {
         queue_tx: tx,
         engine_status,
@@ -782,9 +801,11 @@ async fn main() {
         // Protected UIs (They redirect if session is missing)
         .route("/", get(serve_ui))
         .route("/settings", get(serve_settings_ui))
+        .route("/models", get(serve_models_ui))
         .route("/stats", get(serve_stats_ui))
         .route("/memory", get(serve_memory_ui))
         .route("/js/chat.js", get(serve_chat_js))
+        .route("/js/models.js", get(serve_models_js))
         .route("/js/stats.js", get(serve_stats_js))
         .route("/js/settings.js", get(serve_settings_js))
         .route("/js/memory.js", get(serve_memory_js))

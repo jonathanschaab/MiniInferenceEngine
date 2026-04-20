@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Engine Telemetry</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
     <link rel="stylesheet" href="/css/common.css">
     <style>
         .chart-container { background: #181825; padding: 20px; border-radius: 8px; margin-bottom: 30px; height: 400px; }
@@ -18,6 +19,7 @@
         <h1>Engine Telemetry Dashboard</h1>
         <div style="display: flex; gap: 15px; align-items: center;">
             <button onclick="window.location.href='/'" style="background: #89b4fa; height: 30px; padding: 0 10px;">💬 Chat</button>
+            <button onclick="window.location.href='/models'" style="background: #fab387; height: 30px; padding: 0 10px;">🤖 Models</button>
             <button onclick="window.location.href='/memory'" style="background: #f9e2af; height: 30px; padding: 0 10px;">💾 Memory</button>
             <button onclick="window.location.href='/settings'" style="background: #a6e3a1; height: 30px; padding: 0 10px;">⚙️ Settings</button>
             <button onclick="window.location.href='/auth/logout'" style="background: #45475a; color: white; height: 30px; padding: 0 10px;">Logout</button>
@@ -59,6 +61,10 @@
             <label for="param-context-buffer">Ctx Buffer:</label>
             <input type="number" id="param-context-buffer" min="0" max="128000" value="1024" style="width: 80px;">
         </div>
+        <div class="param-group">
+            <label for="param-yarn-enabled">YaRN Extension:</label>
+            <input type="checkbox" id="param-yarn-enabled" checked style="width: 20px; height: 20px; cursor: pointer;">
+        </div>
     </div>
 
     <div style="padding: 20px;">
@@ -93,11 +99,11 @@
 
         <div id="benchmark-modal" class="modal-overlay">
             <div class="modal-content">
-                <h2>Select Models to Benchmark</h2>
-                <div id="model-checkbox-list" class="model-list">
-                </div>
                 <h2>Select Backends</h2>
-                <div id="backend-checkbox-list" class="model-list" style="margin-bottom: 20px;">
+                <div id="backend-checkbox-list" class="model-list">
+                </div>
+                <h2>Select Models to Benchmark</h2>
+                <div id="model-checkbox-list" class="model-list" style="margin-bottom: 20px;">
                 </div>
                 <div class="modal-actions">
                     <button class="btn-cancel" onclick="closeModal()">Cancel</button>

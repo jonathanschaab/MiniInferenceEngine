@@ -226,6 +226,7 @@ pub struct GenerationParameters {
     pub seed: Option<u64>,
     pub memory_strategy: Option<MemoryStrategy>,
     pub context_buffer: Option<usize>,
+    pub yarn_enabled: Option<bool>,
 }
 
 impl Default for GenerationParameters {
@@ -238,6 +239,7 @@ impl Default for GenerationParameters {
             seed: None,
             memory_strategy: Some(MemoryStrategy::Offload),
             context_buffer: Some(1024),
+            yarn_enabled: Some(true),
         }
     }
 }

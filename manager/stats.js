@@ -12,27 +12,38 @@ async function openBenchmarkModal() {
         const models = await res.json();
         
         const listDiv = document.getElementById('model-checkbox-list');
-        listDiv.innerHTML = ''; // Clear previous list
         
         const allBackends = new Set();
+        let modelsHtml = '';
         models.forEach(m => {
-            listDiv.innerHTML += `
+            const backendsStr = DOMPurify.sanitize(m.supported_backends.map(b => b.toLowerCase()).join(','));
+            modelsHtml += `
                 <label class="model-item">
-                    <input type="checkbox" value="${m.id}" checked>
-                    ${m.name} <span style="color: #6c7086; margin-left: 5px;">(${m.arch})</span>
+                    <input type="checkbox" class="model-cb" value="${DOMPurify.sanitize(m.id)}" data-backends="${backendsStr}" checked>
+                    ${DOMPurify.sanitize(m.name)} <span style="color: #6c7086; margin-left: 5px;">(${DOMPurify.sanitize(m.arch)})</span>
+                    <span class="incompatible-warning" style="display: none; color: #f38ba8; margin-left: auto; font-size: 0.85em; font-style: italic;">(Incompatible)</span>
                 </label>
             `;
             m.supported_backends.forEach(b => allBackends.add(b));
         });
+        listDiv.innerHTML = modelsHtml;
         
         const backendDiv = document.getElementById('backend-checkbox-list');
-        backendDiv.innerHTML = '';
+        let backendsHtml = '';
         allBackends.forEach(b => {
-            backendDiv.innerHTML += `
-                <label class="model-item"><input type="checkbox" value="${b}" checked> ${b}</label>
+            backendsHtml += `
+                <label class="model-item"><input type="checkbox" class="backend-cb" value="${DOMPurify.sanitize(b.toLowerCase())}" checked> ${DOMPurify.sanitize(b)}</label>
             `;
         });
+        backendDiv.innerHTML = backendsHtml;
         
+        // Add listeners to auto-grey out incompatible models
+        document.querySelectorAll('.backend-cb').forEach(cb => {
+            cb.addEventListener('change', updateBenchmarkCompatibility);
+        });
+
+        updateBenchmarkCompatibility();
+
         // Show the modal
         document.getElementById('benchmark-modal').style.display = 'flex';
     } catch (e) {
@@ -41,13 +52,30 @@ async function openBenchmarkModal() {
     }
 }
 
+function updateBenchmarkCompatibility() {
+    const checkedBackends = Array.from(document.querySelectorAll('.backend-cb:checked')).map(cb => cb.value);
+    
+    document.querySelectorAll('.model-cb').forEach(cb => {
+        const supportedBackends = cb.dataset.backends ? cb.dataset.backends.split(',') : [];
+        const supported = supportedBackends.some(b => checkedBackends.includes(b));
+        
+        cb.disabled = !supported;
+        cb.parentElement.style.opacity = supported ? "1" : "0.5";
+        
+        const warningSpan = cb.parentElement.querySelector('.incompatible-warning');
+        if (warningSpan) {
+            warningSpan.style.display = supported ? 'none' : 'inline';
+        }
+    });
+}
+
 function closeModal() {
     document.getElementById('benchmark-modal').style.display = 'none';
 }
 
 async function submitBenchmark() {
-    // Gather all checked boxes
-    const checkboxes = document.querySelectorAll('#model-checkbox-list input:checked');
+    // Gather all checked boxes that are currently compatible (not disabled)
+    const checkboxes = document.querySelectorAll('#model-checkbox-list input:checked:not(:disabled)');
     const selectedModels = Array.from(checkboxes).map(cb => cb.value);
 
     if (selectedModels.length === 0) {
@@ -120,7 +148,7 @@ function populateTable(models, loads) {
         <th>Size on Disk</th>
         <th>Max Context</th>`;
     allBackends.forEach(b => {
-        theadHTML += `<th>Avg Load (${b})</th>`;
+        theadHTML += `<th>Avg Load (${DOMPurify.sanitize(b)})</th>`;
     });
     theadHTML += `</tr>`;
     thead.innerHTML = theadHTML;
@@ -134,12 +162,13 @@ function populateTable(models, loads) {
         loadAverages[l.model_id][b].count++;
     });
 
+    let tbodyHTML = '';
     models.forEach(m => {
         let rowHTML = `<tr>
-            <td>${m.name}</td>
-            <td>${m.parameters_billions}B</td>
-            <td>${m.size_on_disk_gb} GB</td>
-            <td>${m.max_context_len.toLocaleString()}</td>`;
+            <td>${DOMPurify.sanitize(m.name)}</td>
+            <td>${DOMPurify.sanitize(m.parameters_billions.toString())}B</td>
+            <td>${DOMPurify.sanitize(m.size_on_disk_gb.toString())} GB</td>
+            <td>${DOMPurify.sanitize(m.max_context_len.toLocaleString())}</td>`;
             
         allBackends.forEach(b => {
             if (loadAverages[m.id] && loadAverages[m.id][b]) {
@@ -149,8 +178,9 @@ function populateTable(models, loads) {
             }
         });
         rowHTML += `</tr>`;
-        tbody.innerHTML += rowHTML;
+        tbodyHTML += rowHTML;
     });
+    tbody.innerHTML = tbodyHTML;
 }
 
 function renderSpeedChart(models, generations) {
