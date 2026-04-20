@@ -46,16 +46,16 @@ async function updateDashboard() {
             const statusClass = m.status === 'Active' ? 'status-active' : 'status-idle';
             modelsHtml += `
                 <div class="model-card">
-                    <h3>${m.id} <span style="color:#a6adc8; font-size:0.8rem;">(${m.backend})</span></h3>
+                    <h3>${DOMPurify.sanitize(m.id)} <span style="color:#a6adc8; font-size:0.8rem;">(${DOMPurify.sanitize(m.backend)})</span></h3>
                     <div class="model-stat"><span>Weights:</span> <span style="color:#89b4fa; font-weight:bold;">${formatMB(m.weights)}</span></div>
                     <div class="model-stat"><span>KV Cache Context:</span> <span style="color:#a6e3a1; font-weight:bold;">${formatMB(m.kv_cache)}</span></div>
                     <div class="model-stat"><span>Compute Buffer:</span> <span style="color:#f9e2af; font-weight:bold;">${formatMB(m.compute)}</span></div>
-                    <div class="model-stat"><span>Status:</span> <span class="${statusClass}">${m.status}</span></div>
+                    <div class="model-stat"><span>Status:</span> <span class="${statusClass}">${DOMPurify.sanitize(m.status)}</span></div>
                     <div class="model-stat" style="margin-top:10px; border-top:1px solid #45475a; padding-top:8px;"><span>Total Impact:</span> <span style="color:#cdd6f4; font-weight:bold;">${formatMB(m.weights + m.kv_cache + m.compute)}</span></div>
                 </div>
             `;
         });
-        modelsContainer.innerHTML = DOMPurify.sanitize(modelsHtml);
+        modelsContainer.innerHTML = modelsHtml;
 
         const otherPct = (status.vram_other_processes / status.vram_total) * 100;
         const freePct = (status.vram_free / status.vram_total) * 100;
@@ -81,13 +81,13 @@ async function updateDashboard() {
         vramTbodyHtml += `
             <tr>
                 <td style="color: #6c7086;">${formatTime(ev.timestamp)}</td>
-                <td class="${colorClass}">${ev.action}</td>
-                <td style="color: #cba6f7;">${ev.subsystem}</td>
-                <td>${ev.description}</td>
+                <td class="${colorClass}">${DOMPurify.sanitize(ev.action)}</td>
+                <td style="color: #cba6f7;">${DOMPurify.sanitize(ev.subsystem)}</td>
+                <td>${DOMPurify.sanitize(ev.description)}</td>
                 <td>${formatMB(ev.bytes)}</td>
             </tr>`;
     });
-    vramTbody.innerHTML = DOMPurify.sanitize(vramTbodyHtml);
+    vramTbody.innerHTML = vramTbodyHtml;
 
     // RAM Update
     if (status.ram_total > 0) {
@@ -111,13 +111,13 @@ async function updateDashboard() {
         ramTbodyHtml += `
             <tr>
                 <td style="color: #6c7086;">${formatTime(ev.timestamp)}</td>
-                <td class="${colorClass}">${ev.action}</td>
-                <td style="color: #cba6f7;">${ev.subsystem}</td>
-                <td>${ev.description}</td>
+                <td class="${colorClass}">${DOMPurify.sanitize(ev.action)}</td>
+                <td style="color: #cba6f7;">${DOMPurify.sanitize(ev.subsystem)}</td>
+                <td>${DOMPurify.sanitize(ev.description)}</td>
                 <td>${formatMB(ev.bytes)}</td>
             </tr>`;
     });
-    ramTbody.innerHTML = DOMPurify.sanitize(ramTbodyHtml);
+    ramTbody.innerHTML = ramTbodyHtml;
 }
 setInterval(updateDashboard, 1000);
 window.onload = updateDashboard;

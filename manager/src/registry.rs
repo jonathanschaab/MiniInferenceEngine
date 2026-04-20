@@ -1,7 +1,9 @@
 use crate::types::Message;
 use hf_hub::api::tokio::Api;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::OnceCell;
+use tokio::sync::RwLock;
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
 pub enum ModelDType {
@@ -112,22 +114,12 @@ impl ModelConfig {
             ModelDType::F32 => 4,
             ModelDType::F16 | ModelDType::BF16 => 2,
         };
-        if self.n_head > 0 && self.n_head_kv > 0 {
-            (2 * self.num_layers * self.head_dim * self.n_head_kv) * bytes_per_element
-        } else {
-            // Fallback heuristics if precise model architecture details are omitted
-            match &self.arch {
-                ModelArch::Qwen2 if self.parameters_billions > 10.0 => 150_000,
-                ModelArch::Qwen2 => 80_000,
-                ModelArch::Llama if self.parameters_billions < 10.0 => 125_000,
-                ModelArch::GptOss => 49_000,
-                _ => 100_000,
-            }
-        }
+
+        (2 * self.num_layers * self.head_dim * self.n_head_kv) * bytes_per_element
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ModelOverrides {
     pub arch: Option<ModelArch>,
     pub kv_cache_dtype: Option<ModelDType>,
@@ -143,6 +135,7 @@ struct ModelOverrides {
     pub size_on_disk_gb: Option<f32>,
 }
 
+#[derive(Clone)]
 struct ModelRegistration {
     id: &'static str,
     name: &'static str,
@@ -160,9 +153,11 @@ struct ModelRegistration {
 }
 
 // Expose the registry so the web server can send it to the UI
-pub async fn get_model_registry() -> &'static [ModelConfig] {
-    static REGISTRY: OnceCell<Vec<ModelConfig>> = OnceCell::const_new();
-    REGISTRY.get_or_init(|| async {
+pub async fn get_model_registry() -> Vec<ModelConfig> {
+    static REGISTRY: OnceCell<Arc<RwLock<Vec<ModelConfig>>>> = OnceCell::const_new();
+    let registry_lock = REGISTRY.get_or_init(|| async {
+        let lock = Arc::new(RwLock::new(Vec::new()));
+
         let api_opt = Api::new().ok();
         if api_opt.is_none() {
             println!("⚠️ WARNING: Failed to init HF API. Offline mode fallback active.");
@@ -567,6 +562,9 @@ pub async fn get_model_registry() -> &'static [ModelConfig] {
             configs.push(h.await.unwrap());
         }
 
-        configs
-    }).await.as_slice()
+        lock.write().await.extend(configs);
+        lock
+    }).await;
+
+    registry_lock.read().await.clone()
 }

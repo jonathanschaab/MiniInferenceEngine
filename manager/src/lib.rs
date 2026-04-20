@@ -72,7 +72,7 @@ pub async fn wait_for_vram_release(
 
 fn get_exact_token_count(prompt: &str, tokenizer: &Tokenizer) -> usize {
     tokenizer
-        .encode(prompt.to_string(), true)
+        .encode(prompt, true)
         .map(|enc| enc.get_ids().len())
         .unwrap_or_else(|_| prompt.len() / 4)
 }
@@ -620,7 +620,7 @@ pub async fn run_batcher_loop(
                 .iter()
                 .find(|c| c.id == request.compressor_model_id)
             {
-                Some(c) => c,
+                Some(c) => c.clone(),
                 None => {
                     let _ = request.responder.send(StreamEvent::Error(
                         "Server Error: Compressor missing from registry.".to_string(),
@@ -678,7 +678,7 @@ pub async fn run_batcher_loop(
             let comp_load_start = Instant::now();
             if let Err(e) = comp_backend
                 .load_model(
-                    comp_config,
+                    &comp_config,
                     status.clone(),
                     &MemoryStrategy::Offload,
                     comp_required_ctx,

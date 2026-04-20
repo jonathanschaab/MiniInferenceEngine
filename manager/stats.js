@@ -16,26 +16,26 @@ async function openBenchmarkModal() {
         const allBackends = new Set();
         let modelsHtml = '';
         models.forEach(m => {
-            const backendsStr = m.supported_backends.map(b => b.toLowerCase()).join(',');
+            const backendsStr = DOMPurify.sanitize(m.supported_backends.map(b => b.toLowerCase()).join(','));
             modelsHtml += `
                 <label class="model-item">
-                    <input type="checkbox" class="model-cb" value="${m.id}" data-backends="${backendsStr}" checked>
-                    ${m.name} <span style="color: #6c7086; margin-left: 5px;">(${m.arch})</span>
+                    <input type="checkbox" class="model-cb" value="${DOMPurify.sanitize(m.id)}" data-backends="${backendsStr}" checked>
+                    ${DOMPurify.sanitize(m.name)} <span style="color: #6c7086; margin-left: 5px;">(${DOMPurify.sanitize(m.arch)})</span>
                     <span class="incompatible-warning" style="display: none; color: #f38ba8; margin-left: auto; font-size: 0.85em; font-style: italic;">(Incompatible)</span>
                 </label>
             `;
             m.supported_backends.forEach(b => allBackends.add(b));
         });
-        listDiv.innerHTML = DOMPurify.sanitize(modelsHtml);
+        listDiv.innerHTML = modelsHtml;
         
         const backendDiv = document.getElementById('backend-checkbox-list');
         let backendsHtml = '';
         allBackends.forEach(b => {
             backendsHtml += `
-                <label class="model-item"><input type="checkbox" class="backend-cb" value="${b.toLowerCase()}" checked> ${b}</label>
+                <label class="model-item"><input type="checkbox" class="backend-cb" value="${DOMPurify.sanitize(b.toLowerCase())}" checked> ${DOMPurify.sanitize(b)}</label>
             `;
         });
-        backendDiv.innerHTML = DOMPurify.sanitize(backendsHtml);
+        backendDiv.innerHTML = backendsHtml;
         
         // Add listeners to auto-grey out incompatible models
         document.querySelectorAll('.backend-cb').forEach(cb => {
@@ -148,10 +148,10 @@ function populateTable(models, loads) {
         <th>Size on Disk</th>
         <th>Max Context</th>`;
     allBackends.forEach(b => {
-        theadHTML += `<th>Avg Load (${b})</th>`;
+        theadHTML += `<th>Avg Load (${DOMPurify.sanitize(b)})</th>`;
     });
     theadHTML += `</tr>`;
-    thead.innerHTML = DOMPurify.sanitize(theadHTML);
+    thead.innerHTML = theadHTML;
 
     const loadAverages = {};
     loads.forEach(l => {
@@ -165,10 +165,10 @@ function populateTable(models, loads) {
     let tbodyHTML = '';
     models.forEach(m => {
         let rowHTML = `<tr>
-            <td>${m.name}</td>
-            <td>${m.parameters_billions}B</td>
-            <td>${m.size_on_disk_gb} GB</td>
-            <td>${m.max_context_len.toLocaleString()}</td>`;
+            <td>${DOMPurify.sanitize(m.name)}</td>
+            <td>${DOMPurify.sanitize(m.parameters_billions.toString())}B</td>
+            <td>${DOMPurify.sanitize(m.size_on_disk_gb.toString())} GB</td>
+            <td>${DOMPurify.sanitize(m.max_context_len.toLocaleString())}</td>`;
             
         allBackends.forEach(b => {
             if (loadAverages[m.id] && loadAverages[m.id][b]) {
@@ -180,7 +180,7 @@ function populateTable(models, loads) {
         rowHTML += `</tr>`;
         tbodyHTML += rowHTML;
     });
-    tbody.innerHTML = DOMPurify.sanitize(tbodyHTML);
+    tbody.innerHTML = tbodyHTML;
 }
 
 function renderSpeedChart(models, generations) {

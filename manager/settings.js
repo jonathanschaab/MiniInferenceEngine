@@ -12,17 +12,17 @@ async function loadKeys() {
     let tbodyHtml = '';
     keys.forEach(record => {
         const shortHash = record.hash.substring(0, 16) + '...';
-        const desc = record.description ? record.description : '<span style="color: #6c7086; font-style: italic;">None</span>';
+        const desc = record.description ? DOMPurify.sanitize(record.description) : '<span style="color: #6c7086; font-style: italic;">None</span>';
         tbodyHtml += `
             <tr>
-                <td style="font-weight: bold;">${record.name}</td>
+                <td style="font-weight: bold;">${DOMPurify.sanitize(record.name)}</td>
                 <td>${desc}</td>
                 <td class="hash-text">${shortHash}</td>
-                <td><button class="btn-danger" onclick="deleteKey('${record.hash}')">Revoke</button></td>
+                <td><button class="btn-danger" onclick="deleteKey('${DOMPurify.sanitize(record.hash)}')">Revoke</button></td>
             </tr>
         `;
     });
-    tbody.innerHTML = DOMPurify.sanitize(tbodyHtml);
+    tbody.innerHTML = tbodyHtml;
 }
 
 function openKeyModal() {

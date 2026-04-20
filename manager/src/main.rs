@@ -87,7 +87,7 @@ async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>
 
 // Send the model roster to the Javascript dropdowns
 async fn get_models() -> Json<Vec<ModelConfig>> {
-    Json(get_model_registry().await.to_vec())
+    Json(get_model_registry().await)
 }
 
 // Handle incoming chat requests
