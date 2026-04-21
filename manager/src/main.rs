@@ -694,8 +694,10 @@ async fn serve_console_js() -> impl IntoResponse {
     )
 }
 
-async fn get_console_logs(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
-    let logs = state.log_buffer.0.lock().unwrap().iter().cloned().collect();
+async fn get_console_logs(
+    State(state): State<Arc<AppState>>,
+) -> Json<std::collections::VecDeque<String>> {
+    let logs = state.log_buffer.0.lock().unwrap().clone();
     Json(logs)
 }
 
@@ -713,7 +715,12 @@ async fn set_console_loglevel(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LogLevelRequest>,
 ) -> impl IntoResponse {
-    let new_filter = EnvFilter::new(&payload.level);
+    let new_filter = match EnvFilter::try_new(&payload.level) {
+        Ok(filter) => filter,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("Invalid log level: {}", e)).into_response();
+        }
+    };
     if let Err(e) = state.log_reload_handle.reload(new_filter) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
