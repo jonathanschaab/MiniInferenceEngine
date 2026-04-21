@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use hf_hub::api::sync::Api;
 use nvml_wrapper::Nvml;
 use tokenizers::Tokenizer;
+use tracing::{error, info, warn};
 
 const CANDLE_COMPUTE_MARGIN_BYTES: u64 = 500 * 1024 * 1024;
 
@@ -64,8 +65,8 @@ pub async fn wait_for_vram_release(
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    println!(
-        "⚠️ WARNING: VRAM release timeout exceeded for {} on {}! System might OOM.",
+    warn!(
+        "VRAM release timeout exceeded for {} on {}! System might OOM.",
         model_id, backend_name
     );
 }
@@ -207,15 +208,15 @@ pub async fn run_batcher_loop(
     let mut tokenizer_cache: std::collections::HashMap<String, Tokenizer> =
         std::collections::HashMap::new();
 
-    println!("⚙️  ORCHESTRATOR ONLINE: Waiting for requests...");
+    info!("ORCHESTRATOR ONLINE: Waiting for requests...");
 
     'main: while let Some(request) = receiver.recv().await {
-        println!("📥 Processing new chat request...");
+        info!("Processing new chat request...");
 
         let last_message = match request.messages.last() {
             Some(msg) => msg.clone(),
             None => {
-                println!("⚠️ Rejected request: No messages provided.");
+                warn!("Rejected request: No messages provided.");
                 let _ = request.responder.send(StreamEvent::Error(
                     "Server Error: Request contained no messages.".to_string(),
                 ));
@@ -341,8 +342,8 @@ pub async fn run_batcher_loop(
             && req_strategy == MemoryStrategy::Offload
             && active_max_context < config_for_prompt.max_context_len
         {
-            println!(
-                "🔄 Expanding KV Cache from {} to {} tokens...",
+            info!(
+                "Expanding KV Cache from {} to {} tokens...",
                 active_max_context,
                 target_allocated_ctx.min(config_for_prompt.max_context_len)
             );
@@ -351,7 +352,7 @@ pub async fn run_batcher_loop(
 
         // 1. Hot-Swap to the requested Chat Model
         if needs_reload {
-            println!("🔄 Swapping VRAM to {}...", request.chat_model_id);
+            info!("Swapping VRAM to {}...", request.chat_model_id);
 
             if let Some(backend) = active_backend.take() {
                 let offload_pct = backend.get_offload_pct();
@@ -439,7 +440,7 @@ pub async fn run_batcher_loop(
             {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    println!("❌ Chat model load failed: {}", e);
+                    error!("Chat model load failed: {}", e);
                     {
                         let mut s = lock_status(&status);
                         s.log_vram(
@@ -458,7 +459,7 @@ pub async fn run_batcher_loop(
             };
 
             let elapsed = load_start.elapsed().as_millis();
-            println!("⏱️ Model loaded in {} ms using {:?}", elapsed, target_btype);
+            info!("Model loaded in {} ms using {:?}", elapsed, target_btype);
             if let Ok(mut t) = telemetry.lock() {
                 t.record_load(
                     request.chat_model_id.clone(),
@@ -473,8 +474,8 @@ pub async fn run_batcher_loop(
             active_model_id = request.chat_model_id.clone();
             active_max_context = actual_context;
             active_model_config = Some(config);
-            println!(
-                "✅ Model limits established. Max context window: {}",
+            info!(
+                "Model limits established. Max context window: {}",
                 active_max_context
             );
 
@@ -519,14 +520,12 @@ pub async fn run_batcher_loop(
         let static_alloc = active_backend.as_ref().unwrap().is_statically_allocated();
 
         if static_alloc {
-            println!(
-                "🧮 MEMORY CHECK: Statically allocated up to {} tokens.",
+            info!(
+                "MEMORY CHECK: Statically allocated up to {} tokens.",
                 active_max_context
             );
             if token_count + requested_max_tokens > active_max_context {
-                println!(
-                    "⚠️ WARNING: Prompt + Max Tokens exceeds KV Cache! Triggering compression."
-                );
+                warn!("Prompt + Max Tokens exceeds KV Cache! Triggering compression.");
                 trigger_compression = true;
                 dynamic_target_budget = active_max_context
                     .saturating_sub(requested_max_tokens)
@@ -537,7 +536,7 @@ pub async fn run_batcher_loop(
                     .max(256)
                     .min(active_max_context);
             } else if request.force_compression {
-                println!("⚠️ Benchmarking: Forcing compression execution.");
+                info!("Benchmarking: Forcing compression execution.");
                 trigger_compression = true;
                 dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
                     .max(256)
@@ -551,15 +550,13 @@ pub async fn run_batcher_loop(
             let absolute_max_tokens =
                 (safe_free_vram as usize / bytes_per_token).min(active_max_context);
 
-            println!(
-                "🧮 MEMORY CHECK: Free VRAM can hold ~{} tokens.",
+            info!(
+                "MEMORY CHECK: Free VRAM can hold ~{} tokens.",
                 absolute_max_tokens
             );
 
             if token_count + requested_max_tokens > absolute_max_tokens {
-                println!(
-                    "⚠️ WARNING: Prompt exceeds physical VRAM limits! Triggering dynamic compression."
-                );
+                warn!("Prompt exceeds physical VRAM limits! Triggering dynamic compression.");
                 trigger_compression = true;
                 dynamic_target_budget = absolute_max_tokens
                     .saturating_sub(requested_max_tokens)
@@ -570,7 +567,7 @@ pub async fn run_batcher_loop(
                     .max(256)
                     .min(absolute_max_tokens);
             } else if request.force_compression {
-                println!("⚠️ Benchmarking: Forcing compression execution.");
+                info!("Benchmarking: Forcing compression execution.");
                 trigger_compression = true;
                 dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
                     .max(256)
@@ -579,9 +576,7 @@ pub async fn run_batcher_loop(
         } else {
             // CPU fallback
             if token_count + requested_max_tokens > active_max_context {
-                println!(
-                    "⚠️ WARNING: Prompt + Max Tokens exceeds KV Cache! Triggering compression."
-                );
+                warn!("Prompt + Max Tokens exceeds KV Cache! Triggering compression.");
                 trigger_compression = true;
                 dynamic_target_budget = active_max_context
                     .saturating_sub(requested_max_tokens)
@@ -592,7 +587,7 @@ pub async fn run_batcher_loop(
                     .max(256)
                     .min(active_max_context);
             } else if request.force_compression {
-                println!("⚠️ Benchmarking: Forcing compression execution.");
+                info!("Benchmarking: Forcing compression execution.");
                 trigger_compression = true;
                 dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
                     .max(256)
@@ -602,8 +597,8 @@ pub async fn run_batcher_loop(
 
         if trigger_compression {
             if let Some((used_start, total, _)) = vram_info {
-                println!(
-                    "📊 VRAM before compressor: {:.2}GB / {:.2}GB",
+                info!(
+                    "VRAM before compressor: {:.2}GB / {:.2}GB",
                     used_start as f32 / 1024.0_f32.powi(3),
                     total as f32 / 1024.0_f32.powi(3)
                 );
@@ -702,8 +697,8 @@ pub async fn run_batcher_loop(
             }
 
             let comp_load_elapsed = comp_load_start.elapsed().as_millis();
-            println!(
-                "⏱️ Compressor loaded in {} ms using {:?}",
+            info!(
+                "Compressor loaded in {} ms using {:?}",
                 comp_load_elapsed, comp_btype
             );
             if let Ok(mut t) = telemetry.lock() {
@@ -770,8 +765,8 @@ pub async fn run_batcher_loop(
             };
 
             let comp_elapsed = comp_start.elapsed().as_millis();
-            println!(
-                "⏱️ Compression completed in {} ms (Tokenization: {} ms)",
+            info!(
+                "Compression completed in {} ms (Tokenization: {} ms)",
                 comp_elapsed, comp_tok_time
             );
             let comp_btype_str = format!("{:?}", comp_btype);
@@ -841,7 +836,7 @@ pub async fn run_batcher_loop(
                 s.set_model_status(&active_model_id, "Active");
             }
 
-            println!("🔄 Resuming Chat...");
+            info!("Resuming Chat...");
             let mut new_messages = Vec::new();
 
             if request.messages.len() > 1 {
@@ -863,7 +858,7 @@ pub async fn run_batcher_loop(
             token_count = get_exact_token_count(&formatted_prompt, &tokenizer);
         }
 
-        println!("📥 Processing prompt...");
+        info!("Processing prompt...");
         let gen_start = Instant::now();
 
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -913,8 +908,8 @@ pub async fn run_batcher_loop(
         let (_, tokenization_time_ms) = tokio::join!(gen_fut, fwd_fut);
 
         let elapsed = gen_start.elapsed().as_millis();
-        println!(
-            "⏱️ Generation completed in {} ms (Tokenization: {} ms)",
+        info!(
+            "Generation completed in {} ms (Tokenization: {} ms)",
             elapsed, tokenization_time_ms
         );
         let offload_pct = active_backend.as_ref().unwrap().get_offload_pct();

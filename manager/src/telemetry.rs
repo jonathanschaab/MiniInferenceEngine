@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::error;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LoadMetric {
@@ -60,8 +61,8 @@ impl TelemetryStore {
                 let _ = tx.send(json);
             } else {
                 // FAIL LOUDLY: Include the exact payload that is being dropped!
-                eprintln!(
-                    "⚠️ [TELEMETRY FAULT] Writer channel missing! Dropping metric payload to prevent disk I/O race conditions. Check channel initialization in main.rs.\nDropped Payload:\n{}",
+                error!(
+                    "[TELEMETRY FAULT] Writer channel missing! Dropping metric payload to prevent disk I/O race conditions. Check channel initialization in main.rs.\nDropped Payload:\n{}",
                     json
                 );
             }
