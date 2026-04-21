@@ -12,12 +12,27 @@ document.addEventListener("DOMContentLoaded", () => {
         isAtBottom = position <= threshold;
     });
 
+    function updateLevelIndicatorColor() {
+        const colors = {
+            'trace': '#cba6f7',
+            'debug': '#a6adc8',
+            'info': '#89b4fa',
+            'warn': '#f9e2af',
+            'error': '#f38ba8'
+        };
+        levelSelect.style.color = colors[levelSelect.value] || 'white';
+        levelSelect.style.borderColor = colors[levelSelect.value] || '#45475a';
+    }
+    
+    levelSelect.addEventListener('change', updateLevelIndicatorColor);
+
     async function fetchLogLevel() {
         try {
             const res = await fetch("/api/console/loglevel");
             if (res.ok) {
                 const data = await res.json();
                 levelSelect.value = data.level;
+                updateLevelIndicatorColor();
             }
         } catch (e) {
             console.error("Failed to fetch log level", e);
@@ -29,9 +44,18 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch("/api/console/logs");
             if (res.ok) {
                 const logs = await res.json();
-                const newText = logs.join("\n");
-                if (logContainer.textContent !== newText) {
-                    logContainer.textContent = newText;
+                const newHtml = logs.map(line => {
+                    let safe = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    safe = safe.replace(/\bERROR\b/, '<span style="color: #f38ba8; font-weight: bold;">ERROR</span>');
+                    safe = safe.replace(/\bWARN\b/, '<span style="color: #f9e2af; font-weight: bold;">WARN</span>');
+                    safe = safe.replace(/\bINFO\b/, '<span style="color: #89b4fa; font-weight: bold;">INFO</span>');
+                    safe = safe.replace(/\bDEBUG\b/, '<span style="color: #a6adc8; font-weight: bold;">DEBUG</span>');
+                    safe = safe.replace(/\bTRACE\b/, '<span style="color: #cba6f7; font-weight: bold;">TRACE</span>');
+                    return safe;
+                }).join("\n");
+                
+                if (logContainer.innerHTML !== newHtml) {
+                    logContainer.innerHTML = newHtml;
                     
                     // Only auto-scroll if the user hasn't manually scrolled up
                     if (isAtBottom) {
@@ -56,7 +80,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     clearBtn.addEventListener("click", async () => {
         await fetch("/api/console/logs", { method: "DELETE" });
-        logContainer.textContent = "";
+        logContainer.innerHTML = "";
         isAtBottom = true;
     });
 

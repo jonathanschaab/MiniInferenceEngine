@@ -731,7 +731,7 @@ async fn clear_console_logs(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-    StatusCode::OK
+    StatusCode::OK.into_response()
 }
 
 #[derive(Deserialize, Serialize)]
