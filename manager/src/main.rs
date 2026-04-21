@@ -683,9 +683,14 @@ async fn serve_memory_ui(session: tower_sessions::Session) -> Result<Html<&'stat
 
 async fn serve_console_ui(
     session: tower_sessions::Session,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Html<&'static str>, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
+    let email = match require_session(session).await {
+        Ok(e) => e,
+        Err(_) => return Err(Redirect::to("/auth/login")),
+    };
+    if !state.config.admin_emails.contains(&email) {
+        return Err(Redirect::to("/"));
     }
     Ok(Html(include_str!("../console.html")))
 }
@@ -698,18 +703,28 @@ async fn serve_console_js() -> impl IntoResponse {
 }
 
 async fn get_console_logs(
+    user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
-) -> Json<std::collections::VecDeque<String>> {
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
+    }
     let logs = state
         .log_buffer
         .0
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    Json(logs)
+    Json(logs).into_response()
 }
 
-async fn clear_console_logs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn clear_console_logs(
+    user: auth::CurrentUser,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
+    }
     state
         .log_buffer
         .0
@@ -725,9 +740,13 @@ pub struct LogLevelRequest {
 }
 
 async fn set_console_loglevel(
+    user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LogLevelRequest>,
 ) -> impl IntoResponse {
+    if !user.is_admin {
+        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
+    }
     let new_filter = match EnvFilter::try_new(&payload.level) {
         Ok(filter) => filter,
         Err(e) => {
@@ -748,13 +767,19 @@ async fn set_console_loglevel(
     (StatusCode::OK, "Log level updated").into_response()
 }
 
-async fn get_console_loglevel(State(state): State<Arc<AppState>>) -> Json<LogLevelRequest> {
+async fn get_console_loglevel(
+    user: auth::CurrentUser,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
+    }
     let level = state
         .current_log_level
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    Json(LogLevelRequest { level })
+    Json(LogLevelRequest { level }).into_response()
 }
 
 async fn serve_chat_js() -> impl IntoResponse {

@@ -29,11 +29,14 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch("/api/console/logs");
             if (res.ok) {
                 const logs = await res.json();
-                logContainer.textContent = logs.join("\n");
-                
-                // Only auto-scroll if the user hasn't manually scrolled up
-                if (isAtBottom) {
-                    logContainer.scrollTop = logContainer.scrollHeight;
+                const newText = logs.join("\n");
+                if (logContainer.textContent !== newText) {
+                    logContainer.textContent = newText;
+                    
+                    // Only auto-scroll if the user hasn't manually scrolled up
+                    if (isAtBottom) {
+                        logContainer.scrollTop = logContainer.scrollHeight;
+                    }
                 }
             }
         } catch (e) {
