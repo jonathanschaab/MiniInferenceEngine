@@ -18,7 +18,9 @@ use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tower_sessions::{MemoryStore, SessionManagerLayer}; // Ensure this is imported for AppState
+use tower_sessions::{MemoryStore, SessionManagerLayer};
+use tracing::{error, info, warn}; // Ensure this is imported for AppState
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use manager::{
     ApiRequest, BenchmarkRequest, EngineStatus, Message, ModelArch, ModelConfig, ModelRole,
@@ -35,6 +37,27 @@ pub struct AppConfig {
     pub secure_cookies: bool,
     #[serde(default)]
     pub gpu_device_index: u32,
+    #[serde(default = "default_log_level_console")]
+    pub log_level_console: String,
+    #[serde(default = "default_log_level_file")]
+    pub log_level_file: String,
+    #[serde(default = "default_log_level_memory")]
+    pub log_level_memory: String,
+    #[serde(default = "default_log_file_name")]
+    pub log_file_name: String,
+}
+
+fn default_log_level_console() -> String {
+    "info".to_string()
+}
+fn default_log_level_file() -> String {
+    "warn".to_string()
+}
+fn default_log_level_memory() -> String {
+    "debug".to_string()
+}
+fn default_log_file_name() -> String {
+    "server.log".to_string()
 }
 
 impl Default for AppConfig {
@@ -46,6 +69,10 @@ impl Default for AppConfig {
             user_emails: vec![],
             secure_cookies: true,
             gpu_device_index: 0,
+            log_level_console: default_log_level_console(),
+            log_level_file: default_log_level_file(),
+            log_level_memory: default_log_level_memory(),
+            log_file_name: default_log_file_name(),
         }
     }
 }
@@ -67,6 +94,42 @@ impl AppConfig {
 
 pub mod auth;
 
+// --- SHARED MEMORY LOG WRITER ---
+#[derive(Clone)]
+pub struct SharedLogBuffer(pub Arc<Mutex<std::collections::VecDeque<String>>>);
+
+pub struct SharedLogWriter {
+    buffer: Arc<Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl std::io::Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let s = String::from_utf8_lossy(buf).into_owned();
+        let mut logs = self.buffer.lock().unwrap();
+        // Exclude the trailing newline added by the fmt layer since UI handles lines
+        logs.push_back(s.trim_end().to_string());
+        if logs.len() > 1000 {
+            logs.pop_front();
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
+    type Writer = SharedLogWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedLogWriter {
+            buffer: self.0.clone(),
+        }
+    }
+}
+
+pub type LogReloadHandle =
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
 // State to share the transmitter queue across web requests
 pub struct AppState {
     pub queue_tx: mpsc::Sender<UserRequest>,
@@ -76,6 +139,9 @@ pub struct AppState {
     pub reqwest_client: reqwest::Client,
     pub oauth_client: BasicClient,
     pub config: Arc<AppConfig>,
+    pub log_buffer: SharedLogBuffer,
+    pub log_reload_handle: LogReloadHandle,
+    pub current_log_level: Arc<Mutex<String>>,
 }
 
 async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
@@ -138,10 +204,7 @@ async fn trigger_benchmark(
     Json(payload): Json<BenchmarkRequest>,
 ) -> impl IntoResponse {
     if !user.is_admin {
-        println!(
-            "⚠️ Benchmark trigger rejected for non-admin: {}",
-            user.email
-        );
+        warn!("Benchmark trigger rejected for non-admin: {}", user.email);
         return (
             StatusCode::FORBIDDEN,
             "Only administrators can run the benchmark suite.",
@@ -169,7 +232,7 @@ async fn trigger_benchmark(
     let selected_models = payload.models;
 
     tokio::spawn(async move {
-        println!("🚀 Starting Automated Benchmark Suite...");
+        info!("🚀 Starting Automated Benchmark Suite...");
         let full_registry = get_model_registry().await;
 
         let default_compressor = full_registry
@@ -218,22 +281,22 @@ async fn trigger_benchmark(
             .collect();
 
         if registry.is_empty() {
-            println!("⚠️ Benchmark aborted: No valid models selected.");
+            warn!("Benchmark aborted: No valid models selected.");
             let mut status = lock_status(&engine_status);
             status.benchmark_running = false;
             return;
         }
 
         if target_backends.is_empty() {
-            println!("⚠️ Benchmark aborted: No valid backends selected.");
+            warn!("Benchmark aborted: No valid backends selected.");
             let mut status = lock_status(&engine_status);
             status.benchmark_running = false;
             return;
         }
 
         if let Err(e) = tokio::fs::create_dir_all("benchmark_prompts").await {
-            println!(
-                "⚠️ Benchmark aborted: Failed to create prompt directory: {}",
+            error!(
+                "Benchmark aborted: Failed to create prompt directory: {}",
                 e
             );
             let mut status = lock_status(&engine_status);
@@ -242,7 +305,7 @@ async fn trigger_benchmark(
         }
 
         // --- GENERATE REALISTIC PROMPTS ---
-        println!("🌱 Verifying benchmark prompt files...");
+        info!("🌱 Verifying benchmark prompt files...");
 
         let tokenizer_result = tokio::task::spawn_blocking(|| {
             let api = Api::new().map_err(|e| format!("API Init Error: {}", e))?;
@@ -262,17 +325,14 @@ async fn trigger_benchmark(
                 qwen_tokenizer = Some(tokenizer);
             }
             Ok(Err(e)) => {
-                println!(
-                    "⚠️ Tokenizer initialization failed: {}. Falling back to padding.",
+                warn!(
+                    "Tokenizer initialization failed: {}. Falling back to padding.",
                     e
                 );
             }
             Err(e) => {
                 // If the spawn_blocking task actually panics, it is caught here as a JoinError
-                println!(
-                    "⚠️ Thread execution failed: {}. Falling back to padding.",
-                    e
-                );
+                error!("Thread execution failed: {}. Falling back to padding.", e);
             }
         }
 
@@ -300,7 +360,7 @@ async fn trigger_benchmark(
                 let mut final_content = String::new();
 
                 if size < 1000 {
-                    println!(
+                    info!(
                         "🧠 Using {} to generate realistic prompt of ~{} tokens...",
                         prompt_generator, size
                     );
@@ -356,20 +416,20 @@ async fn trigger_benchmark(
                         if token_len >= size.saturating_sub(margin) && token_len <= size + margin {
                             final_content = generated_seed;
                             should_save = true;
-                            println!(
+                            info!(
                                 "✅ Generated {} tokens (within 35% of {}). Saving.",
                                 token_len, size
                             );
                         } else {
-                            println!(
-                                "⚠️ Generation missed margin: {} tokens (target {}).",
+                            warn!(
+                                "Generation missed margin: {} tokens (target {}).",
                                 token_len, size
                             );
                         }
                     }
                 } else {
                     // --- ALGORITHMIC SYNTHESIS FOR LARGE CONTEXT ---
-                    println!(
+                    info!(
                         "🖨️ Synthesizing highly unique {} token data payload...",
                         size
                     );
@@ -435,28 +495,28 @@ async fn trigger_benchmark(
                             if let Ok(decoded) = tokenizer.decode(exact_slice, true) {
                                 final_content = decoded;
                                 should_save = true;
-                                println!(
+                                info!(
                                     "✅ Successfully synthesized exactly {} unique tokens.",
                                     safe_size
                                 );
                             } else {
-                                println!("⚠️ Decode failed. Falling back to padding.");
+                                warn!("Decode failed. Falling back to padding.");
                             }
                         } else {
-                            println!("⚠️ Encode failed. Falling back to padding.");
+                            warn!("Encode failed. Falling back to padding.");
                         }
                     }
                 }
 
                 if !should_save {
-                    println!("⚠️ Fallback: Using generic memory padding. (Will NOT save to disk).");
+                    warn!("Fallback: Using generic memory padding. (Will NOT save to disk).");
                 } else {
                     let _ = tokio::fs::write(&filename, &final_content).await;
                 }
             }
         }
 
-        println!("✅ Setup Phase Complete. Beginning standard benchmark sweeps...");
+        info!("✅ Setup Phase Complete. Beginning standard benchmark sweeps...");
 
         // --- GENERATIVE MODELS ---
         for model in registry.iter().filter(|m| {
@@ -485,7 +545,7 @@ async fn trigger_benchmark(
                         continue;
                     }
 
-                    println!(
+                    info!(
                         "📊 Benchmarking Generative {} using file {} on Backend {}...",
                         model.name, filename, target_b
                     );
@@ -515,7 +575,7 @@ async fn trigger_benchmark(
         }
 
         // --- COMPRESSOR MODELS ---
-        println!("🚀 Transitioning to Compressor Benchmarks...");
+        info!("🚀 Transitioning to Compressor Benchmarks...");
         for comp_model in registry
             .iter()
             .filter(|m| m.roles.contains(&ModelRole::ContextCompressor))
@@ -542,7 +602,7 @@ async fn trigger_benchmark(
                         continue;
                     }
 
-                    println!(
+                    info!(
                         "📊 Benchmarking Compressor {} using file {} on Backend {}...",
                         comp_model.name, filename, target_b
                     );
@@ -571,7 +631,7 @@ async fn trigger_benchmark(
             }
         }
 
-        println!("✅ Automated Benchmark Suite Complete!");
+        info!("✅ Automated Benchmark Suite Complete!");
 
         // Reset the flag when the thread finishes
         {
@@ -616,6 +676,58 @@ async fn serve_memory_ui(session: tower_sessions::Session) -> Result<Html<&'stat
         return Err(Redirect::to("/auth/login"));
     }
     Ok(Html(include_str!("../memory.html")))
+}
+
+async fn serve_console_ui(
+    session: tower_sessions::Session,
+) -> Result<Html<&'static str>, Redirect> {
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok(Html(include_str!("../console.html")))
+}
+
+async fn serve_console_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../console.js"),
+    )
+}
+
+async fn get_console_logs(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
+    let logs = state.log_buffer.0.lock().unwrap().iter().cloned().collect();
+    Json(logs)
+}
+
+async fn clear_console_logs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.log_buffer.0.lock().unwrap().clear();
+    StatusCode::OK
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct LogLevelRequest {
+    pub level: String,
+}
+
+async fn set_console_loglevel(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<LogLevelRequest>,
+) -> impl IntoResponse {
+    let new_filter = EnvFilter::new(&payload.level);
+    if let Err(e) = state.log_reload_handle.reload(new_filter) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to reload log level: {}", e),
+        )
+            .into_response();
+    }
+    *state.current_log_level.lock().unwrap() = payload.level.clone();
+    (StatusCode::OK, "Log level updated").into_response()
+}
+
+async fn get_console_loglevel(State(state): State<Arc<AppState>>) -> Json<LogLevelRequest> {
+    let level = state.current_log_level.lock().unwrap().clone();
+    Json(LogLevelRequest { level })
 }
 
 async fn serve_chat_js() -> impl IntoResponse {
@@ -680,6 +792,37 @@ async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetrySto
 #[tokio::main]
 async fn main() {
     let config = AppConfig::load();
+
+    // --- 1. CONSOLE LAYER ---
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_filter(EnvFilter::new(&config.log_level_console));
+
+    // --- 2. FILE LAYER ---
+    let file_appender = tracing_appender::rolling::never(".", &config.log_file_name);
+    // Bind the _file_guard to keep the background writer active for the life of main()
+    let (file_writer, _file_guard) = tracing_appender::non_blocking(file_appender);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(file_writer)
+        .with_ansi(false) // Do not write ANSI color codes to the log file!
+        .with_filter(EnvFilter::new(&config.log_level_file));
+
+    // --- 3. IN-MEMORY BUFFER LAYER (RELOADABLE) ---
+    let memory_buffer = SharedLogBuffer(Arc::new(Mutex::new(std::collections::VecDeque::new())));
+    let memory_filter = EnvFilter::new(&config.log_level_memory);
+    let (reloadable_memory_filter, log_reload_handle) =
+        tracing_subscriber::reload::Layer::new(memory_filter);
+    let memory_layer = tracing_subscriber::fmt::layer()
+        .with_writer(memory_buffer.clone())
+        .with_ansi(false) // Send clean strings to the web UI
+        .with_filter(reloadable_memory_filter);
+
+    // Apply all registered layers
+    tracing_subscriber::registry()
+        .with(memory_layer)
+        .with(file_layer)
+        .with(console_layer)
+        .init();
 
     // Create the async channel for the GPU queue
     let (tx, rx) = mpsc::channel(32);
@@ -783,6 +926,9 @@ async fn main() {
         reqwest_client,
         oauth_client,
         config: Arc::new(config.clone()),
+        log_buffer: memory_buffer,
+        log_reload_handle,
+        current_log_level: Arc::new(Mutex::new(config.log_level_memory.clone())),
     });
 
     // Setup Session Layer
@@ -804,11 +950,13 @@ async fn main() {
         .route("/models", get(serve_models_ui))
         .route("/stats", get(serve_stats_ui))
         .route("/memory", get(serve_memory_ui))
+        .route("/console", get(serve_console_ui))
         .route("/js/chat.js", get(serve_chat_js))
         .route("/js/models.js", get(serve_models_js))
         .route("/js/stats.js", get(serve_stats_js))
         .route("/js/settings.js", get(serve_settings_js))
         .route("/js/memory.js", get(serve_memory_js))
+        .route("/js/console.js", get(serve_console_js))
         .route("/js/common.js", get(serve_common_js))
         .route("/css/common.css", get(serve_common_css))
         // Settings APIs (They check session manually)
@@ -826,6 +974,14 @@ async fn main() {
         .route("/api/models", get(get_models))
         .route("/api/status", get(get_status))
         .route("/api/stats/data", get(get_stats_data))
+        .route(
+            "/api/console/logs",
+            get(get_console_logs).delete(clear_console_logs),
+        )
+        .route(
+            "/api/console/loglevel",
+            get(get_console_loglevel).post(set_console_loglevel),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             shared_state.clone(),
             auth::dual_auth_middleware,
@@ -842,6 +998,6 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&config.bind_address)
         .await
         .unwrap();
-    println!("🚀 Server safely listening on {}", config.bind_address);
+    info!("🚀 Server safely listening on {}", config.bind_address);
     axum::serve(listener, app).await.unwrap();
 }

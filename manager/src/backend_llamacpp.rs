@@ -19,11 +19,35 @@ use crate::types::GenerationParameters;
 use crate::types::MemoryStrategy;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
+use tracing::{info, warn};
 
 const LLAMA_CPP_COMPUTE_MARGIN_BYTES: u64 = 1_500 * 1024 * 1024;
 
 static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 static LLAMA_BACKEND_INIT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+extern "C" fn llama_log_callback(
+    level: llama_cpp_sys_2::ggml_log_level,
+    text: *const std::os::raw::c_char,
+    _user_data: *mut std::os::raw::c_void,
+) {
+    if text.is_null() {
+        return;
+    }
+    let msg = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
+    let msg = msg.trim_end();
+    if msg.is_empty() || msg == "." {
+        return;
+    } // Filter out empty lines and progress dots
+
+    // ggml_log_level is an enum, we cast it to i32 to avoid bindgen naming variations
+    match level {
+        4 => tracing::error!("llama.cpp: {}", msg), // GGML_LOG_LEVEL_ERROR
+        3 => tracing::warn!("llama.cpp: {}", msg),  // GGML_LOG_LEVEL_WARN
+        2 => tracing::info!("llama.cpp: {}", msg),  // GGML_LOG_LEVEL_INFO
+        _ => tracing::debug!("llama.cpp: {}", msg), // GGML_LOG_LEVEL_DEBUG
+    }
+}
 
 self_cell! {
     struct LlamaInstance {
@@ -135,7 +159,7 @@ where
 
     while generated_tokens < max_new_tokens {
         if n_cur >= max_ctx as i32 {
-            println!("⚠️ Reached maximum context length of {} tokens.", max_ctx);
+            warn!("Reached maximum context length of {} tokens.", max_ctx);
             break;
         }
 
@@ -213,19 +237,28 @@ impl LlamaCppEngine {
                             let _ = init_tx.send(Ok(()));
                             b
                         }
-                        None => match LlamaBackend::init() {
-                            Ok(b) => {
-                                let _ = init_tx.send(Ok(()));
-                                LLAMA_BACKEND.get_or_init(|| b)
+                        None => {
+                            // Wire up the C-callback to our tracing logger before init!
+                            unsafe {
+                                llama_cpp_sys_2::llama_log_set(
+                                    Some(llama_log_callback),
+                                    std::ptr::null_mut(),
+                                );
                             }
-                            Err(e) => {
-                                let _ = init_tx.send(Err(format!(
-                                    "Failed to initialize llama.cpp backend: {}",
-                                    e
-                                )));
-                                return;
+                            match LlamaBackend::init() {
+                                Ok(b) => {
+                                    let _ = init_tx.send(Ok(()));
+                                    LLAMA_BACKEND.get_or_init(|| b)
+                                }
+                                Err(e) => {
+                                    let _ = init_tx.send(Err(format!(
+                                        "Failed to initialize llama.cpp backend: {}",
+                                        e
+                                    )));
+                                    return;
+                                }
                             }
-                        },
+                        }
                     }
                 }
             };
@@ -293,8 +326,8 @@ impl LlamaCppEngine {
                                     .saturating_sub(non_layer_weights_est);
                                 n_gpu_layers =
                                     (vram_for_layers / total_cost_per_gpu_layer.max(1)) as u32;
-                                println!(
-                                    "🔀 CPU Offloading Active: Fitting {} / {} layers on GPU.",
+                                info!(
+                                    "CPU Offloading Active: Fitting {} / {} layers on GPU.",
                                     n_gpu_layers, config.num_layers
                                 );
                             }
@@ -366,17 +399,17 @@ impl LlamaCppEngine {
                                     256
                                 };
                                 final_ctx_len = dynamic_max_ctx.max(256);
-                                println!(
-                                    "🚀 Max Speed Mode (Compress): Sizing KV Cache for {} tokens based on free VRAM.",
+                                info!(
+                                    "Max Speed Mode (Compress): Sizing KV Cache for {} tokens based on free VRAM.",
                                     final_ctx_len
                                 );
                                 {
                                     let mut s = crate::types::lock_status(&status);
-                                    s.log_vram("Measure", "LlamaCpp::Plan", &format!("Reserved 1.5GB Compute Margin. Allocating KV Cache for {} tokens", final_ctx_len), 0);
+                                    s.log_vram("Measure", "LlamaCpp::Plan", &format!("Reserved 1.5GB Compute Margin. Allocating KV Cache for {} tokens.", final_ctx_len), 0);
                                 }
                             } else {
-                                println!(
-                                    "💾 Max Context Mode (Offload): Allocating KV Cache for full {} tokens.",
+                                info!(
+                                    "Max Context Mode (Offload): Allocating KV Cache for full {} tokens.",
                                     final_ctx_len
                                 );
                             }

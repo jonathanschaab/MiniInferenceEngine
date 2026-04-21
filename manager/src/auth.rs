@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, sync::Arc};
 use tokio::sync::mpsc::UnboundedSender;
 use tower_sessions::Session;
+use tracing::error;
 
 #[derive(Clone, Debug)]
 pub struct CurrentUser {
@@ -69,9 +70,9 @@ impl AuthStore {
                         .unwrap_or_default()
                         .as_secs();
                     let backup_name = format!("api_keys_{}.json.bak", timestamp);
-                    eprintln!("⚠️ CRITICAL: api_keys.json is corrupted! Error: {}", e);
-                    eprintln!(
-                        "⚠️ Backing up corrupted file to {} to prevent data loss.",
+                    error!("CRITICAL: api_keys.json is corrupted! Error: {}", e);
+                    error!(
+                        "Backing up corrupted file to {} to prevent data loss.",
                         backup_name
                     );
                     let _ = fs::rename("api_keys.json", backup_name);
@@ -132,7 +133,7 @@ impl AuthStore {
             if let Some(tx) = &self.writer_tx {
                 let _ = tx.send(json);
             } else {
-                eprintln!("⚠️ [AUTH FAULT] Writer channel missing! Dropping api_keys.json write.");
+                error!("[AUTH FAULT] Writer channel missing! Dropping api_keys.json write.");
             }
         }
     }

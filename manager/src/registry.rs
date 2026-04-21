@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::sync::RwLock;
+use tracing::{debug, warn};
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
 pub enum ModelDType {
@@ -160,7 +161,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
 
         let api_opt = Api::new().ok();
         if api_opt.is_none() {
-            println!("⚠️ WARNING: Failed to init HF API. Offline mode fallback active.");
+            warn!("Failed to init HF API. Offline mode fallback active.");
         }
         let cache = hf_hub::Cache::default();
 
@@ -385,13 +386,13 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                     if let Some(v) = val.as_u64() {
                                                         Some(v as usize)
                                                     } else {
-                                                        println!("⚠️ WARNING: Invalid format for '{}' in config.json for {}", key, reg.id);
+                                                    warn!("Invalid format for '{}' in config.json for {}", key, reg.id);
                                                         None
                                                     }
                                                 }
                                                 _ => {
                                                     if key != "head_dim" && key != "num_key_value_heads" && key != "sliding_window" {
-                                                        println!("⚠️ WARNING: Missing '{}' in config.json for {}", key, reg.id);
+                                                    warn!("Missing '{}' in config.json for {}", key, reg.id);
                                                     }
                                                     None
                                                 }
@@ -404,13 +405,13 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                     if let Some(v) = val.as_str() {
                                                         Some(v.to_string())
                                                     } else {
-                                                        println!("⚠️ WARNING: Invalid format for '{}' in config.json for {}", key, reg.id);
+                                                    warn!("Invalid format for '{}' in config.json for {}", key, reg.id);
                                                         None
                                                     }
                                                 }
                                                 _ => {
                                                     if key != "dtype" && key != "torch_dtype" {
-                                                        println!("⚠️ WARNING: Missing '{}' in config.json for {}", key, reg.id);
+                                                    warn!("Missing '{}' in config.json for {}", key, reg.id);
                                                     }
                                                     None
                                                 }
@@ -426,7 +427,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                     "xlm-roberta" => Some(ModelArch::XLMRoberta),
                                                     "gpt_oss" => Some(ModelArch::GptOss),
                                                     _ => {
-                                                        println!("⚠️ WARNING: Unrecognized 'model_type' ({}) in config.json for {}", model_type, reg.id);
+                                                    warn!("Unrecognized 'model_type' ({}) in config.json for {}", model_type, reg.id);
                                                         None
                                                     }
                                                 };
@@ -449,7 +450,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                 sliding_window = Some(v);
                                                 provenance.insert("sliding_window".to_string(), "config.json".to_string());
                                             } else {
-                                                println!("⚠️ WARNING: Missing 'sliding_window' in config.json for {}", reg.id);
+                                        debug!("Missing 'sliding_window' in config.json for {}", reg.id);
                                             }
                                         }
                                         if (rope_scaling_factor.is_none() || original_max_position_embeddings.is_none())
@@ -498,7 +499,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                     "bfloat16" => Some(ModelDType::BF16),
                                                     "float32" => Some(ModelDType::F32),
                                                     _ => {
-                                                        println!("⚠️ WARNING: Unrecognized dtype ({}) in config.json for {}", dt, reg.id);
+                                                    warn!("Unrecognized dtype ({}) in config.json for {}", dt, reg.id);
                                                         None
                                                     }
                                                 };
@@ -506,15 +507,15 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                     provenance.insert("kv_cache_dtype".to_string(), "config.json".to_string());
                                                 }
                                             } else {
-                                                println!("⚠️ WARNING: Missing both 'dtype' and 'torch_dtype' in config.json for {}", reg.id);
+                                            warn!("Missing both 'dtype' and 'torch_dtype' in config.json for {}", reg.id);
                                             }
                                         }
                                     }
                             }
-                            Err(e) => println!("⚠️ WARNING: Failed to fetch config.json for {}: {}", reg.id, e),
+                        Err(e) => warn!("Failed to fetch config.json for {}: {}", reg.id, e),
                         }
                     } else {
-                        println!("⚠️ WARNING: HF API not initialized, skipping remote config.json fetch for {}", reg.id);
+                    warn!("HF API not initialized, skipping remote config.json fetch for {}", reg.id);
                     }
                 }
 
@@ -582,7 +583,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
         for h in handles {
             match h.await {
                 Ok(config) => configs.push(config),
-                Err(e) => println!("⚠️ WARNING: Task failed to join during model resolution: {}", e),
+                Err(e) => warn!("Task failed to join during model resolution: {}", e),
             }
         }
 

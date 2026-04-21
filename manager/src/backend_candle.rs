@@ -14,6 +14,7 @@ use crate::types::EngineStatus;
 use crate::types::GenerationParameters;
 use crate::types::MemoryStrategy;
 use std::sync::{Arc, Mutex};
+use tracing::{info, warn};
 
 pub struct ExtractiveCompressor {
     base: BertModel,
@@ -82,7 +83,7 @@ pub fn load_engine(
             _ => candle_core::DType::F32,
         };
 
-        println!("💎 Loading Safetensors instantly via Mmap...");
+        info!("Loading Safetensors instantly via Mmap...");
 
         // SAFETY: The safetensors file being mapped is cached locally from Hugging Face and
         // its contents are not modified concurrently while memory mapped by the engine.
@@ -179,7 +180,7 @@ where
     let prefill_chunk_size = 256;
     let mut current_pos = 0;
 
-    println!("🔋 Prefilling {} tokens into KV Cache...", tokens.len());
+    info!("Prefilling {} tokens into KV Cache...", tokens.len());
 
     if tokens.len() > 1 {
         // Generalize using Rust's native slice chunks iterator
@@ -199,7 +200,7 @@ where
         }
     }
 
-    println!("⚡ Generation started...");
+    info!("Generation started...");
 
     let mut byte_buffer = Vec::new();
 
@@ -233,8 +234,8 @@ where
             break;
         }
         if tokens.len() >= max_context_len {
-            println!(
-                "⚠️ Reached maximum context length of {} tokens.",
+            warn!(
+                "Reached maximum context length of {} tokens.",
                 max_context_len
             );
             break;
@@ -359,8 +360,8 @@ pub async fn compress_text(
         let mut token_scores: Vec<(usize, u32, f32)> = Vec::new();
         let mut global_idx = 0;
 
-        println!(
-            "✂️ Slicing {} tokens into {}-token chunks for RoBERTa...",
+        info!(
+            "Slicing {} tokens into {}-token chunks for RoBERTa...",
             tokens.len(),
             max_chunk_size
         );
@@ -399,8 +400,8 @@ pub async fn compress_text(
         let compressed_text = tokenizer
             .decode(&kept_tokens, true)
             .map_err(|e| e.to_string())?;
-        println!(
-            "✅ Extractive compression complete. Shrunk from {} to {} tokens.",
+        info!(
+            "Extractive compression complete. Shrunk from {} to {} tokens.",
             tokens.len(),
             kept_tokens.len()
         );

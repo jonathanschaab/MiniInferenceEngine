@@ -28,9 +28,13 @@ sha2 = "0.11.0"
 hex = "0.4.3"
 async-trait = "0.1.79"
 llama-cpp-2 = { version = "0.1.143", optional = true }
+llama-cpp-sys-2 = { version = "0.1.143", optional = true }
 tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+tracing-appender = "0.2"
 
 [features]
 default = ["backend-candle"]
 backend-candle = ["candle-core", "candle-nn", "candle-transformers"]
-backend-llamacpp = ["llama-cpp-2", "llama-cpp-2/cuda"]
+backend-llamacpp = ["llama-cpp-2", "llama-cpp-sys-2", "llama-cpp-2/cuda"]

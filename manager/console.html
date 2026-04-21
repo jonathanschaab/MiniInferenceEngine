@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Engine Console - Mini Inference Engine</title>
+    <link rel="stylesheet" href="/css/common.css">
+    <style>
+        .console-wrapper {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 160px);
+            background: #181825;
+            border: 1px solid #313244;
+            border-radius: 8px;
+            overflow: hidden;
+            margin: 20px;
+        }
+        .console-output {
+            flex-grow: 1;
+            padding: 16px;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            color: #cdd6f4;
+            background-color: #11111b;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>System Console</h1>
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button onclick="window.location.href='/'" style="background: #89b4fa; height: 30px; padding: 0 10px;">💬 Chat</button>
+            <button onclick="window.location.href='/models'" style="background: #fab387; height: 30px; padding: 0 10px;">🤖 Models</button>
+            <button onclick="window.location.href='/memory'" style="background: #f9e2af; height: 30px; padding: 0 10px;">💾 Memory</button>
+            <button onclick="window.location.href='/stats'" style="background: #cba6f7; height: 30px; padding: 0 10px;">📊 Stats</button>
+            <button onclick="window.location.href='/settings'" style="background: #a6e3a1; height: 30px; padding: 0 10px;">⚙️ Settings</button>
+            <button onclick="window.location.href='/auth/logout'" style="background: #45475a; color: white; height: 30px; padding: 0 10px;">Logout</button>
+        </div>
+    </header>
+
+    <!-- Control Bar -->
+    <div style="background: #181825; padding: 10px 20px; border-bottom: 1px solid #313244; display: flex; gap: 15px; align-items: center; justify-content: space-between;">
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <select id="logLevel" style="background: #313244; color: white; border: 1px solid #45475a; padding: 5px; border-radius: 4px;">
+                    <option value="trace">TRACE</option>
+                    <option value="debug">DEBUG</option>
+                    <option value="info">INFO</option>
+                    <option value="warn">WARN</option>
+                    <option value="error">ERROR</option>
+                </select>
+            <button id="applyLogLevel" style="background: #89dceb; height: 30px; padding: 0 10px;">Apply Filter</button>
+        </div>
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button id="clearLogs" style="background: #f38ba8; height: 30px; padding: 0 10px;">🗑️ Clear Logs</button>
+        </div>
+    </div>
+
+    <div class="console-wrapper">
+        <div id="logContainer" class="console-output"></div>
+    </div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/console.js"></script>
+</body>
+</html>
