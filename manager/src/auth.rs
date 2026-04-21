@@ -128,6 +128,19 @@ impl AuthStore {
         plaintext_key
     }
 
+    pub fn revoke_key(&mut self, email: &str, hash: &str) -> bool {
+        if let Some(keys) = self.api_keys.get_mut(email) {
+            let initial_len = keys.len();
+            keys.retain(|k| k.hash != hash);
+            if keys.len() < initial_len {
+                self.key_index.remove(hash); // Keep O(1) cache in sync
+                self.save();
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn save(&self) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
             if let Some(tx) = &self.writer_tx {
@@ -313,14 +326,7 @@ pub async fn delete_key_handler(
         .auth_store
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(keys) = store.api_keys.get_mut(&email) {
-        let initial_len = keys.len();
-        keys.retain(|k| k.hash != hash);
-        if keys.len() < initial_len {
-            store.key_index.remove(&hash); // Keep O(1) cache in sync
-            store.save();
-        }
-    }
+    store.revoke_key(&email, &hash);
     Ok(StatusCode::OK)
 }
 
@@ -396,12 +402,7 @@ mod tests {
         };
 
         // Simulate the manual deletion route
-        store
-            .api_keys
-            .get_mut("test@local")
-            .unwrap()
-            .retain(|k| k.hash != key2_hash);
-        store.key_index.remove(&key2_hash);
+        store.revoke_key("test@local", &key2_hash);
 
         assert!(!store.key_index.contains_key(&key2_hash));
     }

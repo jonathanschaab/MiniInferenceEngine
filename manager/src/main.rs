@@ -1089,6 +1089,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::fmt::MakeWriter;
 
     #[test]
     fn test_app_config_defaults() {
@@ -1110,10 +1111,7 @@ mod tests {
         let buffer = SharedLogBuffer(Arc::new(Mutex::new((0, std::collections::VecDeque::new()))));
 
         for i in 0..1010 {
-            let mut writer = SharedLogWriter {
-                buffer: buffer.0.clone(),
-                local_buf: Vec::new(),
-            };
+            let mut writer = buffer.make_writer();
             use std::io::Write;
             let _ = writer.write(format!("Log line {}\n", i).as_bytes());
             // Dropping the writer triggers the flush to the shared buffer
@@ -1129,10 +1127,7 @@ mod tests {
     fn test_shared_log_writer_empty_drop() {
         let buffer = SharedLogBuffer(Arc::new(Mutex::new((0, std::collections::VecDeque::new()))));
         {
-            let mut writer = SharedLogWriter {
-                buffer: buffer.0.clone(),
-                local_buf: Vec::new(),
-            };
+            let mut writer = buffer.make_writer();
             let _ = std::io::Write::write(&mut writer, b"   \n"); // Just whitespace
         }
         let guard = buffer.0.lock().unwrap();

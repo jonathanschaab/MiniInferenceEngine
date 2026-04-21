@@ -24,23 +24,25 @@ async function mockStaticAssets(page) {
     };
 
     for (const [routePath, file] of Object.entries(routes)) {
-        await page.route(routePath, route => {
+        await page.route(routePath, async route => {
             route.fulfill({
                 contentType: 'text/html',
-                body: fs.readFileSync(path.join(basePath, file))
+                body: await fs.promises.readFile(path.join(basePath, file))
             });
         });
     }
 
     // Mock CSS & JS assets
-    await page.route('**/css/*.css', route => {
-        const file = route.request().url().split('/').pop();
-        route.fulfill({ contentType: 'text/css', body: fs.readFileSync(path.join(basePath, file)) });
+    await page.route('**/css/*.css', async route => {
+        const urlObj = new URL(route.request().url());
+        const file = urlObj.pathname.split('/').pop();
+        route.fulfill({ contentType: 'text/css', body: await fs.promises.readFile(path.join(basePath, file)) });
     });
 
-    await page.route('**/js/*.js', route => {
-        const file = route.request().url().split('/').pop();
-        route.fulfill({ contentType: 'application/javascript', body: fs.readFileSync(path.join(basePath, file)) });
+    await page.route('**/js/*.js', async route => {
+        const urlObj = new URL(route.request().url());
+        const file = urlObj.pathname.split('/').pop();
+        route.fulfill({ contentType: 'application/javascript', body: await fs.promises.readFile(path.join(basePath, file)) });
     });
 }
 
