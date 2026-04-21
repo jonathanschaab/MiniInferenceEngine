@@ -104,12 +104,15 @@ pub struct SharedLogWriter {
 
 impl std::io::Write for SharedLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let s = String::from_utf8_lossy(buf).into_owned();
-        let mut logs = self.buffer.lock().unwrap();
-        // Exclude the trailing newline added by the fmt layer since UI handles lines
-        logs.push_back(s.trim_end().to_string());
-        if logs.len() > 1000 {
-            logs.pop_front();
+        let s = String::from_utf8_lossy(buf);
+        let trimmed = s.trim_end();
+        if !trimmed.is_empty() {
+            let mut logs = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            // Exclude the trailing newline added by the fmt layer since UI handles lines
+            logs.push_back(trimmed.to_string());
+            if logs.len() > 1000 {
+                logs.pop_front();
+            }
         }
         Ok(buf.len())
     }
@@ -697,12 +700,22 @@ async fn serve_console_js() -> impl IntoResponse {
 async fn get_console_logs(
     State(state): State<Arc<AppState>>,
 ) -> Json<std::collections::VecDeque<String>> {
-    let logs = state.log_buffer.0.lock().unwrap().clone();
+    let logs = state
+        .log_buffer
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     Json(logs)
 }
 
 async fn clear_console_logs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    state.log_buffer.0.lock().unwrap().clear();
+    state
+        .log_buffer
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     StatusCode::OK
 }
 
@@ -728,12 +741,19 @@ async fn set_console_loglevel(
         )
             .into_response();
     }
-    *state.current_log_level.lock().unwrap() = payload.level.clone();
+    *state
+        .current_log_level
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = payload.level.clone();
     (StatusCode::OK, "Log level updated").into_response()
 }
 
 async fn get_console_loglevel(State(state): State<Arc<AppState>>) -> Json<LogLevelRequest> {
-    let level = state.current_log_level.lock().unwrap().clone();
+    let level = state
+        .current_log_level
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     Json(LogLevelRequest { level })
 }
 

@@ -40,12 +40,11 @@ extern "C" fn llama_log_callback(
         return;
     } // Filter out empty lines and progress dots
 
-    // ggml_log_level is an enum, we cast it to i32 to avoid bindgen naming variations
     match level {
-        4 => tracing::error!("llama.cpp: {}", msg), // GGML_LOG_LEVEL_ERROR
-        3 => tracing::warn!("llama.cpp: {}", msg),  // GGML_LOG_LEVEL_WARN
-        2 => tracing::info!("llama.cpp: {}", msg),  // GGML_LOG_LEVEL_INFO
-        _ => tracing::debug!("llama.cpp: {}", msg), // GGML_LOG_LEVEL_DEBUG
+        llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => tracing::error!("llama.cpp: {}", msg),
+        llama_cpp_sys_2::GGML_LOG_LEVEL_WARN => tracing::warn!("llama.cpp: {}", msg),
+        llama_cpp_sys_2::GGML_LOG_LEVEL_INFO => tracing::info!("llama.cpp: {}", msg),
+        _ => tracing::debug!("llama.cpp: {}", msg),
     }
 }
 
