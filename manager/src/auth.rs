@@ -326,8 +326,11 @@ pub async fn delete_key_handler(
         .auth_store
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    store.revoke_key(&email, &hash);
-    Ok(StatusCode::OK)
+    if store.revoke_key(&email, &hash) {
+        Ok(StatusCode::OK)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 // --- DUAL-AUTH MIDDLEWARE (Session OR API Key) ---
@@ -402,9 +405,14 @@ mod tests {
         };
 
         // Simulate the manual deletion route
-        store.revoke_key("test@local", &key2_hash);
+        let success = store.revoke_key("test@local", &key2_hash);
+        assert!(success, "Revoking an existing key should return true");
 
         assert!(!store.key_index.contains_key(&key2_hash));
+
+        // Deleting a non-existent or already deleted key returns false (which the router maps to 404 NOT FOUND)
+        assert!(!store.revoke_key("test@local", &key2_hash));
+        assert!(!store.revoke_key("fakeuser@local", "fake_hash"));
     }
 
     #[test]
