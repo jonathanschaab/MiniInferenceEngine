@@ -593,3 +593,127 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
 
     registry_lock.read().await.clone()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn mock_config(arch: ModelArch, dtype: ModelDType) -> ModelConfig {
+        ModelConfig {
+            id: "test".into(),
+            name: "test".into(),
+            repo: "test".into(),
+            tokenizer_repo: "test".into(),
+            filename: "test".into(),
+            max_context_len: 1024,
+            max_yarn_context: 1024,
+            sliding_window: None,
+            rope_scaling_factor: None,
+            original_max_position_embeddings: None,
+            num_layers: 32,
+            n_embd: 4096,
+            n_head: 32,
+            n_head_kv: 8,
+            head_dim: 128,
+            roles: vec![],
+            arch,
+            compression_dtype: None,
+            kv_cache_dtype: dtype,
+            parameters_billions: 7.0,
+            non_layer_params_billions: 0.5,
+            size_on_disk_gb: 4.0,
+            supported_backends: vec![],
+            is_default_chat: false,
+            is_default_compressor: false,
+            provenance: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_prompt_formatter_llama() {
+        let arch = ModelArch::Llama;
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
+        let prompt = arch.format_chat(&msgs);
+        assert_eq!(
+            prompt,
+            "<|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
+    fn test_prompt_formatter_qwen() {
+        let arch = ModelArch::Qwen2;
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+        }];
+        let prompt = arch.format_chat(&msgs);
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn test_prompt_formatter_gpt_oss() {
+        let arch = ModelArch::GptOss;
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+        }];
+        let prompt = arch.format_chat(&msgs);
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn test_prompt_formatter_fallback() {
+        let arch = ModelArch::XLMRoberta;
+        let msgs = vec![Message {
+            role: "system".into(),
+            content: "test".into(),
+        }];
+        let prompt = arch.format_chat(&msgs);
+        assert_eq!(prompt, "system: test\nassistant: ");
+    }
+
+    #[test]
+    fn test_prompt_formatter_empty_messages() {
+        let msgs = vec![];
+        assert_eq!(
+            ModelArch::Llama.format_chat(&msgs),
+            "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+        assert_eq!(
+            ModelArch::Qwen2.format_chat(&msgs),
+            "<|im_start|>assistant\n"
+        );
+        assert_eq!(ModelArch::XLMRoberta.format_chat(&msgs), "assistant: ");
+    }
+
+    #[test]
+    fn test_estimate_kv_bytes() {
+        let config = mock_config(ModelArch::Llama, ModelDType::F16);
+        // 2 * 32 * 128 * 8 * 2 = 131,072
+        assert_eq!(config.estimate_kv_bytes_per_token(), 131_072);
+    }
+
+    #[test]
+    fn test_estimate_kv_bytes_f32() {
+        let config = mock_config(ModelArch::Llama, ModelDType::F32);
+        // 2 * 32 * 128 * 8 * 4 = 262,144
+        assert_eq!(config.estimate_kv_bytes_per_token(), 262_144);
+    }
+
+    #[test]
+    fn test_estimate_kv_bytes_compressor() {
+        let config = mock_config(ModelArch::XLMRoberta, ModelDType::F16);
+        assert_eq!(config.estimate_kv_bytes_per_token(), 0); // Context compressors have no generative KV cache
+    }
+}

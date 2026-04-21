@@ -1,0 +1,9 @@
+{
+  "name": "mini-inference-engine-ui-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@playwright/test": "^1.40.0"
+  }
+}

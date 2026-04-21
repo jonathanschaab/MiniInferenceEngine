@@ -1085,3 +1085,67 @@ async fn main() {
     info!("🚀 Server safely listening on {}", config.bind_address);
     axum::serve(listener, app).await.unwrap();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_config_defaults() {
+        let config = AppConfig::default();
+        assert_eq!(config.bind_address, "127.0.0.1:3000");
+        assert_eq!(config.secure_cookies, true);
+    }
+
+    #[test]
+    fn test_app_config_log_defaults() {
+        assert_eq!(default_log_level_console(), "info");
+        assert_eq!(default_log_level_file(), "warn");
+        assert_eq!(default_log_level_memory(), "debug");
+        assert_eq!(default_log_file_name(), "server.log");
+    }
+
+    #[test]
+    fn test_shared_log_writer_circular_buffer() {
+        let buffer = SharedLogBuffer(Arc::new(Mutex::new((0, std::collections::VecDeque::new()))));
+
+        for i in 0..1010 {
+            let mut writer = SharedLogWriter {
+                buffer: buffer.0.clone(),
+                local_buf: Vec::new(),
+            };
+            use std::io::Write;
+            let _ = writer.write(format!("Log line {}\n", i).as_bytes());
+            // Dropping the writer triggers the flush to the shared buffer
+        }
+
+        let guard = buffer.0.lock().unwrap();
+        assert_eq!(guard.0, 1010); // Verifies the total emitted cursor is intact
+        assert_eq!(guard.1.len(), 1000); // Verifies the circular truncation works
+        assert_eq!(guard.1.front().unwrap(), "Log line 10"); // Oldest retained
+    }
+
+    #[test]
+    fn test_shared_log_writer_empty_drop() {
+        let buffer = SharedLogBuffer(Arc::new(Mutex::new((0, std::collections::VecDeque::new()))));
+        {
+            let mut writer = SharedLogWriter {
+                buffer: buffer.0.clone(),
+                local_buf: Vec::new(),
+            };
+            let _ = std::io::Write::write(&mut writer, b"   \n"); // Just whitespace
+        }
+        let guard = buffer.0.lock().unwrap();
+        assert_eq!(guard.0, 0); // Should not increment cursor for empty/whitespace logs
+        assert!(guard.1.is_empty());
+    }
+
+    #[test]
+    fn test_log_query_deserialization() {
+        let query: LogQuery = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(query.since, None);
+
+        let query: LogQuery = serde_json::from_str(r#"{"since": 42}"#).unwrap();
+        assert_eq!(query.since, Some(42));
+    }
+}

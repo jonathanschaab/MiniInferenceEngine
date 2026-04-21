@@ -624,3 +624,15 @@ impl InferenceBackend for LlamaCppEngine {
         self.offload_pct
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Requires GPU (Suite 2)"]
+    fn test_llamacpp_gpu_init() {
+        let engine = LlamaCppEngine::new(0);
+        assert!(engine.is_ok(), "Llama.cpp Backend must init on GPU node");
+    }
+}
