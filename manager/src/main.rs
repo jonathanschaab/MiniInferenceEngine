@@ -96,28 +96,35 @@ pub mod auth;
 
 // --- SHARED MEMORY LOG WRITER ---
 #[derive(Clone)]
-pub struct SharedLogBuffer(pub Arc<Mutex<std::collections::VecDeque<String>>>);
+pub struct SharedLogBuffer(pub Arc<Mutex<(usize, std::collections::VecDeque<String>)>>);
 
 pub struct SharedLogWriter {
-    buffer: Arc<Mutex<std::collections::VecDeque<String>>>,
+    buffer: Arc<Mutex<(usize, std::collections::VecDeque<String>)>>,
+    local_buf: Vec<u8>,
 }
 
 impl std::io::Write for SharedLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let s = String::from_utf8_lossy(buf);
-        let trimmed = s.trim_end();
-        if !trimmed.is_empty() {
-            let mut logs = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
-            // Exclude the trailing newline added by the fmt layer since UI handles lines
-            logs.push_back(trimmed.to_string());
-            if logs.len() > 1000 {
-                logs.pop_front();
-            }
-        }
+        self.local_buf.extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl Drop for SharedLogWriter {
+    fn drop(&mut self) {
+        let s = String::from_utf8_lossy(&self.local_buf);
+        let trimmed = s.trim_end();
+        if !trimmed.is_empty() {
+            let mut guard = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            guard.1.push_back(trimmed.to_string());
+            guard.0 += 1; // Increment the global cursor counter
+            if guard.1.len() > 1000 {
+                guard.1.pop_front();
+            }
+        }
     }
 }
 
@@ -126,6 +133,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
     fn make_writer(&'a self) -> Self::Writer {
         SharedLogWriter {
             buffer: self.0.clone(),
+            local_buf: Vec::new(),
         }
     }
 }
@@ -702,20 +710,46 @@ async fn serve_console_js() -> impl IntoResponse {
     )
 }
 
+#[derive(Deserialize)]
+pub struct LogQuery {
+    pub since: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct LogResponse {
+    pub logs: Vec<String>,
+    pub next_cursor: usize,
+}
+
 async fn get_console_logs(
     user: auth::CurrentUser,
+    axum::extract::Query(query): axum::extract::Query<LogQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     if !user.is_admin {
         return (StatusCode::FORBIDDEN, "Admin access required").into_response();
     }
-    let logs = state
-        .log_buffer
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    Json(logs).into_response()
+    let guard = state.log_buffer.0.lock().unwrap_or_else(|e| e.into_inner());
+
+    let total_emitted = guard.0;
+    let buffer = &guard.1;
+    let oldest_available = total_emitted.saturating_sub(buffer.len());
+    let since = query.since.unwrap_or(0);
+
+    let logs = if since < oldest_available {
+        buffer.iter().cloned().collect() // Client fell behind; send everything
+    } else if since >= total_emitted {
+        Vec::new() // Up to date
+    } else {
+        let start_idx = since - oldest_available;
+        buffer.iter().skip(start_idx).cloned().collect() // Send only missing slice
+    };
+
+    Json(LogResponse {
+        logs,
+        next_cursor: total_emitted,
+    })
+    .into_response()
 }
 
 async fn clear_console_logs(
@@ -725,12 +759,9 @@ async fn clear_console_logs(
     if !user.is_admin {
         return (StatusCode::FORBIDDEN, "Admin access required").into_response();
     }
-    state
-        .log_buffer
-        .0
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    let mut guard = state.log_buffer.0.lock().unwrap_or_else(|e| e.into_inner());
+    guard.1.clear();
+    guard.0 = 0;
     StatusCode::OK.into_response()
 }
 
@@ -860,7 +891,8 @@ async fn main() {
         .with_filter(EnvFilter::new(&config.log_level_file));
 
     // --- 3. IN-MEMORY BUFFER LAYER (RELOADABLE) ---
-    let memory_buffer = SharedLogBuffer(Arc::new(Mutex::new(std::collections::VecDeque::new())));
+    let memory_buffer =
+        SharedLogBuffer(Arc::new(Mutex::new((0, std::collections::VecDeque::new()))));
     let memory_filter = EnvFilter::new(&config.log_level_memory);
     let (reloadable_memory_filter, log_reload_handle) =
         tracing_subscriber::reload::Layer::new(memory_filter);

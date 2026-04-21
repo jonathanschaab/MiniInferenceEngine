@@ -5,6 +5,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const levelSelect = document.getElementById("logLevel");
 
     let isAtBottom = true;
+    let currentCursor = 0;
 
     logContainer.addEventListener("scroll", () => {
         const threshold = 10; // Pixel threshold to snap to bottom
@@ -41,27 +42,41 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function fetchLogs() {
         try {
-            const res = await fetch("/api/console/logs");
+            const res = await fetch(`/api/console/logs?since=${currentCursor}`);
             if (res.ok) {
-                const logs = await res.json();
-                const newHtml = logs.map(line => {
-                    let safe = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                    safe = safe.replace(/\bERROR\b/, '<span style="color: #f38ba8; font-weight: bold;">ERROR</span>');
-                    safe = safe.replace(/\bWARN\b/, '<span style="color: #f9e2af; font-weight: bold;">WARN</span>');
-                    safe = safe.replace(/\bINFO\b/, '<span style="color: #89b4fa; font-weight: bold;">INFO</span>');
-                    safe = safe.replace(/\bDEBUG\b/, '<span style="color: #a6adc8; font-weight: bold;">DEBUG</span>');
-                    safe = safe.replace(/\bTRACE\b/, '<span style="color: #cba6f7; font-weight: bold;">TRACE</span>');
-                    return safe;
-                }).join("\n");
+                const data = await res.json();
                 
-                if (logContainer.innerHTML !== newHtml) {
-                    logContainer.innerHTML = newHtml;
+                if (data.logs && data.logs.length > 0) {
+                    if (data.next_cursor - currentCursor >= 1000 || currentCursor === 0) {
+                        logContainer.innerHTML = ""; // Hard reset if we fell entirely behind
+                    }
+
+                    const fragment = document.createDocumentFragment();
                     
-                    // Only auto-scroll if the user hasn't manually scrolled up
+                    data.logs.forEach(line => {
+                        let safe = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                        safe = safe.replace(/\bERROR\b/, '<span style="color: #f38ba8; font-weight: bold;">ERROR</span>');
+                        safe = safe.replace(/\bWARN\b/, '<span style="color: #f9e2af; font-weight: bold;">WARN</span>');
+                        safe = safe.replace(/\bINFO\b/, '<span style="color: #89b4fa; font-weight: bold;">INFO</span>');
+                        safe = safe.replace(/\bDEBUG\b/, '<span style="color: #a6adc8; font-weight: bold;">DEBUG</span>');
+                        safe = safe.replace(/\bTRACE\b/, '<span style="color: #cba6f7; font-weight: bold;">TRACE</span>');
+                        
+                        const div = document.createElement("div");
+                        div.innerHTML = safe;
+                        fragment.appendChild(div);
+                    });
+                    
+                    logContainer.appendChild(fragment);
+                    
+                    while (logContainer.childElementCount > 1000) {
+                        logContainer.removeChild(logContainer.firstElementChild);
+                    }
+                    
                     if (isAtBottom) {
                         logContainer.scrollTop = logContainer.scrollHeight;
                     }
                 }
+                currentCursor = data.next_cursor;
             }
         } catch (e) {
             console.error("Failed to fetch engine logs", e);
@@ -81,6 +96,7 @@ document.addEventListener("DOMContentLoaded", () => {
     clearBtn.addEventListener("click", async () => {
         await fetch("/api/console/logs", { method: "DELETE" });
         logContainer.innerHTML = "";
+        currentCursor = 0;
         isAtBottom = true;
     });
 
