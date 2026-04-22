@@ -24,10 +24,13 @@ jobs:
         env:
           CUDA_COMPUTE_CAP: "86" # Bypasses nvidia-smi auto-detection since runners lack GPUs
         run: cargo clippy --all-targets --all-features --target x86_64-unknown-linux-gnu -- -D warnings
+      - name: Prepare CUDA Stubs for Linux Runner
+        run: sudo ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 || true
       - name: Run CPU Unit Tests (Suite 1)
         working-directory: manager
         env:
           CUDA_COMPUTE_CAP: "86"
+          LD_LIBRARY_PATH: /usr/local/cuda/lib64/stubs:${{ env.LD_LIBRARY_PATH }}
         run: cargo test --all-features --target x86_64-unknown-linux-gnu
       - name: Setup Node.js
         uses: actions/setup-node@v4
