@@ -161,8 +161,10 @@ mod tests {
     #[test]
     fn test_telemetry_unsaved_events_batching() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut store = TelemetryStore::default();
-        store.writer_tx = Some(tx);
+        let mut store = TelemetryStore {
+            writer_tx: Some(tx),
+            ..Default::default()
+        };
 
         // Record 4 loads (less than 5)
         for i in 0..4 {

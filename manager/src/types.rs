@@ -438,7 +438,7 @@ mod tests {
 
         // lock_status should safely recover the guard and its state
         let guard = lock_status(&status);
-        assert_eq!(guard.benchmark_running, true);
+        assert!(guard.benchmark_running);
     }
 
     #[test]

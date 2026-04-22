@@ -1095,7 +1095,7 @@ mod tests {
     fn test_app_config_defaults() {
         let config = AppConfig::default();
         assert_eq!(config.bind_address, "127.0.0.1:3000");
-        assert_eq!(config.secure_cookies, true);
+        assert!(config.secure_cookies);
     }
 
     #[test]
