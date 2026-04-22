@@ -581,3 +581,18 @@ impl InferenceBackend for CandleEngine {
         0.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Requires GPU (Suite 2)"]
+    fn test_candle_gpu_init() {
+        let engine = CandleEngine::new(0);
+        assert!(
+            matches!(engine.device, candle_core::Device::Cuda(_)),
+            "Candle must latch onto CUDA 0"
+        );
+    }
+}

@@ -933,3 +933,23 @@ pub async fn run_batcher_loop(
         }
     } // Closes the 'main while loop
 } // Closes the run_batcher_loop function
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_backend_cpu_fallback() {
+        let backend = create_backend(&BackendType::Candle, 999);
+        assert!(backend.is_ok());
+    }
+
+    #[test]
+    #[ignore = "Requires GPU (Suite 2)"]
+    fn test_vram_info_with_gpu() {
+        let nvml = Nvml::init().ok();
+        assert!(nvml.is_some(), "NVML must init on test runner with GPU");
+        let info = get_vram_info(nvml.as_ref(), 0);
+        assert!(info.is_some());
+    }
+}

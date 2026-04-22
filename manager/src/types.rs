@@ -277,3 +277,188 @@ pub struct UserRequest {
     pub parameters: GenerationParameters,
     pub target_backend: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_engine_status_vram() {
+        let mut status = EngineStatus::default();
+        status.set_model_vram(
+            "model_a".into(),
+            "Candle".into(),
+            false,
+            "Active".into(),
+            100,
+            50,
+            10,
+        );
+        status.set_model_vram(
+            "model_b".into(),
+            "LlamaCpp".into(),
+            true,
+            "Idle".into(),
+            200,
+            100,
+            20,
+        );
+
+        assert_eq!(status.total_engine_vram(), 480); // 160 + 320
+
+        status.remove_model_vram("model_a");
+        assert_eq!(status.total_engine_vram(), 320);
+    }
+
+    #[test]
+    fn test_event_log_limits() {
+        let mut status = EngineStatus::default();
+        for i in 0..150 {
+            status.log_vram("Allocate", "Sys", "Test", i as i64);
+            status.log_ram("Allocate", "Sys", "Test", i as i64);
+        }
+        assert_eq!(status.vram_events.len(), 100);
+        assert_eq!(status.ram_events.len(), 100);
+    }
+
+    #[test]
+    fn test_engine_status_mutators() {
+        let mut status = EngineStatus::default();
+        status.set_model_vram(
+            "model_a".into(),
+            "Candle".into(),
+            false,
+            "Idle".into(),
+            100,
+            50,
+            10,
+        );
+
+        // Test set_model_status
+        status.set_model_status("model_a", "Active");
+        assert_eq!(status.models_vram[0].status, "Active");
+
+        // Test remove missing model (should safely no-op)
+        let prev_vram = status.total_engine_vram();
+        status.remove_model_vram("nonexistent_model");
+        assert_eq!(status.models_vram.len(), 1);
+        assert_eq!(status.total_engine_vram(), prev_vram);
+    }
+
+    #[test]
+    fn test_update_nvml_dynamic_vram() {
+        let mut status = EngineStatus::default();
+
+        // 1. Simulate an idle system with 10GB total, 2GB used initially
+        status.update_nvml(10000, 2000, 8000);
+        assert_eq!(status.baseline_other_vram, 2000);
+
+        // 2. Add two models, one static (LlamaCpp), one dynamic (Candle)
+        status.set_model_vram(
+            "static_model".into(),
+            "LlamaCpp".into(),
+            true,
+            "Active".into(),
+            1000,
+            500,
+            0,
+        );
+        status.set_model_vram(
+            "dynamic_model".into(),
+            "Candle".into(),
+            false,
+            "Active".into(),
+            1000,
+            0,
+            0,
+        );
+
+        // 3. Update NVML again. Assume total VRAM usage jumped to 5500.
+        status.update_nvml(10000, 5500, 4500);
+
+        // The dynamic usage pool should be: 5500 (used) - 2000 (baseline) - 1500 (static_model) - 1000 (dynamic_weights) = 1000.
+        let dyn_model = status
+            .models_vram
+            .iter()
+            .find(|m| m.id == "dynamic_model")
+            .unwrap();
+        assert_eq!(dyn_model.kv_cache, 1000);
+    }
+
+    #[test]
+    fn test_update_sysinfo_math() {
+        let mut status = EngineStatus::default();
+        status.update_sysinfo(16000, 8000, 8000, 2000);
+        assert_eq!(status.ram_other_processes, 6000); // 8000 used - 2000 engine process
+    }
+
+    #[test]
+    fn test_update_nvml_baseline_ratchet() {
+        let mut status = EngineStatus::default();
+        // Start at 2000 used, no models
+        status.update_nvml(10000, 2000, 8000);
+        assert_eq!(status.baseline_other_vram, 2000);
+
+        // Now assume usage drops to 1500. The engine should ratchet the baseline down
+        status.update_nvml(10000, 1500, 8500);
+        assert_eq!(status.baseline_other_vram, 1500);
+    }
+
+    #[test]
+    fn test_generation_parameters_default() {
+        let params = GenerationParameters::default();
+        assert_eq!(params.temperature, Some(0.7));
+        assert_eq!(params.max_tokens, Some(500));
+        assert_eq!(params.memory_strategy, Some(MemoryStrategy::Offload));
+    }
+
+    #[test]
+    fn test_memory_strategy_serde() {
+        // Tests #[serde(rename_all = "lowercase")] ensuring UI compatibility
+        let json = serde_json::to_string(&MemoryStrategy::Offload).unwrap();
+        assert_eq!(json, "\"offload\"");
+        let strategy: MemoryStrategy = serde_json::from_str("\"compress\"").unwrap();
+        assert_eq!(strategy, MemoryStrategy::Compress);
+    }
+
+    #[test]
+    fn test_lock_status_poison_recovery() {
+        let status = Arc::new(Mutex::new(EngineStatus::default()));
+
+        // Poison the mutex on purpose inside a separate thread
+        let status_clone = status.clone();
+        let _ = std::thread::spawn(move || {
+            let mut guard = status_clone.lock().unwrap();
+            guard.benchmark_running = true;
+            panic!("Intentional panic to poison the mutex");
+        })
+        .join();
+
+        assert!(status.lock().is_err(), "Mutex should be poisoned");
+
+        // lock_status should safely recover the guard and its state
+        let guard = lock_status(&status);
+        assert!(guard.benchmark_running);
+    }
+
+    #[test]
+    fn test_update_nvml_zero_active_dynamic() {
+        let mut status = EngineStatus::default();
+        status.update_nvml(10000, 2000, 8000);
+
+        // Add a dynamic model but keep it "Idle" (active_count == 0)
+        status.set_model_vram(
+            "idle_dyn".into(),
+            "Candle".into(),
+            false,
+            "Idle".into(),
+            1000,
+            0,
+            0,
+        );
+
+        // With active_count == 0, the baseline recalculates: 3500 used - 1000 static weights = 2500
+        status.update_nvml(10000, 3500, 6500);
+        assert_eq!(status.baseline_other_vram, 2500);
+    }
+}

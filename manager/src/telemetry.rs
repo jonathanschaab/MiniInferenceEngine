@@ -131,3 +131,65 @@ impl TelemetryStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::GenerationParameters;
+
+    #[test]
+    fn test_telemetry_store_limits() {
+        let mut store = TelemetryStore::default();
+        for i in 0..150 {
+            store.record_load(format!("model_{}", i), "Candle".into(), 100);
+            store.record_generation(
+                format!("model_{}", i),
+                "Candle".into(),
+                GenerationParameters::default(),
+                0.0,
+                10,
+                10,
+                50,
+                150,
+            );
+        }
+        // Enforces the drain behavior triggering on length > 100
+        assert!(store.loads.len() <= 100);
+        assert!(store.generations.len() <= 100);
+    }
+
+    #[test]
+    fn test_telemetry_unsaved_events_batching() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut store = TelemetryStore {
+            writer_tx: Some(tx),
+            ..Default::default()
+        };
+
+        // Record 4 loads (less than 5)
+        for i in 0..4 {
+            store.record_load(format!("model_{}", i), "Candle".into(), 100);
+        }
+        assert_eq!(store.unsaved_events, 4);
+        assert!(rx.try_recv().is_err()); // No save triggered yet
+
+        // Record 5th load (triggers save)
+        store.record_load("model_4".into(), "Candle".into(), 100);
+        assert_eq!(store.unsaved_events, 0);
+        assert!(rx.try_recv().is_ok()); // Save was triggered and message sent
+    }
+
+    #[test]
+    fn test_load_metric_default_backend() {
+        let json = r#"{"timestamp": 123, "model_id": "test", "load_time_ms": 456}"#;
+        let metric: LoadMetric = serde_json::from_str(json).unwrap();
+        assert_eq!(metric.backend, "Unknown");
+    }
+
+    #[test]
+    fn test_telemetry_save_to_disk_missing_channel() {
+        let store = TelemetryStore::default();
+        // Verifies the method gracefully drops payloads without panicking if channel gets severed
+        store.save_to_disk();
+    }
+}

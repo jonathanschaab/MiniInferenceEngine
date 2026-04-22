@@ -79,3 +79,43 @@ pub fn process_utf8_buffer(byte_buffer: &mut Vec<u8>) -> String {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_utf8_buffer() {
+        // 1. Valid complete utf8
+        let mut buf = vec![b'h', b'e', b'l', b'l', b'o'];
+        assert_eq!(process_utf8_buffer(&mut buf), "hello");
+        assert!(buf.is_empty());
+
+        // 2. Incomplete utf8 (emoji split mid-byte)
+        let mut buf = vec![0xF0, 0x9F, 0x92]; // Missing final byte for 💫
+        assert_eq!(process_utf8_buffer(&mut buf), "");
+        assert_eq!(buf, vec![0xF0, 0x9F, 0x92]); // Buffer retains the partial sequence
+
+        buf.push(0xAB);
+        assert_eq!(process_utf8_buffer(&mut buf), "💫");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_process_utf8_buffer_invalid_replacement() {
+        // Submits 3 completely invalid bytes to the decoder
+        let mut buf = vec![0xFF, 0xFE, 0xFD];
+        let decoded = process_utf8_buffer(&mut buf);
+        assert_eq!(decoded, "\u{FFFD}\u{FFFD}\u{FFFD}"); // Yields 3 standard replacement chars
+        assert!(buf.is_empty()); // Buffer gracefully recovered by dropping garbage
+    }
+
+    #[test]
+    fn test_process_utf8_buffer_mixed_valid_invalid() {
+        // Valid ASCII mixed with an invalid byte in the middle
+        let mut buf = vec![b'a', b'b', b'c', 0xFF, b'x', b'y', b'z'];
+        let decoded = process_utf8_buffer(&mut buf);
+        assert_eq!(decoded, "abc\u{FFFD}xyz");
+        assert!(buf.is_empty());
+    }
+}

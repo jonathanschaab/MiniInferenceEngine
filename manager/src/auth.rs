@@ -128,6 +128,19 @@ impl AuthStore {
         plaintext_key
     }
 
+    pub fn revoke_key(&mut self, email: &str, hash: &str) -> bool {
+        if let Some(keys) = self.api_keys.get_mut(email) {
+            let initial_len = keys.len();
+            keys.retain(|k| k.hash != hash);
+            if keys.len() < initial_len {
+                self.key_index.remove(hash); // Keep O(1) cache in sync
+                self.save();
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn save(&self) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
             if let Some(tx) = &self.writer_tx {
@@ -313,15 +326,11 @@ pub async fn delete_key_handler(
         .auth_store
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(keys) = store.api_keys.get_mut(&email) {
-        let initial_len = keys.len();
-        keys.retain(|k| k.hash != hash);
-        if keys.len() < initial_len {
-            store.key_index.remove(&hash); // Keep O(1) cache in sync
-            store.save();
-        }
+    if store.revoke_key(&email, &hash) {
+        Ok(StatusCode::OK)
+    } else {
+        Err(StatusCode::NOT_FOUND)
     }
-    Ok(StatusCode::OK)
 }
 
 // --- DUAL-AUTH MIDDLEWARE (Session OR API Key) ---
@@ -367,5 +376,83 @@ pub async fn dual_auth_middleware(
         next.run(request).await
     } else {
         StatusCode::UNAUTHORIZED.into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_auth_store_generate_and_index() {
+        let mut store = AuthStore::default();
+        let key = store.generate_key("admin@local", "Test Key".into(), None);
+
+        assert!(key.starts_with("sk-"));
+        assert_eq!(store.api_keys["admin@local"].len(), 1);
+        let hash = &store.api_keys["admin@local"][0].hash;
+        assert_eq!(store.key_index.get(hash), Some(&"admin@local".to_string()));
+    }
+
+    #[test]
+    fn test_auth_store_key_deletion_sync() {
+        let mut store = AuthStore::default();
+        store.generate_key("test@local", "Key1".into(), None);
+
+        let key2_hash = {
+            store.generate_key("test@local", "Key2".into(), None);
+            store.api_keys["test@local"].last().unwrap().hash.clone()
+        };
+
+        // Simulate the manual deletion route
+        let success = store.revoke_key("test@local", &key2_hash);
+        assert!(success, "Revoking an existing key should return true");
+
+        assert!(!store.key_index.contains_key(&key2_hash));
+
+        // Deleting a non-existent or already deleted key returns false (which the router maps to 404 NOT FOUND)
+        assert!(!store.revoke_key("test@local", &key2_hash));
+        assert!(!store.revoke_key("fakeuser@local", "fake_hash"));
+    }
+
+    #[test]
+    fn test_auth_store_multiple_keys_per_user() {
+        let mut store = AuthStore::default();
+        let key1 = store.generate_key("user@local", "Key1".into(), None);
+        let key2 = store.generate_key("user@local", "Key2".into(), None);
+
+        assert_eq!(store.api_keys["user@local"].len(), 2);
+        assert_ne!(key1, key2);
+
+        // Both distinct hashes should reliably resolve to the same user email
+        let hash1 = &store.api_keys["user@local"][0].hash;
+        let hash2 = &store.api_keys["user@local"][1].hash;
+        assert_eq!(store.key_index.get(hash1), Some(&"user@local".to_string()));
+        assert_eq!(store.key_index.get(hash2), Some(&"user@local".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_current_user_extractor() {
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+
+        // 1. Test missing user extension (Should yield Unauthorized Rejection)
+        let req = Request::builder().body(()).unwrap();
+        let mut parts = req.into_parts().0;
+        let result = CurrentUser::from_request_parts(&mut parts, &()).await;
+        assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
+
+        // 2. Test successful extraction
+        let mut req = Request::builder().body(()).unwrap();
+        req.extensions_mut().insert(CurrentUser {
+            email: "admin@local".to_string(),
+            is_admin: true,
+        });
+        let mut parts = req.into_parts().0;
+        let result = CurrentUser::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        assert_eq!(result.email, "admin@local");
+        assert!(result.is_admin);
     }
 }
