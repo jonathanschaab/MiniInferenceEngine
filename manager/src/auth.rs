@@ -1,6 +1,6 @@
 use crate::AppState;
 use axum::{
-    Json, async_trait,
+    Json,
     extract::{FromRequestParts, Path, Query, Request, State},
     http::{StatusCode, request::Parts},
     middleware::Next,
@@ -15,6 +15,7 @@ use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, sync::Arc};
+use surrealdb::{Surreal, engine::any::Any};
 use tokio::sync::mpsc::UnboundedSender;
 use tower_sessions::Session;
 use tracing::error;
@@ -25,7 +26,6 @@ pub struct CurrentUser {
     pub is_admin: bool,
 }
 
-#[async_trait]
 impl<S> FromRequestParts<S> for CurrentUser
 where
     S: Send + Sync,
@@ -50,46 +50,32 @@ pub struct ApiKeyRecord {
     pub hash: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct UserApiKeys {
+    pub email: String,
+    pub keys: Vec<ApiKeyRecord>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct AuthStore {
     pub api_keys: HashMap<String, Vec<ApiKeyRecord>>,
     #[serde(skip)]
     pub key_index: HashMap<String, String>,
     #[serde(skip)]
-    pub writer_tx: Option<UnboundedSender<String>>,
+    pub writer_tx: Option<UnboundedSender<UserApiKeys>>,
 }
 
 impl AuthStore {
-    pub fn load() -> Self {
-        let mut store = if let Ok(data) = fs::read_to_string("api_keys.json") {
-            match serde_json::from_str(&data) {
-                Ok(s) => s,
-                Err(e) => {
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let backup_name = format!("api_keys_{}.json.bak", timestamp);
-                    error!("CRITICAL: api_keys.json is corrupted! Error: {}", e);
-                    error!(
-                        "Backing up corrupted file to {} to prevent data loss.",
-                        backup_name
-                    );
-                    let _ = fs::rename("api_keys.json", backup_name);
-                    AuthStore {
-                        api_keys: HashMap::new(),
-                        key_index: HashMap::new(),
-                        writer_tx: None,
-                    }
-                }
+    pub async fn load(db: &Surreal<Any>) -> Self {
+        let mut store = AuthStore::default();
+
+        // Load individual user records
+        if let Ok(mut response) = db.query("SELECT * FROM auth_keys").await {
+            let user_keys: Vec<UserApiKeys> = response.take(0).unwrap_or_default();
+            for uk in user_keys {
+                store.api_keys.insert(uk.email, uk.keys);
             }
-        } else {
-            AuthStore {
-                api_keys: HashMap::new(),
-                key_index: HashMap::new(),
-                writer_tx: None,
-            }
-        };
+        }
 
         // Build the O(1) index on startup
         for (email, records) in &store.api_keys {
@@ -123,7 +109,7 @@ impl AuthStore {
 
         // Add to O(1) index
         self.key_index.insert(hash, email.to_string());
-        self.save();
+        self.save_user(email);
 
         plaintext_key
     }
@@ -134,19 +120,23 @@ impl AuthStore {
             keys.retain(|k| k.hash != hash);
             if keys.len() < initial_len {
                 self.key_index.remove(hash); // Keep O(1) cache in sync
-                self.save();
+                self.save_user(email);
                 return true;
             }
         }
         false
     }
 
-    pub fn save(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(self) {
+    pub fn save_user(&self, email: &str) {
+        if let Some(keys) = self.api_keys.get(email) {
             if let Some(tx) = &self.writer_tx {
-                let _ = tx.send(json);
+                let payload = UserApiKeys {
+                    email: email.to_string(),
+                    keys: keys.clone(),
+                };
+                let _ = tx.send(payload);
             } else {
-                error!("[AUTH FAULT] Writer channel missing! Dropping api_keys.json write.");
+                error!("[AUTH FAULT] Writer channel missing! Dropping api_keys DB write.");
             }
         }
     }
@@ -454,5 +444,37 @@ mod tests {
             .unwrap();
         assert_eq!(result.email, "admin@local");
         assert!(result.is_admin);
+    }
+
+    #[tokio::test]
+    async fn test_auth_store_surrealdb_flow() {
+        // Spin up an isolated, in-memory SurrealDB instance for testing
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+
+        let mut store = AuthStore::default();
+        store.generate_key("db_test@local", "DB Key".into(), None);
+
+        // Simulate the background task writing the state to the DB
+        let user_keys = UserApiKeys {
+            email: "db_test@local".to_string(),
+            keys: store.api_keys["db_test@local"].clone(),
+        };
+
+        let _ = db
+            .upsert::<Option<UserApiKeys>>(("auth_keys", "db_test@local"))
+            .content(user_keys)
+            .await;
+
+        let loaded_store = AuthStore::load(&db).await;
+        assert_eq!(loaded_store.api_keys.len(), 1);
+        assert_eq!(loaded_store.api_keys["db_test@local"][0].name, "DB Key");
+
+        // Verify the O(1) index was correctly rebuilt on load
+        let hash = &loaded_store.api_keys["db_test@local"][0].hash;
+        assert_eq!(
+            loaded_store.key_index.get(hash),
+            Some(&"db_test@local".to_string())
+        );
     }
 }

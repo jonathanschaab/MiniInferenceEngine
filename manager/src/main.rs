@@ -18,7 +18,8 @@ use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tower_sessions::{MemoryStore, SessionManagerLayer};
+use tower_sessions::SessionManagerLayer;
+use tower_sessions_surrealdb_store::SurrealSessionStore;
 use tracing::{error, info, warn}; // Ensure this is imported for AppState
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -28,6 +29,26 @@ use manager::{
 };
 
 // --- CONFIGURATION ---
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct DatabaseConfig {
+    pub url: String,
+    pub jwt_file_path: String,
+    pub namespace: String,
+    pub database: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: "ws://localhost:8001".to_string(),
+            jwt_file_path: "database.jwt".to_string(),
+            namespace: "mini_inference_engine".to_string(),
+            database: "main".to_string(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub bind_address: String,
@@ -45,6 +66,8 @@ pub struct AppConfig {
     pub log_level_memory: String,
     #[serde(default = "default_log_file_name")]
     pub log_file_name: String,
+    #[serde(default)]
+    pub database: DatabaseConfig,
 }
 
 fn default_log_level_console() -> String {
@@ -73,20 +96,23 @@ impl Default for AppConfig {
             log_level_file: default_log_level_file(),
             log_level_memory: default_log_level_memory(),
             log_file_name: default_log_file_name(),
+            database: DatabaseConfig::default(),
         }
     }
 }
 
 impl AppConfig {
     pub fn load() -> Self {
-        if let Ok(data) = std::fs::read_to_string("config.json") {
-            serde_json::from_str(&data).unwrap_or_default()
+        if let Ok(data) = std::fs::read_to_string("config.toml") {
+            toml::from_str(&data).unwrap_or_default()
+        } else if let Ok(data) = std::fs::read_to_string("config.json") {
+            // Fallback for backwards compatibility, but save as TOML going forward
+            let config: Self = serde_json::from_str(&data).unwrap_or_default();
+            let _ = std::fs::write("config.toml", toml::to_string_pretty(&config).unwrap());
+            config
         } else {
             let config = Self::default();
-            let _ = std::fs::write(
-                "config.json",
-                serde_json::to_string_pretty(&config).unwrap(),
-            );
+            let _ = std::fs::write("config.toml", toml::to_string_pretty(&config).unwrap());
             config
         }
     }
@@ -235,7 +261,7 @@ async fn trigger_benchmark(
 
     let mut params = payload.parameters.unwrap_or_default();
     if params.seed.is_none() {
-        params.seed = Some(rand::random::<u64>());
+        params.seed = Some(rand::random::<i64>());
     }
     let target_backends = payload.target_backends;
     let queue_tx = state.queue_tx.clone();
@@ -914,6 +940,28 @@ async fn main() {
     // Initialize the shared state BEFORE spawning the background thread
     let engine_status = Arc::new(Mutex::new(EngineStatus::default()));
 
+    // SETUP DATABASE CLIENT
+    let jwt = std::fs::read_to_string(&config.database.jwt_file_path).unwrap_or_else(|_| {
+        panic!(
+            "Failed to read database JWT file: {}",
+            config.database.jwt_file_path
+        )
+    });
+
+    let db_client = surrealdb::engine::any::connect(&config.database.url)
+        .await
+        .expect("Failed to connect to SurrealDB");
+
+    db_client
+        .authenticate(jwt.trim())
+        .await
+        .expect("SurrealDB authentication failed");
+    db_client
+        .use_ns(&config.database.namespace)
+        .use_db(&config.database.database)
+        .await
+        .expect("Failed to switch to namespace/database");
+
     // Background VRAM Tracker
     let status_for_nvml = engine_status.clone();
     let vram_tracker_gpu_idx = config.gpu_device_index;
@@ -949,18 +997,30 @@ async fn main() {
 
     let status_for_batcher = engine_status.clone();
 
-    let (telemetry_tx, mut telemetry_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (telemetry_tx, mut telemetry_rx) =
+        tokio::sync::mpsc::unbounded_channel::<manager::TelemetryEvent>();
+    let db_for_telemetry = db_client.clone();
     tokio::spawn(async move {
-        // This loop processes writes one-at-a-time, perfectly preventing race conditions
-        while let Some(json) = telemetry_rx.recv().await {
-            let temp_file = "stats.json.tmp";
-            if tokio::fs::write(temp_file, &json).await.is_ok() {
-                let _ = tokio::fs::rename(temp_file, "stats.json").await;
+        // This loop processes writes one-at-a-time, storing individual records instead of a monolithic JSON blob
+        while let Some(event) = telemetry_rx.recv().await {
+            match event {
+                manager::TelemetryEvent::Load(metric) => {
+                    let _ = db_for_telemetry
+                        .create::<Option<manager::LoadMetric>>("telemetry_loads")
+                        .content(metric)
+                        .await;
+                }
+                manager::TelemetryEvent::Generation(metric) => {
+                    let _ = db_for_telemetry
+                        .create::<Option<manager::GenerationMetric>>("telemetry_generations")
+                        .content(metric)
+                        .await;
+                }
             }
         }
     });
 
-    let mut store = TelemetryStore::load_from_disk();
+    let mut store = TelemetryStore::load_from_db(&db_client).await;
     store.writer_tx = Some(telemetry_tx); // Wire the channel into the store
     let telemetry = Arc::new(Mutex::new(store));
 
@@ -978,18 +1038,19 @@ async fn main() {
         .await;
     });
 
-    let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (auth_tx, mut auth_rx) = tokio::sync::mpsc::unbounded_channel::<auth::UserApiKeys>();
+    let db_for_auth = db_client.clone();
     tokio::spawn(async move {
-        // This loop processes writes one-at-a-time, enforcing strict order and atomic replacement
-        while let Some(json) = auth_rx.recv().await {
-            let temp_file = "api_keys.json.tmp";
-            if tokio::fs::write(temp_file, &json).await.is_ok() {
-                let _ = tokio::fs::rename(temp_file, "api_keys.json").await;
-            }
+        // This loop processes writes one-at-a-time per user, preventing giant monolithic DB updates
+        while let Some(user_keys) = auth_rx.recv().await {
+            let _ = db_for_auth
+                .upsert::<Option<auth::UserApiKeys>>(("auth_keys", &user_keys.email))
+                .content(user_keys)
+                .await;
         }
     });
 
-    let mut store = AuthStore::load();
+    let mut store = AuthStore::load(&db_client).await;
     store.writer_tx = Some(auth_tx);
     let auth_store = Arc::new(Mutex::new(store));
 
@@ -1016,7 +1077,7 @@ async fn main() {
     });
 
     // Setup Session Layer
-    let session_store = MemoryStore::default();
+    let session_store = SurrealSessionStore::new(db_client.clone(), "sessions".to_string());
     let session_layer = SessionManagerLayer::new(session_store)
         .with_secure(config.secure_cookies)
         .with_same_site(tower_sessions::cookie::SameSite::Lax);
@@ -1048,7 +1109,10 @@ async fn main() {
             "/api/settings/keys",
             get(auth::list_keys_handler).post(auth::create_key_handler),
         )
-        .route("/api/settings/keys/:hash", delete(auth::delete_key_handler));
+        .route(
+            "/api/settings/keys/{hash}",
+            delete(auth::delete_key_handler),
+        );
 
     // ENGINE API ROUTES
     // These get wrapped in our strict Dual-Auth Middleware layer.

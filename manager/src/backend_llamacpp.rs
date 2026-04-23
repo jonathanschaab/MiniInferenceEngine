@@ -151,7 +151,10 @@ where
         samplers.push(LlamaSampler::temp(t));
     }
 
-    let seed_u64 = params.seed.unwrap_or_else(rand::random::<u64>);
+    let seed_u64 = params
+        .seed
+        .map(|s| s as u64)
+        .unwrap_or_else(rand::random::<u64>);
     let seed_u32 = (seed_u64 ^ (seed_u64 >> 32)) as u32;
     samplers.push(LlamaSampler::dist(seed_u32));
     let mut sampler = LlamaSampler::chain_simple(samplers);

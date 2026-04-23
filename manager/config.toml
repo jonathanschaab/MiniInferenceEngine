@@ -1,0 +1,16 @@
+bind_address = "127.0.0.1:3000"
+oauth_redirect_uri = "http://localhost:3000/auth/google/callback"
+admin_emails = ["jschaab@gmail.com"]
+user_emails = []
+secure_cookies = false
+gpu_device_index = 0
+log_level_console = "warn"
+log_level_file = "info"
+log_level_memory = "debug"
+log_file_name = "server.log"
+
+[database]
+url = "ws://localhost:8001"
+jwt_file_path = "database.jwt"
+namespace = "mini_inference_engine"
+database = "main"

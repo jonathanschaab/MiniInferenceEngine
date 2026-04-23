@@ -1,17 +1,26 @@
 use crate::types::GenerationParameters;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
+use surrealdb::{Surreal, engine::any::Any};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::error;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LoadMetric {
+    #[serde(default)]
     pub timestamp: u64,
+    #[serde(default)]
     pub model_id: String,
     #[serde(default = "default_backend")]
     pub backend: String,
-    pub load_time_ms: u128,
+    #[serde(default)]
+    pub load_time_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum TelemetryEvent {
+    Load(LoadMetric),
+    Generation(GenerationMetric),
 }
 
 fn default_backend() -> String {
@@ -20,7 +29,9 @@ fn default_backend() -> String {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GenerationMetric {
+    #[serde(default)]
     pub timestamp: u64,
+    #[serde(default)]
     pub model_id: String,
     #[serde(default = "default_backend")]
     pub backend: String,
@@ -28,11 +39,14 @@ pub struct GenerationMetric {
     pub parameters: GenerationParameters,
     #[serde(default)]
     pub offload_pct: f32,
+    #[serde(default)]
     pub prompt_chars: usize,
+    #[serde(default)]
     pub prompt_tokens: usize,
     #[serde(default)]
-    pub tokenization_time_ms: u128,
-    pub generation_time_ms: u128,
+    pub tokenization_time_ms: u64,
+    #[serde(default)]
+    pub generation_time_ms: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -40,55 +54,71 @@ pub struct TelemetryStore {
     pub loads: Vec<LoadMetric>,
     pub generations: Vec<GenerationMetric>,
     #[serde(skip)]
-    pub unsaved_events: usize,
-    #[serde(skip)]
-    pub writer_tx: Option<UnboundedSender<String>>,
+    pub writer_tx: Option<UnboundedSender<TelemetryEvent>>,
 }
 
 impl TelemetryStore {
-    pub fn load_from_disk() -> Self {
-        if let Ok(data) = fs::read_to_string("stats.json") {
-            serde_json::from_str(&data).unwrap_or_default()
-        } else {
-            Self::default()
+    pub async fn load_from_db(db: &Surreal<Any>) -> Self {
+        let mut loads: Vec<LoadMetric> = vec![];
+        if let Ok(mut response) = db
+            .query("SELECT * FROM telemetry_loads ORDER BY timestamp DESC LIMIT 100")
+            .await
+        {
+            loads = response.take(0).unwrap_or_default();
+            loads.reverse();
         }
+
+        let mut generations: Vec<GenerationMetric> = vec![];
+        if let Ok(mut response) = db
+            .query("SELECT * FROM telemetry_generations ORDER BY timestamp DESC LIMIT 100")
+            .await
+        {
+            generations = response.take(0).unwrap_or_default();
+            generations.reverse();
+        }
+
+        let mut store = TelemetryStore {
+            loads,
+            generations,
+            writer_tx: None,
+        };
+
+        store.loads.sort_by_key(|l| l.timestamp);
+        if store.loads.len() > 100 {
+            let skip = store.loads.len() - 100;
+            store.loads = store.loads.into_iter().skip(skip).collect();
+        }
+
+        store.generations.sort_by_key(|g| g.timestamp);
+        if store.generations.len() > 100 {
+            let skip = store.generations.len() - 100;
+            store.generations = store.generations.into_iter().skip(skip).collect();
+        }
+
+        store
     }
 
-    pub fn save_to_disk(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            if let Some(tx) = &self.writer_tx {
-                // Send payload to the dedicated writer task (Thread-safe & Ordered!)
-                let _ = tx.send(json);
-            } else {
-                // FAIL LOUDLY: Include the exact payload that is being dropped!
-                error!(
-                    "[TELEMETRY FAULT] Writer channel missing! Dropping metric payload to prevent disk I/O race conditions. Check channel initialization in main.rs.\nDropped Payload:\n{}",
-                    json
-                );
-            }
-        }
-    }
-
-    pub fn record_load(&mut self, model_id: String, backend: String, load_time_ms: u128) {
+    pub fn record_load(&mut self, model_id: String, backend: String, load_time_ms: u64) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.loads.push(LoadMetric {
+        let metric = LoadMetric {
             timestamp,
             model_id,
             backend,
             load_time_ms,
-        });
+        };
+        self.loads.push(metric.clone());
 
-        self.unsaved_events += 1;
-        if self.unsaved_events >= 5 {
-            self.save_to_disk();
-            self.unsaved_events = 0;
+        if let Some(tx) = &self.writer_tx {
+            let _ = tx.send(TelemetryEvent::Load(metric));
+        } else {
+            error!("[TELEMETRY FAULT] Writer channel missing! Dropping load metric.");
         }
 
         if self.loads.len() > 100 {
-            self.loads.drain(0..20);
+            self.loads.remove(0);
         }
     }
 
@@ -101,14 +131,14 @@ impl TelemetryStore {
         offload_pct: f32,
         prompt_chars: usize,
         prompt_tokens: usize,
-        tokenization_time_ms: u128,
-        generation_time_ms: u128,
+        tokenization_time_ms: u64,
+        generation_time_ms: u64,
     ) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.generations.push(GenerationMetric {
+        let metric = GenerationMetric {
             timestamp,
             model_id,
             backend,
@@ -118,16 +148,17 @@ impl TelemetryStore {
             prompt_tokens,
             tokenization_time_ms,
             generation_time_ms,
-        });
+        };
+        self.generations.push(metric.clone());
 
-        self.unsaved_events += 1;
-        if self.unsaved_events >= 5 {
-            self.save_to_disk();
-            self.unsaved_events = 0;
+        if let Some(tx) = &self.writer_tx {
+            let _ = tx.send(TelemetryEvent::Generation(metric));
+        } else {
+            error!("[TELEMETRY FAULT] Writer channel missing! Dropping generation metric.");
         }
 
         if self.generations.len() > 100 {
-            self.generations.drain(0..20); // Remove the oldest 20 records
+            self.generations.remove(0);
         }
     }
 }
@@ -159,27 +190,6 @@ mod tests {
     }
 
     #[test]
-    fn test_telemetry_unsaved_events_batching() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut store = TelemetryStore {
-            writer_tx: Some(tx),
-            ..Default::default()
-        };
-
-        // Record 4 loads (less than 5)
-        for i in 0..4 {
-            store.record_load(format!("model_{}", i), "Candle".into(), 100);
-        }
-        assert_eq!(store.unsaved_events, 4);
-        assert!(rx.try_recv().is_err()); // No save triggered yet
-
-        // Record 5th load (triggers save)
-        store.record_load("model_4".into(), "Candle".into(), 100);
-        assert_eq!(store.unsaved_events, 0);
-        assert!(rx.try_recv().is_ok()); // Save was triggered and message sent
-    }
-
-    #[test]
     fn test_load_metric_default_backend() {
         let json = r#"{"timestamp": 123, "model_id": "test", "load_time_ms": 456}"#;
         let metric: LoadMetric = serde_json::from_str(json).unwrap();
@@ -187,9 +197,31 @@ mod tests {
     }
 
     #[test]
-    fn test_telemetry_save_to_disk_missing_channel() {
-        let store = TelemetryStore::default();
-        // Verifies the method gracefully drops payloads without panicking if channel gets severed
-        store.save_to_disk();
+    fn test_telemetry_missing_channel() {
+        let mut store = TelemetryStore::default();
+        // Should not panic
+        store.record_load("test".into(), "Candle".into(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_surrealdb_flow() {
+        // Spin up an isolated, in-memory SurrealDB instance for testing
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+
+        let mut store = TelemetryStore::default();
+        store.record_load("db_model".into(), "Candle".into(), 123);
+
+        // Simulate the background task writing the state to the DB
+        let res = db
+            .create::<Option<LoadMetric>>("telemetry_loads")
+            .content(store.loads[0].clone())
+            .await;
+
+        assert!(res.is_ok(), "DB Update Failed: {:?}", res.unwrap_err());
+
+        let loaded_store = TelemetryStore::load_from_db(&db).await;
+        assert_eq!(loaded_store.loads.len(), 1);
+        assert_eq!(loaded_store.loads[0].model_id, "db_model");
     }
 }

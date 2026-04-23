@@ -223,7 +223,7 @@ pub struct GenerationParameters {
     pub top_p: Option<f32>,
     pub top_k: Option<usize>,
     pub max_tokens: Option<usize>,
-    pub seed: Option<u64>,
+    pub seed: Option<i64>,
     pub memory_strategy: Option<MemoryStrategy>,
     pub context_buffer: Option<usize>,
     pub yarn_enabled: Option<bool>,
