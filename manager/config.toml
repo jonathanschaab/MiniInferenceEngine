@@ -1,5 +1,6 @@
 bind_address = "127.0.0.1:3000"
 oauth_redirect_uri = "http://localhost:3000/auth/google/callback"
+oauth_client_secret_path = "client_secret.apps.googleusercontent.com.json"
 admin_emails = ["jschaab@gmail.com"]
 user_emails = []
 secure_cookies = false

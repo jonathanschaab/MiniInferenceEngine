@@ -53,6 +53,8 @@ impl Default for DatabaseConfig {
 pub struct AppConfig {
     pub bind_address: String,
     pub oauth_redirect_uri: String,
+    #[serde(default = "default_oauth_client_secret_path")]
+    pub oauth_client_secret_path: String,
     pub admin_emails: Vec<String>,
     pub user_emails: Vec<String>,
     pub secure_cookies: bool,
@@ -82,12 +84,16 @@ fn default_log_level_memory() -> String {
 fn default_log_file_name() -> String {
     "server.log".to_string()
 }
+fn default_oauth_client_secret_path() -> String {
+    "client_secret.apps.googleusercontent.com.json".to_string()
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             bind_address: "127.0.0.1:3000".to_string(), // Secure local default
             oauth_redirect_uri: "http://localhost:3000/auth/google/callback".to_string(),
+            oauth_client_secret_path: default_oauth_client_secret_path(),
             admin_emails: vec![],
             user_emails: vec![],
             secure_cookies: true,
@@ -894,6 +900,22 @@ async fn save_chat_session(
         .unwrap_or_default()
         .as_secs();
 
+    // Sanitize the title: trim leading punctuation/whitespace, truncate to 30 chars, and provide a fallback.
+    let clean_title: String = payload
+        .title
+        .trim_start_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        .chars()
+        .take(30)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+
+    payload.title = if clean_title.is_empty() {
+        "New Chat Session".to_string()
+    } else {
+        clean_title
+    };
+
     if !payload.id.is_empty() {
         let mut response = state
             .db
@@ -1251,20 +1273,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_client = match db_client_opt {
         Some(client) => client,
         None => {
-            error!(
-                "Database is temporarily unavailable after 3 attempts. Gracefully shutting down."
-            );
-            std::process::exit(1);
+            let msg =
+                "Database is temporarily unavailable after 3 attempts. Gracefully shutting down.";
+            error!("{}", msg);
+            return Err(msg.into());
         }
     };
 
-    if let Err(e) = db_client
-        .query("DEFINE INDEX chat_sessions_email_idx ON TABLE chat_sessions COLUMNS email;")
-        .query("DEFINE INDEX chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id, message_index;")
-        .query("DEFINE INDEX telemetry_loads_timestamp_idx ON TABLE telemetry_loads COLUMNS timestamp;")
-        .query("DEFINE INDEX telemetry_generations_timestamp_idx ON TABLE telemetry_generations COLUMNS timestamp;")
-        .await
-    {
+    let index_queries = "
+        DEFINE INDEX IF NOT EXISTS chat_sessions_email_idx ON TABLE chat_sessions COLUMNS email;
+        DEFINE INDEX IF NOT EXISTS chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id, message_index;
+        DEFINE INDEX IF NOT EXISTS telemetry_loads_timestamp_idx ON TABLE telemetry_loads COLUMNS timestamp;
+        DEFINE INDEX IF NOT EXISTS telemetry_generations_timestamp_idx ON TABLE telemetry_generations COLUMNS timestamp;
+    ";
+
+    if let Err(e) = db_client.query(index_queries).await {
         error!("Failed to define database indexes: {}", e);
     }
 
@@ -1371,7 +1394,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize global pooled clients once!
     let reqwest_client = reqwest::Client::new();
-    let oauth_client = auth::build_oauth_client(&config.oauth_redirect_uri)?;
+    let oauth_client =
+        auth::build_oauth_client(&config.oauth_redirect_uri, &config.oauth_client_secret_path)?;
 
     // Eagerly initialize the model registry in the background
     tokio::spawn(async {
@@ -1485,7 +1509,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(force_tx));
 
     tokio::select! {
-        res = server => { res.unwrap(); }
+        res = server => { res?; }
         _ = force_rx => { error!("Forcing immediate shutdown..."); }
     }
 
@@ -1654,8 +1678,11 @@ mod tests {
                 writer_tx: Some(auth_tx),
             })),
             reqwest_client: reqwest::Client::new(),
-            oauth_client: auth::build_oauth_client("http://localhost:3000/auth/google/callback")
-                .unwrap(), // Dummy client
+            oauth_client: auth::build_oauth_client(
+                "http://localhost:3000/auth/google/callback",
+                "client_secret.apps.googleusercontent.com.json",
+            )
+            .unwrap(), // Dummy client
             config: Arc::new(AppConfig::default()),
             log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
                 0,

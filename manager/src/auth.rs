@@ -155,14 +155,14 @@ struct GoogleClientSecretWeb {
 
 // --- OAUTH2 CLIENT SETUP ---
 
-pub fn build_oauth_client(redirect_uri: &str) -> Result<BasicClient, String> {
+pub fn build_oauth_client(redirect_uri: &str, secret_path: &str) -> Result<BasicClient, String> {
     // 1. Read the JSON file from the disk
-    let file_content = match fs::read_to_string("client_secret.apps.googleusercontent.com.json") {
+    let file_content = match fs::read_to_string(secret_path) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!(
-                "⚠️ CRITICAL: Could not find client_secret.apps.googleusercontent.com.json in the manager directory! Error: {}",
-                e
+                "⚠️ CRITICAL: Could not find {} in the manager directory! Error: {}",
+                secret_path, e
             );
             error!("{}", msg);
             return Err(msg);
