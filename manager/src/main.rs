@@ -1158,7 +1158,7 @@ async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetrySto
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load();
 
     // --- 1. CONSOLE LAYER ---
@@ -1200,12 +1200,17 @@ async fn main() {
     let engine_status = Arc::new(Mutex::new(EngineStatus::default()));
 
     // SETUP DATABASE CLIENT
-    let jwt = std::fs::read_to_string(&config.database.jwt_file_path).unwrap_or_else(|_| {
-        panic!(
-            "Failed to read database JWT file: {}",
-            config.database.jwt_file_path
-        )
-    });
+    let jwt = match std::fs::read_to_string(&config.database.jwt_file_path) {
+        Ok(content) => content,
+        Err(e) => {
+            let msg = format!(
+                "Failed to read database JWT file '{}': {}",
+                config.database.jwt_file_path, e
+            );
+            error!("{}", msg);
+            return Err(msg.into());
+        }
+    };
 
     let mut db_client_opt = None;
     for attempt in 1..=3 {
@@ -1366,7 +1371,7 @@ async fn main() {
 
     // Initialize global pooled clients once!
     let reqwest_client = reqwest::Client::new();
-    let oauth_client = auth::build_oauth_client(&config.oauth_redirect_uri);
+    let oauth_client = auth::build_oauth_client(&config.oauth_redirect_uri)?;
 
     // Eagerly initialize the model registry in the background
     tokio::spawn(async {
@@ -1474,13 +1479,20 @@ async fn main() {
         .await
         .unwrap();
     info!("🚀 Server safely listening on {}", config.bind_address);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+
+    let (force_tx, force_rx) = tokio::sync::oneshot::channel();
+
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(force_tx));
+
+    tokio::select! {
+        res = server => { res.unwrap(); }
+        _ = force_rx => { error!("Forcing immediate shutdown..."); }
+    }
+
+    Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(force_tx: tokio::sync::oneshot::Sender<()>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -1505,7 +1517,7 @@ async fn shutdown_signal() {
     info!("Received termination signal, starting graceful shutdown...");
 
     // Force shutdown if graceful shutdown takes longer than 30 seconds, or if a second signal is received
-    tokio::spawn(async {
+    tokio::spawn(async move {
         let ctrl_c = async {
             tokio::signal::ctrl_c()
                 .await
@@ -1528,7 +1540,7 @@ async fn shutdown_signal() {
             _ = terminate => { error!("Received second termination signal. Forcing immediate exit."); },
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => { error!("Graceful shutdown timed out after 30 seconds. Forcing exit."); },
         }
-        std::process::exit(1);
+        let _ = force_tx.send(());
     });
 }
 
@@ -1632,8 +1644,8 @@ mod tests {
             queue_tx,
             engine_status: Arc::new(Mutex::new(EngineStatus::default())),
             telemetry: Arc::new(Mutex::new(TelemetryStore {
-                loads: vec![],
-                generations: vec![],
+                loads: std::collections::VecDeque::new(),
+                generations: std::collections::VecDeque::new(),
                 writer_tx: Some(telemetry_tx),
             })),
             auth_store: Arc::new(Mutex::new(AuthStore {
@@ -1642,7 +1654,8 @@ mod tests {
                 writer_tx: Some(auth_tx),
             })),
             reqwest_client: reqwest::Client::new(),
-            oauth_client: auth::build_oauth_client("http://localhost:3000/auth/google/callback"), // Dummy client
+            oauth_client: auth::build_oauth_client("http://localhost:3000/auth/google/callback")
+                .unwrap(), // Dummy client
             config: Arc::new(AppConfig::default()),
             log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
                 0,

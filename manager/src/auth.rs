@@ -155,26 +155,44 @@ struct GoogleClientSecretWeb {
 
 // --- OAUTH2 CLIENT SETUP ---
 
-pub fn build_oauth_client(redirect_uri: &str) -> BasicClient {
+pub fn build_oauth_client(redirect_uri: &str) -> Result<BasicClient, String> {
     // 1. Read the JSON file from the disk
-    let file_content = fs::read_to_string("client_secret.apps.googleusercontent.com.json")
-        .expect("⚠️ CRITICAL: Could not find client_secret.apps.googleusercontent.com.json in the manager directory!");
+    let file_content = match fs::read_to_string("client_secret.apps.googleusercontent.com.json") {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!(
+                "⚠️ CRITICAL: Could not find client_secret.apps.googleusercontent.com.json in the manager directory! Error: {}",
+                e
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+    };
 
     // 2. Parse the JSON to extract the ID and Secret
-    let secret_data: GoogleClientSecret = serde_json::from_str(&file_content)
-        .expect("⚠️ CRITICAL: Failed to parse Google client secret JSON. Make sure it is the 'Web application' format.");
+    let secret_data: GoogleClientSecret = match serde_json::from_str(&file_content) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!(
+                "⚠️ CRITICAL: Failed to parse Google client secret JSON. Make sure it is the 'Web application' format. Error: {}",
+                e
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+    };
 
     let client_id = secret_data.web.client_id;
     let client_secret = secret_data.web.client_secret;
 
-    BasicClient::new(
+    Ok(BasicClient::new(
         ClientId::new(client_id),
         Some(ClientSecret::new(client_secret)),
         AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string()).unwrap(),
         Some(TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).unwrap()),
     )
     // Make sure this matches your Nginx setup exactly! (e.g., https://ai.lan/auth/google/callback)
-    .set_redirect_uri(RedirectUrl::new(redirect_uri.to_string()).unwrap())
+    .set_redirect_uri(RedirectUrl::new(redirect_uri.to_string()).unwrap()))
 }
 
 // --- LOGIN ROUTES ---

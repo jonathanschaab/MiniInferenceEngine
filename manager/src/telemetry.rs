@@ -1,5 +1,6 @@
 use crate::types::GenerationParameters;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 use surrealdb::{Surreal, engine::any::Any};
 use tokio::sync::mpsc::UnboundedSender;
@@ -51,30 +52,32 @@ pub struct GenerationMetric {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TelemetryStore {
-    pub loads: Vec<LoadMetric>,
-    pub generations: Vec<GenerationMetric>,
+    pub loads: VecDeque<LoadMetric>,
+    pub generations: VecDeque<GenerationMetric>,
     #[serde(skip)]
     pub writer_tx: Option<UnboundedSender<TelemetryEvent>>,
 }
 
 impl TelemetryStore {
     pub async fn load_from_db(db: &Surreal<Any>) -> Self {
-        let mut loads: Vec<LoadMetric> = vec![];
+        let mut loads = VecDeque::new();
         if let Ok(mut response) = db
             .query("SELECT * FROM telemetry_loads ORDER BY timestamp DESC LIMIT 100")
             .await
         {
-            loads = response.take(0).unwrap_or_default();
-            loads.reverse();
+            let mut temp: Vec<LoadMetric> = response.take(0).unwrap_or_default();
+            temp.reverse();
+            loads = temp.into();
         }
 
-        let mut generations: Vec<GenerationMetric> = vec![];
+        let mut generations = VecDeque::new();
         if let Ok(mut response) = db
             .query("SELECT * FROM telemetry_generations ORDER BY timestamp DESC LIMIT 100")
             .await
         {
-            generations = response.take(0).unwrap_or_default();
-            generations.reverse();
+            let mut temp: Vec<GenerationMetric> = response.take(0).unwrap_or_default();
+            temp.reverse();
+            generations = temp.into();
         }
 
         TelemetryStore {
@@ -95,7 +98,7 @@ impl TelemetryStore {
             backend,
             load_time_ms,
         };
-        self.loads.push(metric.clone());
+        self.loads.push_back(metric.clone());
 
         if let Some(tx) = &self.writer_tx {
             let _ = tx.send(TelemetryEvent::Load(metric));
@@ -104,7 +107,7 @@ impl TelemetryStore {
         }
 
         if self.loads.len() > 100 {
-            self.loads.remove(0);
+            self.loads.pop_front();
         }
     }
 
@@ -135,7 +138,7 @@ impl TelemetryStore {
             tokenization_time_ms,
             generation_time_ms,
         };
-        self.generations.push(metric.clone());
+        self.generations.push_back(metric.clone());
 
         if let Some(tx) = &self.writer_tx {
             let _ = tx.send(TelemetryEvent::Generation(metric));
@@ -144,7 +147,7 @@ impl TelemetryStore {
         }
 
         if self.generations.len() > 100 {
-            self.generations.remove(0);
+            self.generations.pop_front();
         }
     }
 }
