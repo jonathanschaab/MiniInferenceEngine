@@ -12,6 +12,68 @@ let currentSessionTitle = "";
 
 window.onload = initializeUI;
 
+function showRenameModal(currentTitle) {
+    return new Promise((resolve) => {
+        const modal = document.getElementById('rename-modal');
+        const input = document.getElementById('rename-input');
+        const confirmBtn = document.getElementById('rename-confirm-btn');
+        const cancelBtn = document.getElementById('rename-cancel-btn');
+        
+        input.value = currentTitle || "";
+        modal.style.display = 'flex';
+        setTimeout(() => input.focus(), 10);
+
+        const cleanup = () => {
+            modal.style.display = 'none';
+            confirmBtn.onclick = null;
+            cancelBtn.onclick = null;
+            input.onkeydown = null;
+        };
+
+        confirmBtn.onclick = () => {
+            const val = input.value;
+            cleanup();
+            resolve(val);
+        };
+
+        cancelBtn.onclick = () => {
+            cleanup();
+            resolve(null);
+        };
+
+        input.onkeydown = (e) => {
+            if (e.key === 'Enter') confirmBtn.onclick();
+            if (e.key === 'Escape') cancelBtn.onclick();
+        };
+    });
+}
+
+function showDeleteModal() {
+    return new Promise((resolve) => {
+        const modal = document.getElementById('delete-modal');
+        const confirmBtn = document.getElementById('delete-confirm-btn');
+        const cancelBtn = document.getElementById('delete-cancel-btn');
+        
+        modal.style.display = 'flex';
+
+        const cleanup = () => {
+            modal.style.display = 'none';
+            confirmBtn.onclick = null;
+            cancelBtn.onclick = null;
+        };
+
+        confirmBtn.onclick = () => {
+            cleanup();
+            resolve(true);
+        };
+
+        cancelBtn.onclick = () => {
+            cleanup();
+            resolve(false);
+        };
+    });
+}
+
 async function updateStatus() {
     try {
         const res = await fetchWithAuth('/api/status');
@@ -190,7 +252,7 @@ async function loadSessions() {
             editBtn.title = "Rename Chat";
             editBtn.onclick = async (e) => {
                 e.stopPropagation();
-                const newTitle = prompt("Enter new chat name:", s.title);
+                const newTitle = await showRenameModal(s.title);
                 if (newTitle && newTitle.trim() !== "" && newTitle !== s.title) {
                     await renameSession(s.id, newTitle.trim());
                 }
@@ -202,7 +264,8 @@ async function loadSessions() {
             delBtn.title = "Delete Chat";
             delBtn.onclick = async (e) => {
                 e.stopPropagation();
-                if (confirm("Delete this chat?")) {
+                const confirmed = await showDeleteModal();
+                if (confirmed) {
                     await fetchWithAuth(`/api/chat/sessions/${s.id}`, { method: 'DELETE' });
                     if (currentSessionId === s.id) startNewSession();
                     else loadSessions();
@@ -281,8 +344,19 @@ inputField.addEventListener('input', function() {
     this.style.height = (this.scrollHeight) + 'px';
 });
 
-window.clearChat = function() {
-    startNewSession();
+window.clearChat = async function() {
+    if (chatHistory.length === 0) {
+        startNewSession();
+        return;
+    }
+    
+    const confirmed = await showDeleteModal();
+    if (confirmed) {
+        if (currentSessionId) {
+            await fetchWithAuth(`/api/chat/sessions/${currentSessionId}`, { method: 'DELETE' });
+        }
+        startNewSession();
+    }
 }
 
 function appendMessage(text, isUser) {

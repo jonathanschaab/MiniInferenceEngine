@@ -61,11 +61,39 @@ async function submitNewKey() {
     }
 }
 
+function showDeleteKeyModal() {
+    return new Promise((resolve) => {
+        const modal = document.getElementById('delete-key-modal');
+        const confirmBtn = document.getElementById('delete-key-confirm-btn');
+        const cancelBtn = document.getElementById('delete-key-cancel-btn');
+        
+        modal.style.display = 'flex';
+
+        const cleanup = () => {
+            modal.style.display = 'none';
+            confirmBtn.onclick = null;
+            cancelBtn.onclick = null;
+        };
+
+        confirmBtn.onclick = () => {
+            cleanup();
+            resolve(true);
+        };
+
+        cancelBtn.onclick = () => {
+            cleanup();
+            resolve(false);
+        };
+    });
+}
+
 /* eslint-disable-next-line no-unused-vars -- Called by: settings.html button onclick="deleteKey('${hash}')" */
 async function deleteKey(hash) {
-    if(!confirm("Are you sure you want to permanently revoke this key? External apps using it will instantly fail.")) return;
-    await fetchWithAuth(`/api/settings/keys/${hash}`, { method: 'DELETE' });
-    loadKeys();
+    const confirmed = await showDeleteKeyModal();
+    if (confirmed) {
+        await fetchWithAuth(`/api/settings/keys/${hash}`, { method: 'DELETE' });
+        loadKeys();
+    }
 }
 
 window.onload = loadKeys;

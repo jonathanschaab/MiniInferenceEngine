@@ -169,6 +169,29 @@
         </div>
     </div>
 
+    <!-- Custom Modals -->
+    <div id="rename-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Rename Chat</h2>
+            <input type="text" id="rename-input" style="width: 100%; box-sizing: border-box; background: #313244; color: white; border: 1px solid #45475a; padding: 8px; border-radius: 4px; margin-bottom: 20px;" autocomplete="off">
+            <div class="modal-actions">
+                <button class="btn-cancel" id="rename-cancel-btn">Cancel</button>
+                <button class="btn-run" id="rename-confirm-btn">Rename</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="delete-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Delete Chat</h2>
+            <p style="margin-bottom: 20px;">Are you sure you want to delete this chat session?</p>
+            <div class="modal-actions">
+                <button class="btn-cancel" id="delete-cancel-btn">Cancel</button>
+                <button class="btn-run" id="delete-confirm-btn" style="background: #f38ba8; color: #11111b;">Delete</button>
+            </div>
+        </div>
+    </div>
+
     <script src="/js/common.js"></script>
     <script src="/js/chat.js"></script>
 </body>

@@ -52,6 +52,17 @@
         </div>
     </div>
 
+    <div id="delete-key-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Revoke API Key</h2>
+            <p style="margin-bottom: 20px;">Are you sure you want to permanently revoke this key? External apps using it will instantly fail.</p>
+            <div class="modal-actions">
+                <button class="btn-cancel" id="delete-key-cancel-btn" onclick="document.getElementById('delete-key-modal').style.display='none'">Cancel</button>
+                <button class="btn-run" id="delete-key-confirm-btn" style="background: #f38ba8; color: #11111b;">Revoke</button>
+            </div>
+        </div>
+    </div>
+
     <script src="/js/common.js"></script>
     <script src="/js/settings.js"></script>
 </body>

@@ -1207,19 +1207,61 @@ async fn main() {
         )
     });
 
-    let db_client = surrealdb::engine::any::connect(&config.database.url)
-        .await
-        .expect("Failed to connect to SurrealDB");
+    let mut db_client_opt = None;
+    for attempt in 1..=3 {
+        match surrealdb::engine::any::connect(&config.database.url).await {
+            Ok(client) => {
+                if let Err(e) = client.authenticate(jwt.trim()).await {
+                    error!(
+                        "SurrealDB authentication failed on attempt {}: {}",
+                        attempt, e
+                    );
+                } else if let Err(e) = client
+                    .use_ns(&config.database.namespace)
+                    .use_db(&config.database.database)
+                    .await
+                {
+                    error!(
+                        "Failed to switch to namespace/database on attempt {}: {}",
+                        attempt, e
+                    );
+                } else {
+                    db_client_opt = Some(client);
+                    break;
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Failed to connect to SurrealDB on attempt {}: {}",
+                    attempt, e
+                );
+            }
+        }
+        if attempt < 3 {
+            info!("Retrying database connection in 2 seconds...");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
 
-    db_client
-        .authenticate(jwt.trim())
+    let db_client = match db_client_opt {
+        Some(client) => client,
+        None => {
+            error!(
+                "Database is temporarily unavailable after 3 attempts. Gracefully shutting down."
+            );
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = db_client
+        .query("DEFINE INDEX chat_sessions_email_idx ON TABLE chat_sessions COLUMNS email;")
+        .query("DEFINE INDEX chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id, message_index;")
+        .query("DEFINE INDEX telemetry_loads_timestamp_idx ON TABLE telemetry_loads COLUMNS timestamp;")
+        .query("DEFINE INDEX telemetry_generations_timestamp_idx ON TABLE telemetry_generations COLUMNS timestamp;")
         .await
-        .expect("SurrealDB authentication failed");
-    db_client
-        .use_ns(&config.database.namespace)
-        .use_db(&config.database.database)
-        .await
-        .expect("Failed to switch to namespace/database");
+    {
+        error!("Failed to define database indexes: {}", e);
+    }
 
     // Background VRAM Tracker
     let status_for_nvml = engine_status.clone();
@@ -1432,7 +1474,62 @@ async fn main() {
         .await
         .unwrap();
     info!("🚀 Server safely listening on {}", config.bind_address);
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("Received termination signal, starting graceful shutdown...");
+
+    // Force shutdown if graceful shutdown takes longer than 30 seconds, or if a second signal is received
+    tokio::spawn(async {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install Ctrl+C handler");
+        };
+
+        #[cfg(unix)]
+        let terminate = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+
+        tokio::select! {
+            _ = ctrl_c => { error!("Received second termination signal. Forcing immediate exit."); },
+            _ = terminate => { error!("Received second termination signal. Forcing immediate exit."); },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => { error!("Graceful shutdown timed out after 30 seconds. Forcing exit."); },
+        }
+        std::process::exit(1);
+    });
 }
 
 #[cfg(test)]
@@ -1513,6 +1610,18 @@ mod tests {
             .await
             .unwrap();
         db.query("DEFINE TABLE auth_keys SCHEMALESS;")
+            .await
+            .unwrap();
+        db.query("DEFINE INDEX chat_sessions_email_idx ON TABLE chat_sessions COLUMNS email;")
+            .await
+            .unwrap();
+        db.query("DEFINE INDEX chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id, message_index;")
+            .await
+            .unwrap();
+        db.query("DEFINE INDEX telemetry_loads_timestamp_idx ON TABLE telemetry_loads COLUMNS timestamp;")
+            .await
+            .unwrap();
+        db.query("DEFINE INDEX telemetry_generations_timestamp_idx ON TABLE telemetry_generations COLUMNS timestamp;")
             .await
             .unwrap();
 

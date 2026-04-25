@@ -193,7 +193,7 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         await page.locator('button:has-text("+ Create New Key")').click();
         await expect(page.locator('#new-key-modal')).toBeVisible();
 
-        await page.locator('.btn-cancel').click();
+        await page.locator('#new-key-modal .btn-cancel').click();
         await expect(page.locator('#new-key-modal')).not.toBeVisible();
     });
 
@@ -280,8 +280,6 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             }
         });
 
-        page.on('dialog', async dialog => await dialog.accept('Renamed Chat Session'));
-
         await page.goto('/');
         const sessionItem = page.locator('.session-item').first();
         await expect(sessionItem).toContainText('First Chat Session');
@@ -289,8 +287,58 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         await sessionItem.hover();
         await sessionItem.locator('button[title="Rename Chat"]').click();
         
+        await page.locator('#rename-input').fill('Renamed Chat Session');
+        await page.locator('#rename-confirm-btn').click();
+        
         // Verify the DOM listing has updated to the new name based on the mocked second API call
         await expect(sessionItem).toContainText('Renamed Chat Session');
+    });
+
+    test('Chat UI can delete a session via custom modal', async ({ page }) => {
+        let fetchCount = 0;
+        let deleteCalled = false;
+        
+        // Override the default mock to provide a specific sequence for deletion
+        await page.route('**/api/chat/sessions', async route => {
+            if (route.request().method() === 'GET') {
+                if (fetchCount === 0) {
+                    fetchCount++;
+                    await route.fulfill({ status: 200, json: [{ id: 'session-to-delete', title: 'Delete Me', updated_at: 1678886400, email: 'mock@example.com' }] });
+                } else {
+                    await route.fulfill({ status: 200, json: [] }); // Return empty after deletion
+                }
+            } else {
+                await route.fallback();
+            }
+        });
+
+        await page.route('**/api/chat/sessions/session-to-delete', async route => {
+            if (route.request().method() === 'DELETE') {
+                deleteCalled = true;
+                await route.fulfill({ status: 200 });
+            } else {
+                await route.fallback();
+            }
+        });
+
+        await page.goto('/');
+        const sessionItem = page.locator('.session-item').first();
+        await expect(sessionItem).toContainText('Delete Me');
+        
+        await sessionItem.hover();
+        await sessionItem.locator('button[title="Delete Chat"]').click();
+        
+        // Verify the custom modal appears
+        const deleteModal = page.locator('#delete-modal');
+        await expect(deleteModal).toBeVisible();
+        
+        // Confirm deletion
+        await page.locator('#delete-confirm-btn').click();
+        
+        // Verify the modal closes, the request was sent, and the DOM updates
+        await expect(deleteModal).not.toBeVisible();
+        await expect(page.locator('.session-item')).toHaveCount(0);
+        expect(deleteCalled).toBe(true);
     });
 
     test('Chat UI auto-scrolls to the newest message in a long session', async ({ page }) => {
