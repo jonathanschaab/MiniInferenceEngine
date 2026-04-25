@@ -225,8 +225,6 @@ async function renameSession(id, newTitle) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 id: id,
-                email: "",
-                updated_at: 0,
                 title: newTitle
             })
         });
@@ -303,9 +301,6 @@ async function ensureSession(firstMessageText) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                id: "",
-                email: "",
-                updated_at: 0,
                 title: currentSessionTitle
             })
         });

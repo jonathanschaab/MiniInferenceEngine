@@ -84,16 +84,7 @@ impl TelemetryStore {
         };
 
         store.loads.sort_by_key(|l| l.timestamp);
-        if store.loads.len() > 100 {
-            let skip = store.loads.len() - 100;
-            store.loads = store.loads.into_iter().skip(skip).collect();
-        }
-
         store.generations.sort_by_key(|g| g.timestamp);
-        if store.generations.len() > 100 {
-            let skip = store.generations.len() - 100;
-            store.generations = store.generations.into_iter().skip(skip).collect();
-        }
 
         store
     }

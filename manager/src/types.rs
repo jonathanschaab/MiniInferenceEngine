@@ -232,8 +232,11 @@ pub struct ChatSessionSummary {
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ChatSessionRecord {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub email: String,
+    #[serde(default)]
     pub updated_at: u64,
     pub title: String,
 }

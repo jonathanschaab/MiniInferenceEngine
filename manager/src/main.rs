@@ -1023,6 +1023,24 @@ async fn truncate_chat_messages(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Err(e) = state
+        .db
+        .query("UPDATE type::thing('chat_sessions', $id) SET updated_at = $time")
+        .bind(("id", id.clone()))
+        .bind(("time", updated_at))
+        .await
+    {
+        error!(
+            "DB Update Error (chat_sessions timestamp on truncate): {}",
+            e
+        );
+    }
+
     Ok(StatusCode::OK)
 }
 
@@ -1535,6 +1553,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
     async fn test_chat_session_lifecycle() {
         let state = create_test_app_state().await;
         let user_email = "test@example.com";
@@ -1676,6 +1695,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
     async fn test_chat_session_renaming() {
         let state = create_test_app_state().await;
         let user_email = "test@example.com";
