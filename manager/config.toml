@@ -10,7 +10,7 @@ log_level_memory = "debug"
 log_file_name = "server.log"
 
 [database]
-url = "ws://localhost:8001"
+url = "wss://surrealdb.lan:443"
 jwt_file_path = "database.jwt"
 namespace = "mini_inference_engine"
 database = "main"

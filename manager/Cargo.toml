@@ -36,8 +36,10 @@ tracing-appender = "0.2"
 toml = "0.8"
 surrealdb = { version = "2.6.1", features = ["kv-mem"] }
 tower-sessions-surrealdb-store = "0.7.0"
+native-tls = { version = "0.2", optional = true }
 
 [features]
 default = ["backend-candle"]
 backend-candle = ["candle-core", "candle-nn", "candle-transformers"]
 backend-llamacpp = ["llama-cpp-2", "llama-cpp-sys-2", "llama-cpp-2/cuda"]
+native-tls = ["dep:native-tls", "surrealdb/native-tls"]
