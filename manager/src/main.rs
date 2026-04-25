@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     body::Body,
     body::Bytes,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     http::header,
     response::{Html, IntoResponse, Redirect},
@@ -179,6 +179,7 @@ pub struct AppState {
     pub log_buffer: SharedLogBuffer,
     pub log_reload_handle: LogReloadHandle,
     pub current_log_level: Arc<Mutex<String>>,
+    pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
 }
 
 async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
@@ -824,6 +825,246 @@ async fn set_console_loglevel(
     (StatusCode::OK, "Log level updated").into_response()
 }
 
+async fn list_chat_sessions(
+    user: auth::CurrentUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<manager::ChatSessionSummary>>, StatusCode> {
+    let mut response = state.db.query("SELECT type::string(meta::id(id)) AS id, updated_at, title FROM chat_sessions WHERE email = $email ORDER BY updated_at DESC")
+        .bind(("email", user.email.clone()))
+        .await.map_err(|e| { error!("DB List Error: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
+    let sessions: Vec<manager::ChatSessionSummary> = response.take(0).unwrap_or_default();
+    Ok(Json(sessions))
+}
+
+async fn get_chat_session(
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<manager::ChatSession>, StatusCode> {
+    let mut response = state
+        .db
+        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
+        .bind(("id", id.clone()))
+        .await
+        .map_err(|e| {
+            error!("DB Query Error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let session_record: Option<manager::ChatSessionRecord> = response.take(0).map_err(|e| {
+        error!("DB Take Error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    match session_record {
+        Some(s) if s.email == user.email => {
+            let mut response = state
+                .db
+                .query("SELECT role, content, message_index FROM chat_messages WHERE session_id = $session_id ORDER BY message_index ASC")
+                .bind(("session_id", id.clone()))
+                .await
+                .map_err(|e| {
+                    error!("DB Query Error: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+
+            let db_messages: Vec<manager::Message> = response.take(0).unwrap_or_default();
+
+            Ok(Json(manager::ChatSession {
+                id: s.id,
+                email: s.email,
+                updated_at: s.updated_at,
+                title: s.title,
+                messages: db_messages,
+            }))
+        }
+        Some(_) => Err(StatusCode::FORBIDDEN),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn save_chat_session(
+    user: auth::CurrentUser,
+    State(state): State<Arc<AppState>>,
+    Json(mut payload): Json<manager::ChatSessionRecord>,
+) -> Result<Json<manager::ChatSessionRecord>, StatusCode> {
+    payload.email = user.email.clone();
+    payload.updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if !payload.id.is_empty() {
+        let mut response = state
+            .db
+            .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
+            .bind(("id", payload.id.clone()))
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let existing: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
+        if let Some(s) = existing
+            && s.email != user.email
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    } else {
+        payload.id = uuid::Uuid::new_v4().to_string();
+    }
+
+    let mut response = state
+        .db
+        .query("UPSERT type::thing('chat_sessions', $id) MERGE { email: $email, updated_at: $updated_at, title: $title } RETURN type::string(meta::id(id)) AS id, email, updated_at, title")
+        .bind(("id", payload.id.clone()))
+        .bind(("email", payload.email.clone()))
+        .bind(("updated_at", payload.updated_at))
+        .bind(("title", payload.title.clone()))
+        .await
+        .map_err(|e| {
+            error!("DB Save Error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let saved: Option<manager::ChatSessionRecord> = response.take(0).map_err(|e| {
+        error!("DB Take Error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    saved.map(Json).ok_or_else(|| {
+        error!(
+            "DB Save Error: Upsert returned None for session {}",
+            payload.id
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+async fn append_chat_message(
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Json(mut payload): Json<manager::ChatMessageRecord>,
+) -> Result<StatusCode, StatusCode> {
+    let mut response = state
+        .db
+        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
+        .bind(("id", id.clone()))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let session: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
+
+    if let Some(s) = session {
+        if s.email != user.email {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    } else {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    payload.session_id = id.clone();
+    if let Err(e) = state
+        .db
+        .create::<Option<manager::ChatMessageRecord>>("chat_messages")
+        .content(payload)
+        .await
+    {
+        error!("DB Create Error (chat_messages): {}", e);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Err(e) = state
+        .db
+        .query("UPDATE type::thing('chat_sessions', $id) SET updated_at = $time")
+        .bind(("id", id.clone()))
+        .bind(("time", updated_at))
+        .await
+    {
+        error!("DB Update Error (chat_sessions timestamp): {}", e);
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn truncate_chat_messages(
+    user: auth::CurrentUser,
+    Path((id, index)): Path<(String, usize)>,
+    State(state): State<Arc<AppState>>,
+) -> Result<StatusCode, StatusCode> {
+    let mut response = state
+        .db
+        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
+        .bind(("id", id.clone()))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let session: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
+
+    if let Some(s) = session {
+        if s.email != user.email {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    } else {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    if let Err(e) = state
+        .db
+        .query(
+            "DELETE FROM chat_messages WHERE session_id = $session_id AND message_index >= $index",
+        )
+        .bind(("session_id", id.clone()))
+        .bind(("index", index))
+        .await
+    {
+        error!("DB Delete Error (truncate chat_messages): {}", e);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    Ok(StatusCode::OK)
+}
+
+async fn delete_chat_session(
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<StatusCode, StatusCode> {
+    let mut response = state
+        .db
+        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
+        .bind(("id", id.clone()))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let session: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
+    if let Some(s) = session {
+        if s.email != user.email {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if let Err(e) = state
+            .db
+            .query("DELETE type::thing('chat_sessions', $id)")
+            .bind(("id", id.clone()))
+            .await
+        {
+            error!("DB Delete Error (chat_sessions): {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        if let Err(e) = state
+            .db
+            .query("DELETE FROM chat_messages WHERE session_id = $session_id")
+            .bind(("session_id", id.clone()))
+            .await
+        {
+            error!("DB Delete Error (chat_messages): {}", e);
+        }
+        Ok(StatusCode::OK)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
 async fn get_console_loglevel(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
@@ -1005,16 +1246,22 @@ async fn main() {
         while let Some(event) = telemetry_rx.recv().await {
             match event {
                 manager::TelemetryEvent::Load(metric) => {
-                    let _ = db_for_telemetry
+                    if let Err(e) = db_for_telemetry
                         .create::<Option<manager::LoadMetric>>("telemetry_loads")
                         .content(metric)
-                        .await;
+                        .await
+                    {
+                        error!("Background DB Write Error (telemetry_loads): {}", e);
+                    }
                 }
                 manager::TelemetryEvent::Generation(metric) => {
-                    let _ = db_for_telemetry
+                    if let Err(e) = db_for_telemetry
                         .create::<Option<manager::GenerationMetric>>("telemetry_generations")
                         .content(metric)
-                        .await;
+                        .await
+                    {
+                        error!("Background DB Write Error (telemetry_generations): {}", e);
+                    }
                 }
             }
         }
@@ -1043,10 +1290,13 @@ async fn main() {
     tokio::spawn(async move {
         // This loop processes writes one-at-a-time per user, preventing giant monolithic DB updates
         while let Some(user_keys) = auth_rx.recv().await {
-            let _ = db_for_auth
+            if let Err(e) = db_for_auth
                 .upsert::<Option<auth::UserApiKeys>>(("auth_keys", &user_keys.email))
                 .content(user_keys)
-                .await;
+                .await
+            {
+                error!("Background DB Write Error (auth_keys): {}", e);
+            }
         }
     });
 
@@ -1074,6 +1324,7 @@ async fn main() {
         log_buffer: memory_buffer,
         log_reload_handle,
         current_log_level: Arc::new(Mutex::new(config.log_level_memory.clone())),
+        db: db_client.clone(),
     });
 
     // Setup Session Layer
@@ -1119,6 +1370,22 @@ async fn main() {
     let engine_api_routes = Router::new()
         .route("/api/generate", post(handle_generate))
         .route("/api/stats/collect", post(trigger_benchmark))
+        .route(
+            "/api/chat/sessions",
+            get(list_chat_sessions).post(save_chat_session),
+        )
+        .route(
+            "/api/chat/sessions/{id}",
+            get(get_chat_session).delete(delete_chat_session),
+        )
+        .route(
+            "/api/chat/sessions/{id}/messages",
+            post(append_chat_message),
+        )
+        .route(
+            "/api/chat/sessions/{id}/messages/{index}",
+            delete(truncate_chat_messages),
+        )
         .route("/api/models", get(get_models))
         .route("/api/status", get(get_status))
         .route("/api/stats/data", get(get_stats_data))
@@ -1206,5 +1473,259 @@ mod tests {
 
         let query: LogQuery = serde_json::from_str(r#"{"since": 42}"#).unwrap();
         assert_eq!(query.since, Some(42));
+    }
+
+    use axum::Json;
+    use axum::extract::{Path, State};
+    use std::collections::HashMap;
+
+    async fn create_test_app_state() -> Arc<AppState> {
+        let (queue_tx, _) = mpsc::channel(1);
+        let (telemetry_tx, _) = mpsc::unbounded_channel();
+        let (auth_tx, _) = tokio::sync::mpsc::unbounded_channel();
+
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+
+        // Ensure tables exist for testing purposes
+        db.query("DEFINE TABLE chat_sessions SCHEMALESS;")
+            .await
+            .unwrap();
+        db.query("DEFINE TABLE chat_messages SCHEMALESS;")
+            .await
+            .unwrap();
+        db.query("DEFINE TABLE auth_keys SCHEMALESS;")
+            .await
+            .unwrap();
+
+        let (_, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+
+        Arc::new(AppState {
+            queue_tx,
+            engine_status: Arc::new(Mutex::new(EngineStatus::default())),
+            telemetry: Arc::new(Mutex::new(TelemetryStore {
+                loads: vec![],
+                generations: vec![],
+                writer_tx: Some(telemetry_tx),
+            })),
+            auth_store: Arc::new(Mutex::new(AuthStore {
+                api_keys: HashMap::new(),
+                key_index: HashMap::new(),
+                writer_tx: Some(auth_tx),
+            })),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client: auth::build_oauth_client("http://localhost:3000/auth/google/callback"), // Dummy client
+            config: Arc::new(AppConfig::default()),
+            log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle,
+            current_log_level: Arc::new(Mutex::new("info".to_string())),
+            db,
+        })
+    }
+
+    fn mock_user(email: &str, is_admin: bool) -> auth::CurrentUser {
+        auth::CurrentUser {
+            email: email.to_string(),
+            is_admin,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_lifecycle() {
+        let state = create_test_app_state().await;
+        let user_email = "test@example.com";
+        let user = mock_user(user_email, false);
+
+        // 1. Create a new session
+        let new_session_payload = manager::ChatSessionRecord {
+            id: "".to_string(),
+            email: user_email.to_string(),
+            updated_at: 0,
+            title: "First Session".to_string(),
+        };
+        let response = save_chat_session(
+            user.clone(),
+            State(state.clone()),
+            Json(new_session_payload),
+        )
+        .await;
+        assert!(
+            response.is_ok(),
+            "Failed to save new session: {:?}",
+            response.err()
+        ); // Enhance assertion message
+        let new_session = response.unwrap().0;
+        assert!(!new_session.id.is_empty());
+        assert_eq!(new_session.title, "First Session");
+        let session_id = new_session.id.clone();
+
+        // 2. List sessions for the user
+        let sessions = list_chat_sessions(user.clone(), State(state.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+        assert_eq!(sessions[0].title, "First Session");
+
+        // 3. Get the session details (including messages, initially empty)
+        let session_detail_res =
+            get_chat_session(user.clone(), Path(session_id.clone()), State(state.clone())).await;
+        assert!(
+            session_detail_res.is_ok(),
+            "Failed to get session details: {:?}",
+            session_detail_res.err()
+        );
+        let session_detail = session_detail_res.unwrap().0;
+        assert_eq!(session_detail.id, session_id);
+        assert!(session_detail.messages.is_empty());
+
+        // 4. Append a message
+        let message_payload = manager::ChatMessageRecord {
+            session_id: session_id.clone(),
+            message_index: 0,
+            role: "user".to_string(),
+            content: "Hello AI".to_string(),
+        };
+        let append_res = append_chat_message(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(message_payload),
+        )
+        .await;
+        assert_eq!(append_res, Ok(StatusCode::OK));
+
+        // 5. Append another message
+        let message_payload_2 = manager::ChatMessageRecord {
+            session_id: session_id.clone(),
+            message_index: 1,
+            role: "assistant".to_string(),
+            content: "Hello human".to_string(),
+        };
+        let append_res_2 = append_chat_message(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(message_payload_2),
+        )
+        .await;
+        assert_eq!(append_res_2, Ok(StatusCode::OK));
+
+        // 6. Get session again and verify messages
+        let session_detail_with_msgs =
+            get_chat_session(user.clone(), Path(session_id.clone()), State(state.clone()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(session_detail_with_msgs.messages.len(), 2);
+        assert_eq!(session_detail_with_msgs.messages[0].content, "Hello AI");
+        assert_eq!(session_detail_with_msgs.messages[1].content, "Hello human");
+
+        // 7. Truncate messages (e.g., regenerate from a point)
+        let truncate_res = truncate_chat_messages(
+            user.clone(),
+            Path((session_id.clone(), 1)),
+            State(state.clone()),
+        )
+        .await;
+        assert_eq!(truncate_res, Ok(StatusCode::OK));
+
+        // 8. Verify truncation
+        let session_after_truncate =
+            get_chat_session(user.clone(), Path(session_id.clone()), State(state.clone()))
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(session_after_truncate.messages.len(), 1);
+        assert_eq!(session_after_truncate.messages[0].content, "Hello AI");
+
+        // 9. Attempt to access/modify another user's session (FORBIDDEN)
+        let other_user = mock_user("other@example.com", false);
+        let other_user_session_get_res = get_chat_session(
+            other_user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+        )
+        .await;
+        assert_eq!(
+            other_user_session_get_res.unwrap_err(),
+            StatusCode::FORBIDDEN
+        );
+
+        let other_user_session_update_payload = manager::ChatSessionRecord {
+            id: session_id.clone(),
+            email: other_user.email.clone(), // This should be ignored by the backend logic due to ID check
+            updated_at: 0,
+            title: "Malicious Update".to_string(),
+        };
+        let other_user_session_update_res = save_chat_session(
+            other_user.clone(),   // This should be `other_user` not `user.clone()`
+            State(state.clone()), // Use the cloned state
+            Json(other_user_session_update_payload), // Use the payload for the other user
+        )
+        .await;
+        assert_eq!(
+            other_user_session_update_res.unwrap_err(),
+            StatusCode::FORBIDDEN
+        ); // Expect a FORBIDDEN status
+    }
+
+    #[tokio::test]
+    async fn test_chat_session_renaming() {
+        let state = create_test_app_state().await;
+        let user_email = "test@example.com";
+        let user = mock_user(user_email, false);
+
+        // 1. Create a new session
+        let new_session_payload = manager::ChatSessionRecord {
+            id: "".to_string(),
+            email: user_email.to_string(),
+            updated_at: 0,
+            title: "Original Title".to_string(),
+        };
+        let response = save_chat_session(
+            user.clone(),
+            State(state.clone()),
+            Json(new_session_payload),
+        )
+        .await;
+
+        let new_session = response.unwrap().0;
+        let session_id = new_session.id.clone();
+        assert_eq!(new_session.title, "Original Title");
+
+        // 2. Rename the session
+        let rename_payload = manager::ChatSessionRecord {
+            id: session_id.clone(),
+            email: user_email.to_string(), // Keep same email
+            updated_at: 0,
+            title: "Renamed Title".to_string(),
+        };
+        let rename_response =
+            save_chat_session(user.clone(), State(state.clone()), Json(rename_payload)).await;
+        let renamed_session = rename_response.unwrap().0;
+
+        assert_eq!(
+            renamed_session.id, session_id,
+            "The ID should remain the same after an update."
+        );
+        assert_eq!(
+            renamed_session.title, "Renamed Title",
+            "The title should be updated."
+        );
+
+        // 3. Verify the listing reflects the new title and didn't duplicate the database record
+        let sessions = list_chat_sessions(user.clone(), State(state.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(sessions.len(), 1, "There should still only be one session.");
+        assert_eq!(sessions[0].id, session_id);
+        assert_eq!(sessions[0].title, "Renamed Title");
     }
 }

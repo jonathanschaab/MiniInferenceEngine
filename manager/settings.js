@@ -3,6 +3,7 @@ async function loadKeys() {
     try {
         res = await fetchWithAuth('/api/settings/keys');
     } catch (e) {
+        console.error("Failed to load keys", e);
         return;
     }
     if (!res.ok) return;
@@ -25,6 +26,7 @@ async function loadKeys() {
     tbody.innerHTML = tbodyHtml;
 }
 
+/* eslint-disable-next-line no-unused-vars -- Called by: settings.html button onclick="openKeyModal()" */
 function openKeyModal() {
     document.getElementById('new-key-name').value = '';
     document.getElementById('new-key-desc').value = '';
@@ -35,6 +37,7 @@ function closeKeyModal() {
     document.getElementById('new-key-modal').style.display = 'none';
 }
 
+/* eslint-disable-next-line no-unused-vars -- Called by: settings.html modal button onclick="submitNewKey()" */
 async function submitNewKey() {
     const name = document.getElementById('new-key-name').value.trim();
     const desc = document.getElementById('new-key-desc').value.trim();
@@ -58,6 +61,7 @@ async function submitNewKey() {
     }
 }
 
+/* eslint-disable-next-line no-unused-vars -- Called by: settings.html button onclick="deleteKey('${hash}')" */
 async function deleteKey(hash) {
     if(!confirm("Are you sure you want to permanently revoke this key? External apps using it will instantly fail.")) return;
     await fetchWithAuth(`/api/settings/keys/${hash}`, { method: 'DELETE' });

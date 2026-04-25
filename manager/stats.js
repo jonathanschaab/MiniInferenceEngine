@@ -1,5 +1,6 @@
 const colorPalette = ['#89b4fa', '#f38ba8', '#a6e3a1', '#f9e2af', '#cba6f7', '#94e2d5'];
 
+/* eslint-disable-next-line no-unused-vars -- Called by: stats.html button onclick="openBenchmarkModal()" */
 async function openBenchmarkModal() {
     if (isBenchmarking) {
         alert("A benchmark is already running!");
@@ -73,6 +74,7 @@ function closeModal() {
     document.getElementById('benchmark-modal').style.display = 'none';
 }
 
+/* eslint-disable-next-line no-unused-vars -- Called by: stats.html modal button onclick="submitBenchmark()" */
 async function submitBenchmark() {
     // Gather all checked boxes that are currently compatible (not disabled)
     const checkboxes = document.querySelectorAll('#model-checkbox-list input:checked:not(:disabled)');
@@ -121,7 +123,8 @@ async function loadDashboard() {
             fetchWithAuth('/api/stats/data')
         ]);
     } catch (e) {
-        return; // Redirected by fetchWithAuth
+        console.error("Failed to load dashboard", e);
+        return;
     }
     
     if (!modelsRes.ok || !statsRes.ok) return;

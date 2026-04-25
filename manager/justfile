@@ -2,6 +2,7 @@ set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 
 clippy:
     cargo fmt
+    npx eslint . --max-warnings 0
     cargo clippy --all-features --target x86_64-pc-windows-msvc
 
 test: clippy

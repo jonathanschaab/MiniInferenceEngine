@@ -7,6 +7,8 @@ const typingIndicator = document.getElementById('typing-indicator');
 
 let chatHistory = [];
 let currentAbortController = null;
+let currentSessionId = "";
+let currentSessionTitle = "";
 
 window.onload = initializeUI;
 
@@ -98,6 +100,8 @@ async function initializeUI() {
         updateDropdownCompatibility();
 
         updateStatus();
+        
+        await loadSessions();
     } catch (err) {
         console.error("Failed to execute UI initialization:", err);
     }
@@ -140,19 +144,147 @@ function updateDropdownCompatibility() {
     }
 }
 
+async function loadSessions() {
+    try {
+        const res = await fetchWithAuth('/api/chat/sessions');
+        const sessions = await res.json();
+        
+        if (!currentSessionId) {
+            const lastId = localStorage.getItem('mini_inference_last_chat_id');
+            if (lastId && sessions.some(s => s.id === lastId)) {
+                await loadSession(lastId);
+                return; 
+            } else if (lastId) {
+                localStorage.removeItem('mini_inference_last_chat_id');
+            }
+        }
+
+        const list = document.getElementById('session-list');
+        list.innerHTML = '';
+        sessions.forEach(s => {
+            const div = document.createElement('div');
+            div.className = `session-item ${s.id === currentSessionId ? 'active' : ''}`;
+            div.onclick = () => loadSession(s.id);
+            
+            const infoDiv = document.createElement('div');
+            infoDiv.className = 'session-info';
+
+            const title = document.createElement('div');
+            title.className = 'session-title';
+            title.textContent = s.title || "Untitled Chat";
+            
+            const dateStr = s.updated_at ? new Date(s.updated_at * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '';
+            const dateDiv = document.createElement('div');
+            dateDiv.className = 'session-date';
+            dateDiv.textContent = dateStr;
+
+            infoDiv.appendChild(title);
+            infoDiv.appendChild(dateDiv);
+
+            const actionsDiv = document.createElement('div');
+            actionsDiv.style.whiteSpace = 'nowrap';
+
+            const editBtn = document.createElement('button');
+            editBtn.className = 'session-action-btn';
+            editBtn.textContent = '✎';
+            editBtn.title = "Rename Chat";
+            editBtn.onclick = async (e) => {
+                e.stopPropagation();
+                const newTitle = prompt("Enter new chat name:", s.title);
+                if (newTitle && newTitle.trim() !== "" && newTitle !== s.title) {
+                    await renameSession(s.id, newTitle.trim());
+                }
+            };
+
+            const delBtn = document.createElement('button');
+            delBtn.className = 'session-action-btn delete-btn';
+            delBtn.textContent = '×';
+            delBtn.title = "Delete Chat";
+            delBtn.onclick = async (e) => {
+                e.stopPropagation();
+                if (confirm("Delete this chat?")) {
+                    await fetchWithAuth(`/api/chat/sessions/${s.id}`, { method: 'DELETE' });
+                    if (currentSessionId === s.id) startNewSession();
+                    else loadSessions();
+                }
+            };
+
+            actionsDiv.appendChild(editBtn);
+            actionsDiv.appendChild(delBtn);
+            div.appendChild(infoDiv);
+            div.appendChild(actionsDiv);
+            list.appendChild(div);
+        });
+    } catch(e) { console.error("Failed to load sessions:", e); }
+}
+
+async function renameSession(id, newTitle) {
+    try {
+        const res = await fetchWithAuth('/api/chat/sessions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                id: id,
+                email: "",
+                updated_at: 0,
+                title: newTitle
+            })
+        });
+        if (res.ok) {
+            if (id === currentSessionId) {
+                currentSessionTitle = newTitle;
+            }
+            loadSessions();
+        } else {
+            console.error("Failed to rename session");
+        }
+    } catch(e) { console.error("Error renaming session:", e); }
+}
+
+async function loadSession(id) {
+    try {
+        const res = await fetchWithAuth(`/api/chat/sessions/${id}`);
+        const session = await res.json();
+        currentSessionId = session.id;
+        currentSessionTitle = session.title;
+        localStorage.setItem('mini_inference_last_chat_id', currentSessionId);
+        chatHistory = session.messages || [];
+        
+        chatContainer.innerHTML = '';
+        regenBtn.style.display = 'none';
+        
+        chatHistory.forEach(msg => {
+            appendMessage(msg.content, msg.role === 'user');
+        });
+        
+        // Ensure we scroll to the bottom after the browser renders the messages
+        requestAnimationFrame(() => {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        });
+        
+        if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
+        
+        loadSessions(); // update active class
+    } catch(e) { console.error("Failed to load session:", e); }
+}
+
+window.startNewSession = function() {
+    currentSessionId = "";
+    currentSessionTitle = "";
+    localStorage.removeItem('mini_inference_last_chat_id');
+    chatHistory = [];
+    chatContainer.innerHTML = '<div class="message ai-message">System: New chat session started. How can I help you?</div>';
+    regenBtn.style.display = 'none';
+    loadSessions();
+}
+
 inputField.addEventListener('input', function() {
     this.style.height = 'auto';
     this.style.height = (this.scrollHeight) + 'px';
 });
 
-function clearChat() {
-    chatHistory = [];
-    // Remove all messages except the first AI greeting
-    regenBtn.style.display = 'none';
-    const messages = chatContainer.querySelectorAll('.message');
-    for (let i = 1; i < messages.length; i++) {
-        chatContainer.removeChild(messages[i]);
-    }
+window.clearChat = function() {
+    startNewSession();
 }
 
 function appendMessage(text, isUser) {
@@ -161,6 +293,53 @@ function appendMessage(text, isUser) {
     div.textContent = text;
     chatContainer.appendChild(div);
     chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+async function ensureSession(firstMessageText) {
+    if (currentSessionId) return;
+    currentSessionTitle = firstMessageText ? firstMessageText.substring(0, 30) : "New Chat";
+    try {
+        const res = await fetchWithAuth('/api/chat/sessions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                id: "",
+                email: "",
+                updated_at: 0,
+                title: currentSessionTitle
+            })
+        });
+        const saved = await res.json();
+        currentSessionId = saved.id;
+        localStorage.setItem('mini_inference_last_chat_id', currentSessionId);
+        loadSessions();
+    } catch(e) { console.error("Failed to create session", e); }
+}
+
+async function appendMessageToDB(role, content, index) {
+    if (!currentSessionId) return;
+    try {
+        await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: currentSessionId,
+                message_index: index,
+                role: role,
+                content: content
+            })
+        });
+        loadSessions(); // Updates the updated_at timestamp in sidebar
+    } catch(e) { console.error("Failed to append message", e); }
+}
+
+async function truncateMessagesInDB(fromIndex) {
+    if (!currentSessionId) return;
+    try {
+        await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages/${fromIndex}`, {
+            method: 'DELETE'
+        });
+    } catch(e) { console.error("Failed to truncate messages", e); }
 }
 
 async function sendMessage() {
@@ -177,8 +356,12 @@ async function sendMessage() {
         return;
     }
 
+    await ensureSession(text);
+
+    const userIndex = chatHistory.length;
     appendMessage(text, true);
     chatHistory.push({ role: "user", content: text });
+    await appendMessageToDB("user", text, userIndex);
     
     inputField.value = '';
     inputField.style.height = 'auto'; 
@@ -233,14 +416,18 @@ async function sendMessage() {
             chatContainer.scrollTop = chatContainer.scrollHeight;
         }
         
+        const aiIndex = chatHistory.length;
         chatHistory.push({ role: "assistant", content: fullAnswer });
         updateStatus();
+        await appendMessageToDB("assistant", fullAnswer, aiIndex);
 
     } catch (err) {
         if (err.name === 'AbortError') {
             aiMessageDiv.textContent += " [Stopped]";
+            const aiIndex = chatHistory.length;
             chatHistory.push({ role: "assistant", content: aiMessageDiv.textContent });
             updateStatus();
+            await appendMessageToDB("assistant", aiMessageDiv.textContent, aiIndex);
         } else {
             typingIndicator.style.display = 'none';
             aiMessageDiv.textContent = "Error: Failed to connect to engine.";
@@ -256,7 +443,7 @@ async function sendMessage() {
     currentAbortController = null;
 }
 
-function regenerateLast() {
+async function regenerateLast() {
     if (chatHistory.length === 0) return;
     
     // Remove the assistant's last message
@@ -269,6 +456,7 @@ function regenerateLast() {
     if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'user') {
         const lastUserMsg = chatHistory.pop();
         chatContainer.removeChild(chatContainer.lastChild);
+        await truncateMessagesInDB(chatHistory.length);
         inputField.value = lastUserMsg.content;
         sendMessage();
     }

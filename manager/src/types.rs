@@ -204,8 +204,44 @@ pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ChatSession {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub title: String,
+    pub messages: Vec<Message>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ChatSessionSummary {
+    pub id: String,
+    pub updated_at: u64,
+    pub title: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ChatSessionRecord {
+    pub id: String,
+    pub email: String,
+    pub updated_at: u64,
+    pub title: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ChatMessageRecord {
+    pub session_id: String,
+    pub message_index: usize,
     pub role: String,
     pub content: String,
 }
