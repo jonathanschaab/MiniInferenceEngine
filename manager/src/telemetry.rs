@@ -77,16 +77,11 @@ impl TelemetryStore {
             generations.reverse();
         }
 
-        let mut store = TelemetryStore {
+        TelemetryStore {
             loads,
             generations,
             writer_tx: None,
-        };
-
-        store.loads.sort_by_key(|l| l.timestamp);
-        store.generations.sort_by_key(|g| g.timestamp);
-
-        store
+        }
     }
 
     pub fn record_load(&mut self, model_id: String, backend: String, load_time_ms: u64) {

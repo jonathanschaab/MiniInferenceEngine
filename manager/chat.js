@@ -398,7 +398,6 @@ async function appendMessageToDB(role, content, index) {
                 content: content
             })
         });
-        loadSessions(); // Updates the updated_at timestamp in sidebar
     } catch(e) { console.error("Failed to append message", e); }
 }
 
@@ -510,6 +509,8 @@ async function sendMessage() {
     sendBtn.disabled = false;
     inputField.focus();
     currentAbortController = null;
+    
+    loadSessions(); // Updates the updated_at timestamp in sidebar
 }
 
 async function regenerateLast() {
