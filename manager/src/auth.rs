@@ -66,15 +66,14 @@ pub struct AuthStore {
 }
 
 impl AuthStore {
-    pub async fn load(db: &Surreal<Any>) -> Self {
+    pub async fn load(db: &Surreal<Any>) -> Result<Self, surrealdb::Error> {
         let mut store = AuthStore::default();
 
         // Load individual user records
-        if let Ok(mut response) = db.query("SELECT * FROM auth_keys").await {
-            let user_keys: Vec<UserApiKeys> = response.take(0).unwrap_or_default();
-            for uk in user_keys {
-                store.api_keys.insert(uk.email, uk.keys);
-            }
+        let mut response = db.query("SELECT * FROM auth_keys").await?;
+        let user_keys: Vec<UserApiKeys> = response.take(0)?;
+        for uk in user_keys {
+            store.api_keys.insert(uk.email, uk.keys);
         }
 
         // Build the O(1) index on startup
@@ -83,7 +82,7 @@ impl AuthStore {
                 store.key_index.insert(record.hash.clone(), email.clone());
             }
         }
-        store
+        Ok(store)
     }
 
     pub fn generate_key(
@@ -484,7 +483,7 @@ mod tests {
             .content(user_keys)
             .await;
 
-        let loaded_store = AuthStore::load(&db).await;
+        let loaded_store = AuthStore::load(&db).await.unwrap();
         assert_eq!(loaded_store.api_keys.len(), 1);
         assert_eq!(loaded_store.api_keys["db_test@local"][0].name, "DB Key");
 

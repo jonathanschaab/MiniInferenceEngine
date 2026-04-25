@@ -1388,7 +1388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut store = AuthStore::load(&db_client).await;
+    let mut store = AuthStore::load(&db_client).await?;
     store.writer_tx = Some(auth_tx);
     let auth_store = Arc::new(Mutex::new(store));
 
