@@ -83,7 +83,9 @@ pub async fn init_db(
     ";
 
     if let Err(e) = db_client.query(index_queries).await {
-        error!("Failed to define database indexes: {}", e);
+        let msg = format!("Failed to define database indexes: {}", e);
+        error!("{}", msg);
+        return Err(msg.into());
     }
 
     Ok(db_client)
