@@ -165,6 +165,44 @@ impl TelemetryStore {
     }
 }
 
+pub async fn cleanup_telemetry(db: &Surreal<Any>, retention_days: u64) -> Result<(), String> {
+    let retention_secs = retention_days * 24 * 3600;
+    let tables = ["telemetry_loads", "telemetry_generations"];
+
+    for table in tables {
+        let query = format!(
+            "SELECT model_id, backend, math::max(timestamp) AS max_ts FROM {} GROUP BY model_id, backend",
+            table
+        );
+
+        let mut response = db.query(&query).await.map_err(|e| e.to_string())?;
+        let groups: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
+
+        for group in groups {
+            if let (Some(model_id), Some(backend), Some(max_ts)) = (
+                group.get("model_id").and_then(|v| v.as_str()),
+                group.get("backend").and_then(|v| v.as_str()),
+                group
+                    .get("max_ts")
+                    .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64))),
+            ) {
+                let cutoff = max_ts.saturating_sub(retention_secs);
+                let delete_query = format!(
+                    "DELETE FROM {} WHERE model_id = $model_id AND backend = $backend AND timestamp < $cutoff",
+                    table
+                );
+                let _ = db
+                    .query(&delete_query)
+                    .bind(("model_id", model_id.to_string()))
+                    .bind(("backend", backend.to_string()))
+                    .bind(("cutoff", cutoff))
+                    .await;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

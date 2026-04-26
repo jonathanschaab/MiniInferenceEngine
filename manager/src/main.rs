@@ -59,6 +59,8 @@ pub struct AppConfig {
     pub secure_cookies: bool,
     #[serde(default)]
     pub gpu_device_index: u32,
+    #[serde(default = "default_telemetry_retention_days")]
+    pub telemetry_retention_days: u64,
     #[serde(default = "default_log_level_console")]
     pub log_level_console: String,
     #[serde(default = "default_log_level_file")]
@@ -86,6 +88,9 @@ fn default_log_file_name() -> String {
 fn default_oauth_client_secret_path() -> String {
     "client_secret.apps.googleusercontent.com.json".to_string()
 }
+fn default_telemetry_retention_days() -> u64 {
+    30
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -97,6 +102,7 @@ impl Default for AppConfig {
             user_emails: vec![],
             secure_cookies: true,
             gpu_device_index: 0,
+            telemetry_retention_days: default_telemetry_retention_days(),
             log_level_console: default_log_level_console(),
             log_level_file: default_log_level_file(),
             log_level_memory: default_log_level_memory(),
@@ -1204,6 +1210,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_status = Arc::new(Mutex::new(EngineStatus::default()));
 
     let db_client = setup::init_db(&config).await?;
+
+    // Background Telemetry Cleanup Task
+    let db_for_cleanup = db_client.clone();
+    let retention_days = config.telemetry_retention_days;
+    tokio::spawn(async move {
+        if retention_days == 0 {
+            return; // 0 disables retention cleanup
+        }
+        // Check every 24 hours (The first tick completes immediately on startup)
+        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        loop {
+            cleanup_interval.tick().await;
+            if let Err(e) = manager::cleanup_telemetry(&db_for_cleanup, retention_days).await {
+                error!("Telemetry cleanup task failed: {}", e);
+            }
+        }
+    });
 
     // Background VRAM Tracker
     let status_for_nvml = engine_status.clone();
