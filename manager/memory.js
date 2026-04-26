@@ -10,6 +10,7 @@ function formatTime(millis) {
     return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
 }
 
+/* eslint-disable-next-line no-unused-vars -- Called by: memory.html tab buttons onclick="switchTab('tabName')" */
 function switchTab(tabName) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -25,6 +26,7 @@ async function updateDashboard() {
     try {
         res = await fetchWithAuth('/api/status');
     } catch (e) {
+        console.error("Failed to update dashboard", e);
         return;
     }
     if (!res.ok) return;

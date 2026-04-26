@@ -1,6 +1,6 @@
 use crate::AppState;
 use axum::{
-    Json, async_trait,
+    Json,
     extract::{FromRequestParts, Path, Query, Request, State},
     http::{StatusCode, request::Parts},
     middleware::Next,
@@ -15,6 +15,7 @@ use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashMap, fs, sync::Arc};
+use surrealdb::{Surreal, engine::any::Any};
 use tokio::sync::mpsc::UnboundedSender;
 use tower_sessions::Session;
 use tracing::error;
@@ -25,7 +26,6 @@ pub struct CurrentUser {
     pub is_admin: bool,
 }
 
-#[async_trait]
 impl<S> FromRequestParts<S> for CurrentUser
 where
     S: Send + Sync,
@@ -50,46 +50,31 @@ pub struct ApiKeyRecord {
     pub hash: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct UserApiKeys {
+    pub email: String,
+    pub keys: Vec<ApiKeyRecord>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct AuthStore {
     pub api_keys: HashMap<String, Vec<ApiKeyRecord>>,
     #[serde(skip)]
     pub key_index: HashMap<String, String>,
     #[serde(skip)]
-    pub writer_tx: Option<UnboundedSender<String>>,
+    pub writer_tx: Option<UnboundedSender<UserApiKeys>>,
 }
 
 impl AuthStore {
-    pub fn load() -> Self {
-        let mut store = if let Ok(data) = fs::read_to_string("api_keys.json") {
-            match serde_json::from_str(&data) {
-                Ok(s) => s,
-                Err(e) => {
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let backup_name = format!("api_keys_{}.json.bak", timestamp);
-                    error!("CRITICAL: api_keys.json is corrupted! Error: {}", e);
-                    error!(
-                        "Backing up corrupted file to {} to prevent data loss.",
-                        backup_name
-                    );
-                    let _ = fs::rename("api_keys.json", backup_name);
-                    AuthStore {
-                        api_keys: HashMap::new(),
-                        key_index: HashMap::new(),
-                        writer_tx: None,
-                    }
-                }
-            }
-        } else {
-            AuthStore {
-                api_keys: HashMap::new(),
-                key_index: HashMap::new(),
-                writer_tx: None,
-            }
-        };
+    pub async fn load(db: &Surreal<Any>) -> Result<Self, surrealdb::Error> {
+        let mut store = AuthStore::default();
+
+        // Load individual user records
+        let mut response = db.query("SELECT * FROM auth_keys").await?;
+        let user_keys: Vec<UserApiKeys> = response.take(0)?;
+        for uk in user_keys {
+            store.api_keys.insert(uk.email, uk.keys);
+        }
 
         // Build the O(1) index on startup
         for (email, records) in &store.api_keys {
@@ -97,7 +82,7 @@ impl AuthStore {
                 store.key_index.insert(record.hash.clone(), email.clone());
             }
         }
-        store
+        Ok(store)
     }
 
     pub fn generate_key(
@@ -123,7 +108,7 @@ impl AuthStore {
 
         // Add to O(1) index
         self.key_index.insert(hash, email.to_string());
-        self.save();
+        self.save_user(email);
 
         plaintext_key
     }
@@ -134,19 +119,23 @@ impl AuthStore {
             keys.retain(|k| k.hash != hash);
             if keys.len() < initial_len {
                 self.key_index.remove(hash); // Keep O(1) cache in sync
-                self.save();
+                self.save_user(email);
                 return true;
             }
         }
         false
     }
 
-    pub fn save(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(self) {
+    pub fn save_user(&self, email: &str) {
+        if let Some(keys) = self.api_keys.get(email) {
             if let Some(tx) = &self.writer_tx {
-                let _ = tx.send(json);
+                let payload = UserApiKeys {
+                    email: email.to_string(),
+                    keys: keys.clone(),
+                };
+                let _ = tx.send(payload);
             } else {
-                error!("[AUTH FAULT] Writer channel missing! Dropping api_keys.json write.");
+                error!("[AUTH FAULT] Writer channel missing! Dropping api_keys DB write.");
             }
         }
     }
@@ -165,26 +154,55 @@ struct GoogleClientSecretWeb {
 
 // --- OAUTH2 CLIENT SETUP ---
 
-pub fn build_oauth_client(redirect_uri: &str) -> BasicClient {
+pub fn build_oauth_client(
+    redirect_uri: &str,
+    secret_path: &str,
+    auth_url: &str,
+    token_url: &str,
+) -> Result<BasicClient, String> {
     // 1. Read the JSON file from the disk
-    let file_content = fs::read_to_string("client_secret.apps.googleusercontent.com.json")
-        .expect("⚠️ CRITICAL: Could not find client_secret.apps.googleusercontent.com.json in the manager directory!");
+    let file_content = match fs::read_to_string(secret_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!(
+                "⚠️ CRITICAL: Could not find {} in the manager directory! Error: {}",
+                secret_path, e
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+    };
 
     // 2. Parse the JSON to extract the ID and Secret
-    let secret_data: GoogleClientSecret = serde_json::from_str(&file_content)
-        .expect("⚠️ CRITICAL: Failed to parse Google client secret JSON. Make sure it is the 'Web application' format.");
+    let secret_data: GoogleClientSecret = match serde_json::from_str(&file_content) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!(
+                "⚠️ CRITICAL: Failed to parse Google client secret JSON. Make sure it is the 'Web application' format. Error: {}",
+                e
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+    };
 
     let client_id = secret_data.web.client_id;
     let client_secret = secret_data.web.client_secret;
 
-    BasicClient::new(
+    Ok(BasicClient::new(
         ClientId::new(client_id),
         Some(ClientSecret::new(client_secret)),
-        AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string()).unwrap(),
-        Some(TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).unwrap()),
+        AuthUrl::new(auth_url.to_string()).map_err(|e| format!("Invalid Auth URL: {}", e))?,
+        Some(
+            TokenUrl::new(token_url.to_string())
+                .map_err(|e| format!("Invalid Token URL: {}", e))?,
+        ),
     )
     // Make sure this matches your Nginx setup exactly! (e.g., https://ai.lan/auth/google/callback)
-    .set_redirect_uri(RedirectUrl::new(redirect_uri.to_string()).unwrap())
+    .set_redirect_uri(
+        RedirectUrl::new(redirect_uri.to_string())
+            .map_err(|e| format!("Invalid OAuth redirect URI: {}", e))?,
+    ))
 }
 
 // --- LOGIN ROUTES ---
@@ -214,7 +232,7 @@ pub struct AuthRequest {
 }
 
 #[derive(Deserialize)]
-pub struct GoogleUser {
+pub struct OidcUser {
     email: String,
 }
 
@@ -228,7 +246,7 @@ pub async fn callback_handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if saved_state.is_none() || saved_state.unwrap() != query.state {
+    if saved_state != Some(query.state) {
         return Err(StatusCode::BAD_REQUEST); // CSRF Attack Detected!
     }
 
@@ -243,12 +261,12 @@ pub async fn callback_handler(
     // Use the pooled Reqwest client from AppState
     let user_data = state
         .reqwest_client
-        .get("https://www.googleapis.com/oauth2/v2/userinfo")
+        .get(&state.config.oauth_userinfo_url)
         .bearer_auth(token.access_token().secret())
         .send()
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?
-        .json::<GoogleUser>()
+        .json::<OidcUser>()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -454,5 +472,37 @@ mod tests {
             .unwrap();
         assert_eq!(result.email, "admin@local");
         assert!(result.is_admin);
+    }
+
+    #[tokio::test]
+    async fn test_auth_store_surrealdb_flow() {
+        // Spin up an isolated, in-memory SurrealDB instance for testing
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+
+        let mut store = AuthStore::default();
+        store.generate_key("db_test@local", "DB Key".into(), None);
+
+        // Simulate the background task writing the state to the DB
+        let user_keys = UserApiKeys {
+            email: "db_test@local".to_string(),
+            keys: store.api_keys["db_test@local"].clone(),
+        };
+
+        let _ = db
+            .upsert::<Option<UserApiKeys>>(("auth_keys", "db_test@local"))
+            .content(user_keys)
+            .await;
+
+        let loaded_store = AuthStore::load(&db).await.unwrap();
+        assert_eq!(loaded_store.api_keys.len(), 1);
+        assert_eq!(loaded_store.api_keys["db_test@local"][0].name, "DB Key");
+
+        // Verify the O(1) index was correctly rebuilt on load
+        let hash = &loaded_store.api_keys["db_test@local"][0].hash;
+        assert_eq!(
+            loaded_store.key_index.get(hash),
+            Some(&"db_test@local".to_string())
+        );
     }
 }

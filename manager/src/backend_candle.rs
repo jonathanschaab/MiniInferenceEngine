@@ -172,7 +172,10 @@ where
 
     let prompt_length = tokens.len();
     let mut logits_processor = LogitsProcessor::new(
-        params.seed.unwrap_or_else(rand::random::<u64>),
+        params
+            .seed
+            .map(|s| s as u64)
+            .unwrap_or_else(rand::random::<u64>),
         params.temperature.map(|t| t as f64),
         params.top_p.map(|p| p as f64),
     );

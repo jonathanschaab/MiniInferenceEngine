@@ -1,18 +1,17 @@
-/**
- * Wrapper around standard fetch that automatically handles 401 Unauthorized redirects.
- */
+/* eslint-disable-next-line no-unused-vars -- Called by: chat.js, settings.js, memory.js, stats.js, models.js, console.js (internal fetch wrapper) */
 async function fetchWithAuth(url, options = {}) {
     const response = await fetch(url, options);
-    if (!response.ok && response.status === 401) {
-        window.location.href = '/auth/login';
-        throw new Error('Unauthorized'); // Stop further execution in the caller
+    if (!response.ok) {
+        if (response.status === 401) {
+            window.location.href = '/auth/login';
+            throw new Error('Unauthorized'); // Stop further execution in the caller
+        }
+        throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
     }
     return response;
 }
 
-/**
- * Extracts generation parameters from the shared parameter UI panel.
- */
+/* eslint-disable-next-line no-unused-vars -- Called by: stats.js submitBenchmark() and stats.html generation parameter UI */
 function getGenerationParameters() {
     const params = {
         temperature: parseFloat(document.getElementById('param-temp').value),

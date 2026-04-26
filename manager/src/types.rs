@@ -204,8 +204,47 @@ pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ChatSession {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub updated_at: u64,
+    #[serde(default)]
+    pub title: String,
+    pub messages: Vec<Message>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ChatSessionSummary {
+    pub id: String,
+    pub updated_at: u64,
+    pub title: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ChatSessionRecord {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub updated_at: u64,
+    pub title: String,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct ChatMessageRecord {
+    pub session_id: String,
+    pub message_index: usize,
     pub role: String,
     pub content: String,
 }
@@ -223,7 +262,7 @@ pub struct GenerationParameters {
     pub top_p: Option<f32>,
     pub top_k: Option<usize>,
     pub max_tokens: Option<usize>,
-    pub seed: Option<u64>,
+    pub seed: Option<i64>,
     pub memory_strategy: Option<MemoryStrategy>,
     pub context_buffer: Option<usize>,
     pub yarn_enabled: Option<bool>,

@@ -39,6 +39,9 @@ jobs:
       - name: Install NPM Dependencies
         working-directory: manager
         run: npm install
+      - name: Run Javascript Linter (ESLint)
+        working-directory: manager
+        run: npm run lint:js
       - name: Install Playwright Browsers
         working-directory: manager
         run: npx playwright install --with-deps chromium

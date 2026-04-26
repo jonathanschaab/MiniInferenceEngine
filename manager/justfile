@@ -1,0 +1,14 @@
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+
+clippy:
+    cargo fmt
+    npx eslint . --max-warnings 0
+    cargo clippy --all-features --target x86_64-pc-windows-msvc
+
+test: clippy
+    cargo test --all-features --target x86_64-pc-windows-msvc
+    cargo test --all-features --target x86_64-pc-windows-msvc -- --ignored
+    npx playwright test
+
+run: test
+    cargo run --all-features --target x86_64-pc-windows-msvc

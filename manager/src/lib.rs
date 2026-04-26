@@ -464,7 +464,13 @@ pub async fn run_batcher_loop(
                 t.record_load(
                     request.chat_model_id.clone(),
                     target_backend_name.clone(),
-                    elapsed,
+                    match elapsed.try_into() {
+                        Ok(val) => val,
+                        Err(_) => {
+                            warn!("Load time ({}ms) for model '{}' on backend '{}' exceeded u64::MAX, saturating to u64::MAX. This indicates an extremely long duration or a potential issue.", elapsed, request.chat_model_id, target_backend_name);
+                            u64::MAX
+                        }
+                    },
                 );
             }
 
@@ -705,7 +711,13 @@ pub async fn run_batcher_loop(
                 t.record_load(
                     request.compressor_model_id.clone(),
                     format!("{:?}", comp_btype),
-                    comp_load_elapsed,
+                    match comp_load_elapsed.try_into() {
+                        Ok(val) => val,
+                        Err(_) => {
+                            warn!("Compressor load time ({}ms) for model '{}' on backend '{:?}' exceeded u64::MAX, saturating to u64::MAX. This indicates an extremely long duration or a potential issue.", comp_load_elapsed, request.compressor_model_id, comp_btype);
+                            u64::MAX
+                        }
+                    },
                 );
             }
 
@@ -779,8 +791,20 @@ pub async fn run_batcher_loop(
                     comp_offload_pct,
                     formatted_prompt.len(),
                     token_count,
-                    comp_tok_time,
-                    comp_elapsed,
+                    match comp_tok_time.try_into() {
+                        Ok(val) => val,
+                        Err(_) => {
+                            warn!("Compressor tokenization time ({}ms) for model '{}' on backend '{}' exceeded u64::MAX, saturating to u64::MAX.", comp_tok_time, request.compressor_model_id, comp_btype_str);
+                            u64::MAX
+                        }
+                    },
+                    match comp_elapsed.try_into() {
+                        Ok(val) => val,
+                        Err(_) => {
+                            warn!("Compressor generation time ({}ms) for model '{}' on backend '{}' exceeded u64::MAX, saturating to u64::MAX.", comp_elapsed, request.compressor_model_id, comp_btype_str);
+                            u64::MAX
+                        }
+                    },
                 );
             }
 
@@ -921,8 +945,20 @@ pub async fn run_batcher_loop(
                 offload_pct,
                 formatted_prompt.len(),
                 token_count,
-                tokenization_time_ms,
-                elapsed,
+                match tokenization_time_ms.try_into() {
+                    Ok(val) => val,
+                    Err(_) => {
+                        warn!("Tokenization time ({}ms) for model '{}' on backend '{}' exceeded u64::MAX, saturating to u64::MAX.", tokenization_time_ms, active_model_id, active_backend_name);
+                        u64::MAX
+                    }
+                },
+                match elapsed.try_into() {
+                    Ok(val) => val,
+                    Err(_) => {
+                        warn!("Generation time ({}ms) for model '{}' on backend '{}' exceeded u64::MAX, saturating to u64::MAX.", elapsed, active_model_id, active_backend_name);
+                        u64::MAX
+                    }
+                },
             );
         }
 
