@@ -1038,14 +1038,37 @@ pub(crate) async fn append_chat_message(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    let mut last_msg_response = state
+        .db
+        .query("SELECT * FROM chat_messages WHERE session_id = $session_id ORDER BY message_index DESC LIMIT 1")
+        .bind(("session_id", id.clone()))
+        .await
+        .map_err(|e| {
+            error!("DB Query Error (last message): {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let last_msg: Option<manager::ChatMessageRecord> =
+        last_msg_response.take(0).unwrap_or_default();
+    let expected_index = last_msg.map(|m| m.message_index + 1).unwrap_or(0);
+
+    if payload.message_index > expected_index {
+        error!(
+            "Invalid message_index for session {}: expected <= {}, got {}",
+            id, expected_index, payload.message_index
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     payload.session_id = id.clone();
+    let message_id = format!("{}_{}", id, payload.message_index);
     if let Err(e) = state
         .db
-        .create::<Option<manager::ChatMessageRecord>>("chat_messages")
+        .upsert::<Option<manager::ChatMessageRecord>>(("chat_messages", &message_id))
         .content(payload)
         .await
     {
-        error!("DB Create Error (chat_messages): {}", e);
+        error!("DB Upsert Error (chat_messages): {}", e);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -1856,5 +1879,85 @@ mod tests {
         assert_eq!(sessions.len(), 1, "There should still only be one session.");
         assert_eq!(sessions[0].id, session_id);
         assert_eq!(sessions[0].title, "Renamed Title");
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
+    async fn test_chat_session_gap_rejection() {
+        let state = create_test_app_state().await;
+        let user_email = "test@example.com";
+        let user = mock_user(user_email, false);
+
+        let new_session_payload = manager::ChatSessionRecord {
+            id: "".to_string(),
+            email: user_email.to_string(),
+            updated_at: 0,
+            title: "Gap Test Session".to_string(),
+        };
+        let response = save_chat_session(
+            user.clone(),
+            State(state.clone()),
+            Json(new_session_payload),
+        )
+        .await;
+        let session_id = response.unwrap().0.id;
+
+        // 1. Append message 0 (Valid)
+        let msg0 = manager::ChatMessageRecord {
+            session_id: session_id.clone(),
+            message_index: 0,
+            role: "user".to_string(),
+            content: "Message 0".to_string(),
+        };
+        let res0 = append_chat_message(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(msg0),
+        )
+        .await;
+        assert_eq!(res0, Ok(StatusCode::OK));
+
+        // 2. Append message 2 (Invalid Gap -> Should return BAD_REQUEST)
+        let msg2 = manager::ChatMessageRecord {
+            session_id: session_id.clone(),
+            message_index: 2,
+            role: "user".to_string(),
+            content: "Message 2".to_string(),
+        };
+        let res2 = append_chat_message(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(msg2),
+        )
+        .await;
+        assert_eq!(res2, Err(StatusCode::BAD_REQUEST));
+
+        // 3. Append message 1 (Valid sequence)
+        let msg1 = manager::ChatMessageRecord {
+            session_id: session_id.clone(),
+            message_index: 1,
+            role: "assistant".to_string(),
+            content: "Message 1".to_string(),
+        };
+        let res1 = append_chat_message(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(msg1.clone()),
+        )
+        .await;
+        assert_eq!(res1, Ok(StatusCode::OK));
+
+        // 4. Retry appending message 1 (Valid Overwrite/Upsert)
+        let res1_retry = append_chat_message(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(msg1),
+        )
+        .await;
+        assert_eq!(res1_retry, Ok(StatusCode::OK));
     }
 }

@@ -268,6 +268,28 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         await expect(page.locator('.ai-message').last()).toContainText('Persistent message');
     });
 
+    test('Chat UI restores last session from localStorage even if not in initial API results', async ({ page }) => {
+        // Inject the last chat ID into localStorage before the page scripts run
+        await page.addInitScript(() => {
+            window.localStorage.setItem('mini_inference_last_chat_id', 'off-page-session');
+        });
+
+        // Mock the specific fetch for the off-page session that the UI will request
+        await page.route('**/api/chat/sessions/off-page-session*', route => {
+            route.fulfill({
+                status: 200,
+                json: { id: 'off-page-session', title: 'Off Page Chat Session', updated_at: 1678886600, email: 'mock@example.com', messages: [{ role: 'assistant', content: 'Message from the off-page session' }] }
+            });
+        });
+
+        await page.goto('/');
+
+        // Wait for the UI to resolve and verify the off-page session messages loaded directly
+        // Because it was not in the initial page of results, the active session will not be highlighted in the sidebar, 
+        // but the messages will be correctly loaded into the chat container.
+        await expect(page.locator('.ai-message').last()).toContainText('Message from the off-page session');
+    });
+
     test('Chat UI can rename a session', async ({ page }) => {
         let fetchCount = 0;
         const handleSessionRenameRoute = async route => {

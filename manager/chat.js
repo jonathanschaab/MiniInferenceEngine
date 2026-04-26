@@ -260,10 +260,12 @@ async function fetchMoreSessions(isInitialLoad = false) {
         
         if (isInitialLoad && !currentSessionId) {
             const lastId = localStorage.getItem('mini_inference_last_chat_id');
-            if (lastId && sessions.some(s => s.id === lastId)) {
-                await loadSession(lastId, true);
-            } else if (lastId) {
-                localStorage.removeItem('mini_inference_last_chat_id');
+            if (lastId) {
+                const success = await loadSession(lastId, true);
+                if (!success) {
+                    localStorage.removeItem('mini_inference_last_chat_id');
+                    startNewSession();
+                }
             }
         }
 
@@ -381,20 +383,22 @@ async function loadSession(id, skipSessionListUpdate = false) {
     chatContainer.innerHTML = '';
     regenBtn.style.display = 'none';
     
-    await fetchMoreMessages(id, true);
+    const success = await fetchMoreMessages(id, true);
     
-    if (!skipSessionListUpdate) {
+    if (success && !skipSessionListUpdate) {
         updateActiveSessionClass();
     }
+    return success;
 }
 
 async function fetchMoreMessages(id, isInitialLoad = false) {
-    if (isLoadingMessages || !hasMoreMessages) return;
+    if (isLoadingMessages || !hasMoreMessages) return false;
     isLoadingMessages = true;
     
     try {
         const offset = chatHistory.length;
         const res = await fetchWithAuth(`/api/chat/sessions/${id}?limit=${MESSAGE_LIMIT}&offset=${offset}`);
+        if (!res.ok) throw new Error("Failed to fetch session messages");
         const session = await res.json();
         
         if (isInitialLoad) {
@@ -411,7 +415,7 @@ async function fetchMoreMessages(id, isInitialLoad = false) {
         
         const oldScrollHeight = chatContainer.scrollHeight;
         
-        renderChatHistory();
+        prependMessagesToUI(fetchedMessages);
         
         if (isInitialLoad) {
             requestAnimationFrame(() => {
@@ -425,35 +429,45 @@ async function fetchMoreMessages(id, isInitialLoad = false) {
         }
         
         if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
+        return true;
         
     } catch(e) { 
         console.error("Failed to fetch messages:", e); 
+        hasMoreMessages = false;
+        return false;
     } finally {
         isLoadingMessages = false;
     }
 }
 
-function renderChatHistory() {
+function prependMessagesToUI(messages) {
     chatScrollObserver.disconnect();
-    chatContainer.innerHTML = '';
+    
+    const existingSentinel = document.getElementById('chat-sentinel');
+    if (existingSentinel) existingSentinel.remove();
+    
+    const fragment = document.createDocumentFragment();
     
     if (hasMoreMessages) {
         const sentinel = document.createElement('div');
+        sentinel.id = 'chat-sentinel';
         sentinel.style.padding = '10px';
         sentinel.style.textAlign = 'center';
         sentinel.style.color = '#6c7086';
         sentinel.style.fontSize = '0.9rem';
         sentinel.textContent = 'Loading older messages...';
-        chatContainer.appendChild(sentinel);
+        fragment.appendChild(sentinel);
         chatScrollObserver.observe(sentinel);
     }
     
-    chatHistory.forEach(msg => {
+    messages.forEach(msg => {
         const div = document.createElement('div');
         div.className = `message ${msg.role === 'user' ? 'user-message' : 'ai-message'}`;
         div.textContent = msg.content;
-        chatContainer.appendChild(div);
+        fragment.appendChild(div);
     });
+    
+    chatContainer.prepend(fragment);
 }
 
 window.startNewSession = function() {
