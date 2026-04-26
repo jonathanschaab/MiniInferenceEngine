@@ -286,60 +286,7 @@ function renderSessionList(sessions) {
     if (existingSentinel) existingSentinel.remove();
 
         sessions.forEach(s => {
-            const div = document.createElement('div');
-            div.className = `session-item ${s.id === currentSessionId ? 'active' : ''}`;
-            div.dataset.id = s.id;
-            div.onclick = () => loadSession(s.id);
-            
-            const infoDiv = document.createElement('div');
-            infoDiv.className = 'session-info';
-
-            const title = document.createElement('div');
-            title.className = 'session-title';
-            title.textContent = s.title || "Untitled Chat";
-            
-            const dateStr = s.updated_at ? new Date(s.updated_at * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '';
-            const dateDiv = document.createElement('div');
-            dateDiv.className = 'session-date';
-            dateDiv.textContent = dateStr;
-
-            infoDiv.appendChild(title);
-            infoDiv.appendChild(dateDiv);
-
-            const actionsDiv = document.createElement('div');
-            actionsDiv.style.whiteSpace = 'nowrap';
-
-            const editBtn = document.createElement('button');
-            editBtn.className = 'session-action-btn';
-            editBtn.textContent = '✎';
-            editBtn.title = "Rename Chat";
-            editBtn.onclick = async (e) => {
-                e.stopPropagation();
-                const newTitle = await showRenameModal(s.title);
-                if (newTitle && newTitle.trim() !== "" && newTitle !== s.title) {
-                    await renameSession(s.id, newTitle.trim());
-                }
-            };
-
-            const delBtn = document.createElement('button');
-            delBtn.className = 'session-action-btn delete-btn';
-            delBtn.textContent = '×';
-            delBtn.title = "Delete Chat";
-            delBtn.onclick = async (e) => {
-                e.stopPropagation();
-                const confirmed = await showDeleteModal();
-                if (confirmed) {
-                    await fetchWithAuth(`/api/chat/sessions/${s.id}`, { method: 'DELETE' });
-                    if (currentSessionId === s.id) startNewSession();
-                    loadSessions();
-                }
-            };
-
-            actionsDiv.appendChild(editBtn);
-            actionsDiv.appendChild(delBtn);
-            div.appendChild(infoDiv);
-            div.appendChild(actionsDiv);
-            list.appendChild(div);
+            list.appendChild(createSessionElement(s));
         });
 
     if (hasMoreSessions) {
@@ -353,6 +300,63 @@ function renderSessionList(sessions) {
         list.appendChild(sentinel);
         sessionScrollObserver.observe(sentinel);
     }
+}
+
+function createSessionElement(s) {
+    const div = document.createElement('div');
+    div.className = `session-item ${s.id === currentSessionId ? 'active' : ''}`;
+    div.dataset.id = s.id;
+    div.onclick = () => loadSession(s.id);
+    
+    const infoDiv = document.createElement('div');
+    infoDiv.className = 'session-info';
+
+    const title = document.createElement('div');
+    title.className = 'session-title';
+    title.textContent = s.title || "Untitled Chat";
+    
+    const dateStr = s.updated_at ? new Date(s.updated_at * 1000).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : '';
+    const dateDiv = document.createElement('div');
+    dateDiv.className = 'session-date';
+    dateDiv.textContent = dateStr;
+
+    infoDiv.appendChild(title);
+    infoDiv.appendChild(dateDiv);
+
+    const actionsDiv = document.createElement('div');
+    actionsDiv.style.whiteSpace = 'nowrap';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'session-action-btn';
+    editBtn.textContent = '✎';
+    editBtn.title = "Rename Chat";
+    editBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const newTitle = await showRenameModal(s.title);
+        if (newTitle && newTitle.trim() !== "" && newTitle !== s.title) {
+            await renameSession(s.id, newTitle.trim());
+        }
+    };
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'session-action-btn delete-btn';
+    delBtn.textContent = '×';
+    delBtn.title = "Delete Chat";
+    delBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const confirmed = await showDeleteModal();
+        if (confirmed) {
+            await fetchWithAuth(`/api/chat/sessions/${s.id}`, { method: 'DELETE' });
+            if (currentSessionId === s.id) startNewSession();
+            loadSessions();
+        }
+    };
+
+    actionsDiv.appendChild(editBtn);
+    actionsDiv.appendChild(delBtn);
+    div.appendChild(infoDiv);
+    div.appendChild(actionsDiv);
+    return div;
 }
 
 async function renameSession(id, newTitle) {
@@ -369,7 +373,11 @@ async function renameSession(id, newTitle) {
             if (id === currentSessionId) {
                 currentSessionTitle = newTitle;
             }
-            loadSessions();
+            const sessionEl = document.querySelector(`.session-item[data-id="${id}"]`);
+            if (sessionEl) {
+                const titleDiv = sessionEl.querySelector('.session-title');
+                if (titleDiv) titleDiv.textContent = newTitle;
+            }
         } else {
             console.error("Failed to rename session");
         }
@@ -525,7 +533,8 @@ async function ensureSession(firstMessageText) {
         const saved = await res.json();
         currentSessionId = saved.id;
         localStorage.setItem('mini_inference_last_chat_id', currentSessionId);
-        loadSessions();
+        const newSessionEl = createSessionElement(saved);
+        document.getElementById('session-list').prepend(newSessionEl);
     } catch(e) { console.error("Failed to create session", e); }
 }
 
@@ -584,6 +593,10 @@ async function sendMessage() {
     typingIndicator.style.display = 'block';
     
     currentAbortController = new AbortController();
+
+    const generatingSessionId = currentSessionId;
+    const generatingSessionEl = document.querySelector(`.session-item[data-id="${generatingSessionId}"]`);
+    if (generatingSessionEl) generatingSessionEl.classList.add('generating');
 
     let aiMessageDiv = document.createElement('div');
     aiMessageDiv.className = 'message ai-message';
@@ -654,7 +667,16 @@ async function sendMessage() {
     inputField.focus();
     currentAbortController = null;
     
-    loadSessions(); // Updates the updated_at timestamp in sidebar
+    // Move the active session to the top of the list and update its timestamp
+    const generatingSessionElAfter = document.querySelector(`.session-item[data-id="${generatingSessionId}"]`);
+    if (generatingSessionElAfter) {
+        document.getElementById('session-list').prepend(generatingSessionElAfter);
+        const dateDiv = generatingSessionElAfter.querySelector('.session-date');
+        if (dateDiv) {
+            dateDiv.textContent = new Date().toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
+        }
+        generatingSessionElAfter.classList.remove('generating');
+    }
 }
 
 async function regenerateLast() {

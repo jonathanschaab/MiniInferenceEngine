@@ -18,6 +18,13 @@
         .session-item { padding: 12px 15px; border-bottom: 1px solid #313244; cursor: pointer; color: #a6adc8; display: flex; justify-content: space-between; align-items: center; font-size: 0.95rem; }
         .session-item:hover { background: #1e1e2e; color: #cdd6f4; }
         .session-item.active { background: #313244; color: #cdd6f4; font-weight: bold; }
+        
+        @keyframes session-pulse {
+            0% { box-shadow: inset 4px 0 0 0 transparent; background: #313244; }
+            50% { box-shadow: inset 4px 0 0 0 #a6e3a1; background: #45475a; }
+            100% { box-shadow: inset 4px 0 0 0 transparent; background: #313244; }
+        }
+        .session-item.generating { animation: session-pulse 1.5s infinite; }
         .session-info { overflow: hidden; display: flex; flex-direction: column; flex: 1; }
         .session-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .session-date { font-size: 0.75rem; color: #6c7086; margin-top: 2px; font-weight: normal; }
