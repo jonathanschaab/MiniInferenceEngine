@@ -865,18 +865,31 @@ pub(crate) async fn set_console_loglevel(
 
 pub(crate) async fn list_chat_sessions(
     user: auth::CurrentUser,
+    axum::extract::Query(query): axum::extract::Query<MessageQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<manager::ChatSessionSummary>>, StatusCode> {
-    let mut response = state.db.query("SELECT type::string(meta::id(id)) AS id, updated_at, title FROM chat_sessions WHERE email = $email ORDER BY updated_at DESC")
+    let limit = query.limit.unwrap_or(20);
+    let offset = query.offset.unwrap_or(0);
+
+    let mut response = state.db.query("SELECT type::string(meta::id(id)) AS id, updated_at, title FROM chat_sessions WHERE email = $email ORDER BY updated_at DESC LIMIT $limit START $offset")
         .bind(("email", user.email.clone()))
+        .bind(("limit", limit))
+        .bind(("offset", offset))
         .await.map_err(|e| { error!("DB List Error: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
     let sessions: Vec<manager::ChatSessionSummary> = response.take(0).unwrap_or_default();
     Ok(Json(sessions))
 }
 
+#[derive(Deserialize)]
+pub struct MessageQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
 pub(crate) async fn get_chat_session(
     user: auth::CurrentUser,
     Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MessageQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<manager::ChatSession>, StatusCode> {
     let mut response = state
@@ -896,17 +909,24 @@ pub(crate) async fn get_chat_session(
 
     match session_record {
         Some(s) if s.email == user.email => {
+            let limit = query.limit.unwrap_or(50);
+            let offset = query.offset.unwrap_or(0);
+
             let mut response = state
                 .db
-                .query("SELECT role, content, message_index FROM chat_messages WHERE session_id = $session_id ORDER BY message_index ASC")
+                // Order DESC to get the latest messages first, then we'll reverse them
+                .query("SELECT role, content, message_index FROM chat_messages WHERE session_id = $session_id ORDER BY message_index DESC LIMIT $limit START $offset")
                 .bind(("session_id", id.clone()))
+                .bind(("limit", limit))
+                .bind(("offset", offset))
                 .await
                 .map_err(|e| {
                     error!("DB Query Error: {}", e);
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            let db_messages: Vec<manager::Message> = response.take(0).unwrap_or_default();
+            let mut db_messages: Vec<manager::Message> = response.take(0).unwrap_or_default();
+            db_messages.reverse(); // Reverse back to chronological order
 
             Ok(Json(manager::ChatSession {
                 id: s.id,
@@ -1349,8 +1369,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize global pooled clients once!
     let reqwest_client = reqwest::Client::new();
-    let oauth_client =
-        auth::build_oauth_client(&config.oauth_redirect_uri, &config.oauth_client_secret_path)?;
+    let oauth_client = auth::build_oauth_client(
+        &config.oauth_redirect_uri,
+        &config.oauth_client_secret_path,
+        &config.oauth_auth_url,
+        &config.oauth_token_url,
+    )?;
 
     // Eagerly initialize the model registry in the background
     tokio::spawn(async {
@@ -1628,17 +1652,32 @@ mod tests {
         let session_id = new_session.id.clone();
 
         // 2. List sessions for the user
-        let sessions = list_chat_sessions(user.clone(), State(state.clone()))
-            .await
-            .unwrap()
-            .0;
+        let sessions = list_chat_sessions(
+            user.clone(),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session_id);
         assert_eq!(sessions[0].title, "First Session");
 
         // 3. Get the session details (including messages, initially empty)
-        let session_detail_res =
-            get_chat_session(user.clone(), Path(session_id.clone()), State(state.clone())).await;
+        let session_detail_res = get_chat_session(
+            user.clone(),
+            Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await;
         assert!(
             session_detail_res.is_ok(),
             "Failed to get session details: {:?}",
@@ -1681,11 +1720,18 @@ mod tests {
         assert_eq!(append_res_2, Ok(StatusCode::OK));
 
         // 6. Get session again and verify messages
-        let session_detail_with_msgs =
-            get_chat_session(user.clone(), Path(session_id.clone()), State(state.clone()))
-                .await
-                .unwrap()
-                .0;
+        let session_detail_with_msgs = get_chat_session(
+            user.clone(),
+            Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(session_detail_with_msgs.messages.len(), 2);
         assert_eq!(session_detail_with_msgs.messages[0].content, "Hello AI");
         assert_eq!(session_detail_with_msgs.messages[1].content, "Hello human");
@@ -1700,11 +1746,18 @@ mod tests {
         assert_eq!(truncate_res, Ok(StatusCode::OK));
 
         // 8. Verify truncation
-        let session_after_truncate =
-            get_chat_session(user.clone(), Path(session_id.clone()), State(state.clone()))
-                .await
-                .unwrap()
-                .0;
+        let session_after_truncate = get_chat_session(
+            user.clone(),
+            Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(session_after_truncate.messages.len(), 1);
         assert_eq!(session_after_truncate.messages[0].content, "Hello AI");
 
@@ -1713,6 +1766,10 @@ mod tests {
         let other_user_session_get_res = get_chat_session(
             other_user.clone(),
             Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
             State(state.clone()),
         )
         .await;
@@ -1785,10 +1842,17 @@ mod tests {
         );
 
         // 3. Verify the listing reflects the new title and didn't duplicate the database record
-        let sessions = list_chat_sessions(user.clone(), State(state.clone()))
-            .await
-            .unwrap()
-            .0;
+        let sessions = list_chat_sessions(
+            user.clone(),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(sessions.len(), 1, "There should still only be one session.");
         assert_eq!(sessions[0].id, session_id);
         assert_eq!(sessions[0].title, "Renamed Title");

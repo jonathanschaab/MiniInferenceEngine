@@ -9,6 +9,33 @@ let chatHistory = [];
 let currentAbortController = null;
 let currentSessionId = "";
 let currentSessionTitle = "";
+const MESSAGE_LIMIT = 50;
+let hasMoreMessages = false;
+let isLoadingMessages = false;
+const SESSION_LIMIT = 20;
+let sessionOffset = 0;
+let hasMoreSessions = false;
+let isLoadingSessions = false;
+
+const chatScrollObserver = new IntersectionObserver((entries) => {
+    if (entries[0].isIntersecting && hasMoreMessages && !isLoadingMessages && currentSessionId) {
+        fetchMoreMessages(currentSessionId, false);
+    }
+}, {
+    root: chatContainer,
+    rootMargin: '150px', // Trigger the fetch slightly before the user hits the very top
+    threshold: 0
+});
+
+const sessionScrollObserver = new IntersectionObserver((entries) => {
+    if (entries[0].isIntersecting && hasMoreSessions && !isLoadingSessions) {
+        fetchMoreSessions(false);
+    }
+}, {
+    root: document.getElementById('session-list'),
+    rootMargin: '100px',
+    threshold: 0
+});
 
 window.onload = initializeUI;
 
@@ -207,25 +234,59 @@ function updateDropdownCompatibility() {
 }
 
 async function loadSessions() {
+    sessionOffset = 0;
+    hasMoreSessions = true;
+    document.getElementById('session-list').innerHTML = '';
+    await fetchMoreSessions(true);
+}
+
+function updateActiveSessionClass() {
+    document.querySelectorAll('.session-item').forEach(el => {
+        if (el.dataset.id === currentSessionId) {
+            el.classList.add('active');
+        } else {
+            el.classList.remove('active');
+        }
+    });
+}
+
+async function fetchMoreSessions(isInitialLoad = false) {
+    if (isLoadingSessions || !hasMoreSessions) return;
+    isLoadingSessions = true;
+
     try {
-        const res = await fetchWithAuth('/api/chat/sessions');
+        const res = await fetchWithAuth(`/api/chat/sessions?limit=${SESSION_LIMIT}&offset=${sessionOffset}`);
         const sessions = await res.json();
         
-        if (!currentSessionId) {
+        if (isInitialLoad && !currentSessionId) {
             const lastId = localStorage.getItem('mini_inference_last_chat_id');
             if (lastId && sessions.some(s => s.id === lastId)) {
-                await loadSession(lastId);
-                return; 
+                await loadSession(lastId, true);
             } else if (lastId) {
                 localStorage.removeItem('mini_inference_last_chat_id');
             }
         }
 
-        const list = document.getElementById('session-list');
-        list.innerHTML = '';
+        hasMoreSessions = sessions.length === SESSION_LIMIT;
+        sessionOffset += sessions.length;
+
+        renderSessionList(sessions);
+    } catch(e) { console.error("Failed to load sessions:", e); } finally {
+        isLoadingSessions = false;
+    }
+}
+
+function renderSessionList(sessions) {
+    sessionScrollObserver.disconnect();
+    const list = document.getElementById('session-list');
+    
+    const existingSentinel = document.getElementById('session-sentinel');
+    if (existingSentinel) existingSentinel.remove();
+
         sessions.forEach(s => {
             const div = document.createElement('div');
             div.className = `session-item ${s.id === currentSessionId ? 'active' : ''}`;
+            div.dataset.id = s.id;
             div.onclick = () => loadSession(s.id);
             
             const infoDiv = document.createElement('div');
@@ -268,7 +329,7 @@ async function loadSessions() {
                 if (confirmed) {
                     await fetchWithAuth(`/api/chat/sessions/${s.id}`, { method: 'DELETE' });
                     if (currentSessionId === s.id) startNewSession();
-                    else loadSessions();
+                    loadSessions();
                 }
             };
 
@@ -278,7 +339,18 @@ async function loadSessions() {
             div.appendChild(actionsDiv);
             list.appendChild(div);
         });
-    } catch(e) { console.error("Failed to load sessions:", e); }
+
+    if (hasMoreSessions) {
+        const sentinel = document.createElement('div');
+        sentinel.id = 'session-sentinel';
+        sentinel.style.padding = '10px';
+        sentinel.style.textAlign = 'center';
+        sentinel.style.color = '#6c7086';
+        sentinel.style.fontSize = '0.85rem';
+        sentinel.textContent = 'Loading more...';
+        list.appendChild(sentinel);
+        sessionScrollObserver.observe(sentinel);
+    }
 }
 
 async function renameSession(id, newTitle) {
@@ -302,41 +374,98 @@ async function renameSession(id, newTitle) {
     } catch(e) { console.error("Error renaming session:", e); }
 }
 
-async function loadSession(id) {
+async function loadSession(id, skipSessionListUpdate = false) {
+    chatScrollObserver.disconnect();
+    chatHistory = [];
+    hasMoreMessages = true;
+    chatContainer.innerHTML = '';
+    regenBtn.style.display = 'none';
+    
+    await fetchMoreMessages(id, true);
+    
+    if (!skipSessionListUpdate) {
+        updateActiveSessionClass();
+    }
+}
+
+async function fetchMoreMessages(id, isInitialLoad = false) {
+    if (isLoadingMessages || !hasMoreMessages) return;
+    isLoadingMessages = true;
+    
     try {
-        const res = await fetchWithAuth(`/api/chat/sessions/${id}`);
+        const offset = chatHistory.length;
+        const res = await fetchWithAuth(`/api/chat/sessions/${id}?limit=${MESSAGE_LIMIT}&offset=${offset}`);
         const session = await res.json();
-        currentSessionId = session.id;
-        currentSessionTitle = session.title;
-        localStorage.setItem('mini_inference_last_chat_id', currentSessionId);
-        chatHistory = session.messages || [];
         
-        chatContainer.innerHTML = '';
-        regenBtn.style.display = 'none';
+        if (isInitialLoad) {
+            currentSessionId = session.id;
+            currentSessionTitle = session.title;
+            localStorage.setItem('mini_inference_last_chat_id', currentSessionId);
+        }
         
-        chatHistory.forEach(msg => {
-            appendMessage(msg.content, msg.role === 'user');
-        });
+        const fetchedMessages = session.messages || [];
+        hasMoreMessages = fetchedMessages.length === MESSAGE_LIMIT;
         
-        // Ensure we scroll to the bottom after the browser renders the messages
-        requestAnimationFrame(() => {
-            chatContainer.scrollTop = chatContainer.scrollHeight;
-        });
+        // Prepend older messages
+        chatHistory = [...fetchedMessages, ...chatHistory];
+        
+        const oldScrollHeight = chatContainer.scrollHeight;
+        
+        renderChatHistory();
+        
+        if (isInitialLoad) {
+            requestAnimationFrame(() => {
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            });
+        } else {
+            // Maintain smooth scrolling point when older messages are injected
+            requestAnimationFrame(() => {
+                chatContainer.scrollTop = chatContainer.scrollHeight - oldScrollHeight;
+            });
+        }
         
         if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
         
-        loadSessions(); // update active class
-    } catch(e) { console.error("Failed to load session:", e); }
+    } catch(e) { 
+        console.error("Failed to fetch messages:", e); 
+    } finally {
+        isLoadingMessages = false;
+    }
+}
+
+function renderChatHistory() {
+    chatScrollObserver.disconnect();
+    chatContainer.innerHTML = '';
+    
+    if (hasMoreMessages) {
+        const sentinel = document.createElement('div');
+        sentinel.style.padding = '10px';
+        sentinel.style.textAlign = 'center';
+        sentinel.style.color = '#6c7086';
+        sentinel.style.fontSize = '0.9rem';
+        sentinel.textContent = 'Loading older messages...';
+        chatContainer.appendChild(sentinel);
+        chatScrollObserver.observe(sentinel);
+    }
+    
+    chatHistory.forEach(msg => {
+        const div = document.createElement('div');
+        div.className = `message ${msg.role === 'user' ? 'user-message' : 'ai-message'}`;
+        div.textContent = msg.content;
+        chatContainer.appendChild(div);
+    });
 }
 
 window.startNewSession = function() {
+    chatScrollObserver.disconnect();
     currentSessionId = "";
     currentSessionTitle = "";
     localStorage.removeItem('mini_inference_last_chat_id');
     chatHistory = [];
+    hasMoreMessages = false;
     chatContainer.innerHTML = '<div class="message ai-message">System: New chat session started. How can I help you?</div>';
     regenBtn.style.display = 'none';
-    loadSessions();
+    updateActiveSessionClass();
 }
 
 inputField.addEventListener('input', function() {
@@ -356,6 +485,7 @@ window.clearChat = async function() {
             await fetchWithAuth(`/api/chat/sessions/${currentSessionId}`, { method: 'DELETE' });
         }
         startNewSession();
+        loadSessions();
     }
 }
 

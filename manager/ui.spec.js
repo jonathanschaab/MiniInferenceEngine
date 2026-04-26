@@ -77,7 +77,7 @@ async function mockEngineApis(page) {
         });
     });
 
-    await page.route('**/api/chat/sessions', route => {
+    const handleSessionsRoute = route => {
         if (route.request().method() === 'GET') {
             route.fulfill({
                 status: 200,
@@ -96,7 +96,9 @@ async function mockEngineApis(page) {
                 email: 'mock@example.com', messages: []
             } });
         }
-    });
+    };
+    await page.route('**/api/chat/sessions', handleSessionsRoute);
+    await page.route('**/api/chat/sessions?*', handleSessionsRoute);
 
     await page.route('**/api/chat/sessions/*/messages*', route => {
         route.fulfill({ status: 200 });
@@ -207,13 +209,13 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
 
     test('Chat UI loads existing sessions and allows switching', async ({ page }) => {
         // Mock responses for loading specific sessions
-        await page.route('**/api/chat/sessions/session-1', route => {
+        await page.route('**/api/chat/sessions/session-1*', route => {
             route.fulfill({
                 status: 200,
                 json: { id: 'session-1', title: 'First Chat Session', updated_at: 1678886400, email: 'mock@example.com', messages: [{ role: 'user', content: 'Hi session 1' }, { role: 'assistant', content: 'Hello from session 1' }] }
             });
         });
-        await page.route('**/api/chat/sessions/session-2', route => {
+        await page.route('**/api/chat/sessions/session-2*', route => {
             route.fulfill({
                 status: 200,
                 json: { id: 'session-2', title: 'Second Chat Session', updated_at: 1678886500, email: 'mock@example.com', messages: [{ role: 'user', content: 'Hi session 2' }, { role: 'assistant', content: 'Hello from session 2' }] }
@@ -231,7 +233,7 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
     });
 
     test('Chat UI remembers active session across reloads and navigation', async ({ page }) => {
-        await page.route('**/api/chat/sessions/session-2', route => {
+        await page.route('**/api/chat/sessions/session-2*', route => {
             route.fulfill({
                 status: 200,
                 json: { id: 'session-2', title: 'Second Chat Session', updated_at: 1678886500, email: 'mock@example.com', messages: [{ role: 'assistant', content: 'Persistent message' }] }
@@ -268,7 +270,7 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
 
     test('Chat UI can rename a session', async ({ page }) => {
         let fetchCount = 0;
-        await page.route('**/api/chat/sessions', async route => {
+        const handleSessionRenameRoute = async route => {
             if (route.request().method() === 'GET') {
                 const title = fetchCount === 0 ? 'First Chat Session' : 'Renamed Chat Session';
                 fetchCount++;
@@ -278,7 +280,9 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             } else {
                 await route.fallback();
             }
-        });
+        };
+        await page.route('**/api/chat/sessions', handleSessionRenameRoute);
+        await page.route('**/api/chat/sessions?*', handleSessionRenameRoute);
 
         await page.goto('/');
         const sessionItem = page.locator('.session-item').first();
@@ -299,7 +303,7 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         let deleteCalled = false;
         
         // Override the default mock to provide a specific sequence for deletion
-        await page.route('**/api/chat/sessions', async route => {
+        const handleSessionDeleteRoute = async route => {
             if (route.request().method() === 'GET') {
                 if (fetchCount === 0) {
                     fetchCount++;
@@ -310,9 +314,11 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             } else {
                 await route.fallback();
             }
-        });
+        };
+        await page.route('**/api/chat/sessions', handleSessionDeleteRoute);
+        await page.route('**/api/chat/sessions?*', handleSessionDeleteRoute);
 
-        await page.route('**/api/chat/sessions/session-to-delete', async route => {
+        await page.route('**/api/chat/sessions/session-to-delete*', async route => {
             if (route.request().method() === 'DELETE') {
                 deleteCalled = true;
                 await route.fulfill({ status: 200 });
@@ -347,14 +353,14 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             content: `Message number ${i}\nThis is a bit longer to take up vertical space.\nLine 3.`
         }));
 
-        await page.route('**/api/chat/sessions/session-long', route => {
+        await page.route('**/api/chat/sessions/session-long*', route => {
             route.fulfill({
                 status: 200,
                 json: { id: 'session-long', title: 'Long Chat Session', updated_at: 1678886600, email: 'mock@example.com', messages: longMessages }
             });
         });
 
-        await page.route('**/api/chat/sessions', route => {
+        const handleLongSessionRoute = route => {
             if (route.request().method() === 'GET') {
                 route.fulfill({
                     status: 200,
@@ -365,7 +371,9 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             } else {
                 route.fallback();
             }
-        });
+        };
+        await page.route('**/api/chat/sessions', handleLongSessionRoute);
+        await page.route('**/api/chat/sessions?*', handleLongSessionRoute);
 
         await page.goto('/');
 

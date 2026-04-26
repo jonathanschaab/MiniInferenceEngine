@@ -192,13 +192,17 @@ pub fn build_oauth_client(
     Ok(BasicClient::new(
         ClientId::new(client_id),
         Some(ClientSecret::new(client_secret)),
-        AuthUrl::new(auth_url.to_string())
-            .map_err(|e| format!("Invalid Auth URL: {}", e))?,
-        Some(TokenUrl::new(token_url.to_string())
-            .map_err(|e| format!("Invalid Token URL: {}", e))?),
+        AuthUrl::new(auth_url.to_string()).map_err(|e| format!("Invalid Auth URL: {}", e))?,
+        Some(
+            TokenUrl::new(token_url.to_string())
+                .map_err(|e| format!("Invalid Token URL: {}", e))?,
+        ),
     )
     // Make sure this matches your Nginx setup exactly! (e.g., https://ai.lan/auth/google/callback)
-    .set_redirect_uri(RedirectUrl::new(redirect_uri.to_string()).map_err(|e| format!("Invalid OAuth redirect URI: {}", e))?))
+    .set_redirect_uri(
+        RedirectUrl::new(redirect_uri.to_string())
+            .map_err(|e| format!("Invalid OAuth redirect URI: {}", e))?,
+    ))
 }
 
 // --- LOGIN ROUTES ---
