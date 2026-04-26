@@ -154,7 +154,12 @@ struct GoogleClientSecretWeb {
 
 // --- OAUTH2 CLIENT SETUP ---
 
-pub fn build_oauth_client(redirect_uri: &str, secret_path: &str) -> Result<BasicClient, String> {
+pub fn build_oauth_client(
+    redirect_uri: &str,
+    secret_path: &str,
+    auth_url: &str,
+    token_url: &str,
+) -> Result<BasicClient, String> {
     // 1. Read the JSON file from the disk
     let file_content = match fs::read_to_string(secret_path) {
         Ok(c) => c,
@@ -187,11 +192,13 @@ pub fn build_oauth_client(redirect_uri: &str, secret_path: &str) -> Result<Basic
     Ok(BasicClient::new(
         ClientId::new(client_id),
         Some(ClientSecret::new(client_secret)),
-        AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string()).unwrap(),
-        Some(TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).unwrap()),
+        AuthUrl::new(auth_url.to_string())
+            .map_err(|e| format!("Invalid Auth URL: {}", e))?,
+        Some(TokenUrl::new(token_url.to_string())
+            .map_err(|e| format!("Invalid Token URL: {}", e))?),
     )
     // Make sure this matches your Nginx setup exactly! (e.g., https://ai.lan/auth/google/callback)
-    .set_redirect_uri(RedirectUrl::new(redirect_uri.to_string()).unwrap()))
+    .set_redirect_uri(RedirectUrl::new(redirect_uri.to_string()).map_err(|e| format!("Invalid OAuth redirect URI: {}", e))?))
 }
 
 // --- LOGIN ROUTES ---
@@ -221,7 +228,7 @@ pub struct AuthRequest {
 }
 
 #[derive(Deserialize)]
-pub struct GoogleUser {
+pub struct OidcUser {
     email: String,
 }
 
@@ -235,7 +242,7 @@ pub async fn callback_handler(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    if saved_state.is_none() || saved_state.unwrap() != query.state {
+    if saved_state != Some(query.state) {
         return Err(StatusCode::BAD_REQUEST); // CSRF Attack Detected!
     }
 
@@ -250,12 +257,12 @@ pub async fn callback_handler(
     // Use the pooled Reqwest client from AppState
     let user_data = state
         .reqwest_client
-        .get("https://www.googleapis.com/oauth2/v2/userinfo")
+        .get(&state.config.oauth_userinfo_url)
         .bearer_auth(token.access_token().secret())
         .send()
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?
-        .json::<GoogleUser>()
+        .json::<OidcUser>()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

@@ -54,6 +54,12 @@ pub struct AppConfig {
     pub oauth_redirect_uri: String,
     #[serde(default = "default_oauth_client_secret_path")]
     pub oauth_client_secret_path: String,
+    #[serde(default = "default_oauth_auth_url")]
+    pub oauth_auth_url: String,
+    #[serde(default = "default_oauth_token_url")]
+    pub oauth_token_url: String,
+    #[serde(default = "default_oauth_userinfo_url")]
+    pub oauth_userinfo_url: String,
     pub admin_emails: Vec<String>,
     pub user_emails: Vec<String>,
     pub secure_cookies: bool,
@@ -88,6 +94,15 @@ fn default_log_file_name() -> String {
 fn default_oauth_client_secret_path() -> String {
     "client_secret.apps.googleusercontent.com.json".to_string()
 }
+fn default_oauth_auth_url() -> String {
+    "https://accounts.google.com/o/oauth2/v2/auth".to_string()
+}
+fn default_oauth_token_url() -> String {
+    "https://oauth2.googleapis.com/token".to_string()
+}
+fn default_oauth_userinfo_url() -> String {
+    "https://www.googleapis.com/oauth2/v2/userinfo".to_string()
+}
 fn default_telemetry_retention_days() -> u64 {
     30
 }
@@ -98,6 +113,9 @@ impl Default for AppConfig {
             bind_address: "127.0.0.1:3000".to_string(), // Secure local default
             oauth_redirect_uri: "http://localhost:3000/auth/google/callback".to_string(),
             oauth_client_secret_path: default_oauth_client_secret_path(),
+            oauth_auth_url: default_oauth_auth_url(),
+            oauth_token_url: default_oauth_token_url(),
+            oauth_userinfo_url: default_oauth_userinfo_url(),
             admin_emails: vec![],
             user_emails: vec![],
             secure_cookies: true,
@@ -1557,6 +1575,8 @@ mod tests {
             oauth_client: auth::build_oauth_client(
                 "http://localhost:3000/auth/google/callback",
                 "client_secret.apps.googleusercontent.com.json",
+                "https://accounts.google.com/o/oauth2/v2/auth",
+                "https://oauth2.googleapis.com/token",
             )
             .unwrap(), // Dummy client
             config: Arc::new(AppConfig::default()),
