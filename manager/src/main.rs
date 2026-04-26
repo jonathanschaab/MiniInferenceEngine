@@ -1,13 +1,12 @@
 use auth::{AuthStore, require_session};
 use axum::{
-    Json, Router,
+    Json,
     body::Body,
     body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     http::header,
     response::{Html, IntoResponse, Redirect},
-    routing::{delete, get, post},
 };
 use hf_hub::api::sync::Api;
 use oauth2::basic::BasicClient;
@@ -21,7 +20,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_sessions::SessionManagerLayer;
 use tower_sessions_surrealdb_store::SurrealSessionStore;
 use tracing::{error, info, warn}; // Ensure this is imported for AppState
-use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::EnvFilter;
 
 use manager::{
     ApiRequest, BenchmarkRequest, EngineStatus, Message, ModelArch, ModelConfig, ModelRole,
@@ -125,6 +124,7 @@ impl AppConfig {
 }
 
 pub mod auth;
+pub mod setup;
 
 // --- SHARED MEMORY LOG WRITER ---
 #[derive(Clone)]
@@ -188,7 +188,9 @@ pub struct AppState {
     pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
 }
 
-async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+pub(crate) async fn serve_ui(
+    session: tower_sessions::Session,
+) -> Result<Html<&'static str>, Redirect> {
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
@@ -196,12 +198,12 @@ async fn serve_ui(session: tower_sessions::Session) -> Result<Html<&'static str>
 }
 
 // Send the model roster to the Javascript dropdowns
-async fn get_models() -> Json<Vec<ModelConfig>> {
+pub(crate) async fn get_models() -> Json<Vec<ModelConfig>> {
     Json(get_model_registry().await)
 }
 
 // Handle incoming chat requests
-async fn handle_generate(
+pub(crate) async fn handle_generate(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ApiRequest>,
 ) -> impl IntoResponse {
@@ -236,13 +238,13 @@ async fn handle_generate(
         .unwrap()
 }
 
-async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
+pub(crate) async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
     let current_status = lock_status(&state.engine_status).clone();
     Json(current_status)
 }
 
 // The Automated Benchmark Trigger
-async fn trigger_benchmark(
+pub(crate) async fn trigger_benchmark(
     State(state): State<Arc<AppState>>,
     user: auth::CurrentUser,
     Json(payload): Json<BenchmarkRequest>,
@@ -692,14 +694,16 @@ async fn trigger_benchmark(
 }
 
 // Route: Serve the Stats UI
-async fn serve_stats_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+pub(crate) async fn serve_stats_ui(
+    session: tower_sessions::Session,
+) -> Result<Html<&'static str>, Redirect> {
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
     Ok(Html(include_str!("../stats.html")))
 }
 
-async fn serve_settings_ui(
+pub(crate) async fn serve_settings_ui(
     session: tower_sessions::Session,
 ) -> Result<Html<&'static str>, Redirect> {
     if require_session(session).await.is_err() {
@@ -708,21 +712,25 @@ async fn serve_settings_ui(
     Ok(Html(include_str!("../settings.html")))
 }
 
-async fn serve_models_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+pub(crate) async fn serve_models_ui(
+    session: tower_sessions::Session,
+) -> Result<Html<&'static str>, Redirect> {
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
     Ok(Html(include_str!("../models.html")))
 }
 
-async fn serve_memory_ui(session: tower_sessions::Session) -> Result<Html<&'static str>, Redirect> {
+pub(crate) async fn serve_memory_ui(
+    session: tower_sessions::Session,
+) -> Result<Html<&'static str>, Redirect> {
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
     Ok(Html(include_str!("../memory.html")))
 }
 
-async fn serve_console_ui(
+pub(crate) async fn serve_console_ui(
     session: tower_sessions::Session,
     State(state): State<Arc<AppState>>,
 ) -> Result<Html<&'static str>, Redirect> {
@@ -736,7 +744,7 @@ async fn serve_console_ui(
     Ok(Html(include_str!("../console.html")))
 }
 
-async fn serve_console_js() -> impl IntoResponse {
+pub(crate) async fn serve_console_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../console.js"),
@@ -754,7 +762,7 @@ pub struct LogResponse {
     pub next_cursor: usize,
 }
 
-async fn get_console_logs(
+pub(crate) async fn get_console_logs(
     user: auth::CurrentUser,
     axum::extract::Query(query): axum::extract::Query<LogQuery>,
     State(state): State<Arc<AppState>>,
@@ -785,7 +793,7 @@ async fn get_console_logs(
     .into_response()
 }
 
-async fn clear_console_logs(
+pub(crate) async fn clear_console_logs(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -803,7 +811,7 @@ pub struct LogLevelRequest {
     pub level: String,
 }
 
-async fn set_console_loglevel(
+pub(crate) async fn set_console_loglevel(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LogLevelRequest>,
@@ -831,7 +839,7 @@ async fn set_console_loglevel(
     (StatusCode::OK, "Log level updated").into_response()
 }
 
-async fn list_chat_sessions(
+pub(crate) async fn list_chat_sessions(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<manager::ChatSessionSummary>>, StatusCode> {
@@ -842,7 +850,7 @@ async fn list_chat_sessions(
     Ok(Json(sessions))
 }
 
-async fn get_chat_session(
+pub(crate) async fn get_chat_session(
     user: auth::CurrentUser,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -889,7 +897,7 @@ async fn get_chat_session(
     }
 }
 
-async fn save_chat_session(
+pub(crate) async fn save_chat_session(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
     Json(mut payload): Json<manager::ChatSessionRecord>,
@@ -917,6 +925,10 @@ async fn save_chat_session(
     };
 
     if !payload.id.is_empty() {
+        if uuid::Uuid::parse_str(&payload.id).is_err() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
         let mut response = state
             .db
             .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
@@ -960,7 +972,7 @@ async fn save_chat_session(
     })
 }
 
-async fn append_chat_message(
+pub(crate) async fn append_chat_message(
     user: auth::CurrentUser,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -1011,7 +1023,7 @@ async fn append_chat_message(
     Ok(StatusCode::OK)
 }
 
-async fn truncate_chat_messages(
+pub(crate) async fn truncate_chat_messages(
     user: auth::CurrentUser,
     Path((id, index)): Path<(String, usize)>,
     State(state): State<Arc<AppState>>,
@@ -1066,7 +1078,7 @@ async fn truncate_chat_messages(
     Ok(StatusCode::OK)
 }
 
-async fn delete_chat_session(
+pub(crate) async fn delete_chat_session(
     user: auth::CurrentUser,
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -1105,7 +1117,7 @@ async fn delete_chat_session(
     }
 }
 
-async fn get_console_loglevel(
+pub(crate) async fn get_console_loglevel(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -1120,49 +1132,49 @@ async fn get_console_loglevel(
     Json(LogLevelRequest { level }).into_response()
 }
 
-async fn serve_chat_js() -> impl IntoResponse {
+pub(crate) async fn serve_chat_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../chat.js"),
     )
 }
 
-async fn serve_stats_js() -> impl IntoResponse {
+pub(crate) async fn serve_stats_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../stats.js"),
     )
 }
 
-async fn serve_models_js() -> impl IntoResponse {
+pub(crate) async fn serve_models_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../models.js"),
     )
 }
 
-async fn serve_settings_js() -> impl IntoResponse {
+pub(crate) async fn serve_settings_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../settings.js"),
     )
 }
 
-async fn serve_memory_js() -> impl IntoResponse {
+pub(crate) async fn serve_memory_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../memory.js"),
     )
 }
 
-async fn serve_common_js() -> impl IntoResponse {
+pub(crate) async fn serve_common_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
         include_str!("../common.js"),
     )
 }
 
-async fn serve_common_css() -> impl IntoResponse {
+pub(crate) async fn serve_common_css() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css")],
         include_str!("../common.css"),
@@ -1170,7 +1182,7 @@ async fn serve_common_css() -> impl IntoResponse {
 }
 
 // Route: Serve the Telemetry JSON
-async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetryStore> {
+pub(crate) async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetryStore> {
     let current_data = state
         .telemetry
         .lock()
@@ -1183,37 +1195,7 @@ async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetrySto
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::load();
 
-    // --- 1. CONSOLE LAYER ---
-    let console_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stdout)
-        .with_filter(EnvFilter::new(&config.log_level_console));
-
-    // --- 2. FILE LAYER ---
-    let file_appender = tracing_appender::rolling::never(".", &config.log_file_name);
-    // Bind the _file_guard to keep the background writer active for the life of main()
-    let (file_writer, _file_guard) = tracing_appender::non_blocking(file_appender);
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(file_writer)
-        .with_ansi(false) // Do not write ANSI color codes to the log file!
-        .with_filter(EnvFilter::new(&config.log_level_file));
-
-    // --- 3. IN-MEMORY BUFFER LAYER (RELOADABLE) ---
-    let memory_buffer =
-        SharedLogBuffer(Arc::new(Mutex::new((0, std::collections::VecDeque::new()))));
-    let memory_filter = EnvFilter::new(&config.log_level_memory);
-    let (reloadable_memory_filter, log_reload_handle) =
-        tracing_subscriber::reload::Layer::new(memory_filter);
-    let memory_layer = tracing_subscriber::fmt::layer()
-        .with_writer(memory_buffer.clone())
-        .with_ansi(false) // Send clean strings to the web UI
-        .with_filter(reloadable_memory_filter);
-
-    // Apply all registered layers
-    tracing_subscriber::registry()
-        .with(memory_layer)
-        .with(file_layer)
-        .with(console_layer)
-        .init();
+    let (memory_buffer, log_reload_handle, _file_guard) = setup::init_logging(&config);
 
     // Create the async channel for the GPU queue
     let (tx, rx) = mpsc::channel(32);
@@ -1221,75 +1203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the shared state BEFORE spawning the background thread
     let engine_status = Arc::new(Mutex::new(EngineStatus::default()));
 
-    // SETUP DATABASE CLIENT
-    let jwt = match std::fs::read_to_string(&config.database.jwt_file_path) {
-        Ok(content) => content,
-        Err(e) => {
-            let msg = format!(
-                "Failed to read database JWT file '{}': {}",
-                config.database.jwt_file_path, e
-            );
-            error!("{}", msg);
-            return Err(msg.into());
-        }
-    };
-
-    let mut db_client_opt = None;
-    for attempt in 1..=3 {
-        match surrealdb::engine::any::connect(&config.database.url).await {
-            Ok(client) => {
-                if let Err(e) = client.authenticate(jwt.trim()).await {
-                    error!(
-                        "SurrealDB authentication failed on attempt {}: {}",
-                        attempt, e
-                    );
-                } else if let Err(e) = client
-                    .use_ns(&config.database.namespace)
-                    .use_db(&config.database.database)
-                    .await
-                {
-                    error!(
-                        "Failed to switch to namespace/database on attempt {}: {}",
-                        attempt, e
-                    );
-                } else {
-                    db_client_opt = Some(client);
-                    break;
-                }
-            }
-            Err(e) => {
-                error!(
-                    "Failed to connect to SurrealDB on attempt {}: {}",
-                    attempt, e
-                );
-            }
-        }
-        if attempt < 3 {
-            info!("Retrying database connection in 2 seconds...");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-    }
-
-    let db_client = match db_client_opt {
-        Some(client) => client,
-        None => {
-            let msg =
-                "Database is temporarily unavailable after 3 attempts. Gracefully shutting down.";
-            error!("{}", msg);
-            return Err(msg.into());
-        }
-    };
-
-    let index_queries = "
-        DEFINE INDEX IF NOT EXISTS chat_sessions_email_idx ON TABLE chat_sessions COLUMNS email;
-        DEFINE INDEX IF NOT EXISTS chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id, message_index;
-        DEFINE INDEX IF NOT EXISTS telemetry_loads_timestamp_idx ON TABLE telemetry_loads COLUMNS timestamp;
-        DEFINE INDEX IF NOT EXISTS telemetry_generations_timestamp_idx ON TABLE telemetry_generations COLUMNS timestamp;
-    ";
-
-    if let Err(e) = db_client.query(index_queries).await {
-        error!("Failed to define database indexes: {}", e);
-    }
+    let db_client = setup::init_db(&config).await?;
 
     // Background VRAM Tracker
     let status_for_nvml = engine_status.clone();
@@ -1424,72 +1338,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // WEB & SETTINGS ROUTES
     // These handle their own session logic and redirects, so we don't apply the strict middleware here.
-    let web_routes = Router::new()
-        // Public OAuth
-        .route("/auth/login", get(auth::login_handler))
-        .route("/auth/google/callback", get(auth::callback_handler))
-        .route("/auth/logout", get(auth::logout_handler))
-        // Protected UIs (They redirect if session is missing)
-        .route("/", get(serve_ui))
-        .route("/settings", get(serve_settings_ui))
-        .route("/models", get(serve_models_ui))
-        .route("/stats", get(serve_stats_ui))
-        .route("/memory", get(serve_memory_ui))
-        .route("/console", get(serve_console_ui))
-        .route("/js/chat.js", get(serve_chat_js))
-        .route("/js/models.js", get(serve_models_js))
-        .route("/js/stats.js", get(serve_stats_js))
-        .route("/js/settings.js", get(serve_settings_js))
-        .route("/js/memory.js", get(serve_memory_js))
-        .route("/js/console.js", get(serve_console_js))
-        .route("/js/common.js", get(serve_common_js))
-        .route("/css/common.css", get(serve_common_css))
-        // Settings APIs (They check session manually)
-        .route(
-            "/api/settings/keys",
-            get(auth::list_keys_handler).post(auth::create_key_handler),
-        )
-        .route(
-            "/api/settings/keys/{hash}",
-            delete(auth::delete_key_handler),
-        );
+    let web_routes = setup::build_web_routes();
 
     // ENGINE API ROUTES
     // These get wrapped in our strict Dual-Auth Middleware layer.
-    let engine_api_routes = Router::new()
-        .route("/api/generate", post(handle_generate))
-        .route("/api/stats/collect", post(trigger_benchmark))
-        .route(
-            "/api/chat/sessions",
-            get(list_chat_sessions).post(save_chat_session),
-        )
-        .route(
-            "/api/chat/sessions/{id}",
-            get(get_chat_session).delete(delete_chat_session),
-        )
-        .route(
-            "/api/chat/sessions/{id}/messages",
-            post(append_chat_message),
-        )
-        .route(
-            "/api/chat/sessions/{id}/messages/{index}",
-            delete(truncate_chat_messages),
-        )
-        .route("/api/models", get(get_models))
-        .route("/api/status", get(get_status))
-        .route("/api/stats/data", get(get_stats_data))
-        .route(
-            "/api/console/logs",
-            get(get_console_logs).delete(clear_console_logs),
-        )
-        .route(
-            "/api/console/loglevel",
-            get(get_console_loglevel).post(set_console_loglevel),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            shared_state.clone(),
-            auth::dual_auth_middleware,
-        ));
+    let engine_api_routes = setup::build_engine_api_routes(shared_state.clone());
 
     // MERGE & MOUNT
     // Combine them, inject the shared state, and apply the session layer globally

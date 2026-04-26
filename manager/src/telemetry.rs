@@ -60,24 +60,37 @@ pub struct TelemetryStore {
 
 impl TelemetryStore {
     pub async fn load_from_db(db: &Surreal<Any>) -> Self {
+        let loads_future =
+            db.query("SELECT * FROM telemetry_loads ORDER BY timestamp DESC LIMIT 100");
+        let generations_future =
+            db.query("SELECT * FROM telemetry_generations ORDER BY timestamp DESC LIMIT 100");
+
+        let (loads_res, generations_res) = tokio::join!(loads_future, generations_future);
+
         let mut loads = VecDeque::new();
-        if let Ok(mut response) = db
-            .query("SELECT * FROM telemetry_loads ORDER BY timestamp DESC LIMIT 100")
-            .await
-        {
-            let mut temp: Vec<LoadMetric> = response.take(0).unwrap_or_default();
-            temp.reverse();
-            loads = temp.into();
+        match loads_res {
+            Ok(mut response) => {
+                let mut temp: Vec<LoadMetric> = response.take(0).unwrap_or_else(|e| {
+                    error!("Failed to parse telemetry_loads from database: {}", e);
+                    Vec::new()
+                });
+                temp.reverse();
+                loads = temp.into();
+            }
+            Err(e) => error!("Failed to query telemetry_loads from database: {}", e),
         }
 
         let mut generations = VecDeque::new();
-        if let Ok(mut response) = db
-            .query("SELECT * FROM telemetry_generations ORDER BY timestamp DESC LIMIT 100")
-            .await
-        {
-            let mut temp: Vec<GenerationMetric> = response.take(0).unwrap_or_default();
-            temp.reverse();
-            generations = temp.into();
+        match generations_res {
+            Ok(mut response) => {
+                let mut temp: Vec<GenerationMetric> = response.take(0).unwrap_or_else(|e| {
+                    error!("Failed to parse telemetry_generations from database: {}", e);
+                    Vec::new()
+                });
+                temp.reverse();
+                generations = temp.into();
+            }
+            Err(e) => error!("Failed to query telemetry_generations from database: {}", e),
         }
 
         TelemetryStore {
