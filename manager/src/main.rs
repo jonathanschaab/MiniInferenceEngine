@@ -331,289 +331,287 @@ pub(crate) async fn trigger_download(
 
     let state_clone = state.clone();
     let id_clone = id.clone();
+    let repo = model.repo.clone();
+    let filename = model.filename.clone();
 
     tokio::spawn(async move {
-        let url = format!(
-            "https://huggingface.co/{}/resolve/main/{}",
-            model.repo, model.filename
-        );
-        let client = &state_clone.reqwest_client;
-
-        let _ = tokio::fs::create_dir_all("downloads").await;
-        let file_path = format!("downloads/{}", model.filename);
-        let tmp_file_path = format!("{}.tmp", file_path);
-
-        let mut existing_size = 0;
-        if let Ok(meta) = tokio::fs::metadata(&tmp_file_path).await {
-            existing_size = meta.len();
-        }
-
-        {
-            let mut dl = state_clone
-                .active_downloads
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(status) = dl.get_mut(&id_clone) {
-                status.bytes_transferred = existing_size;
-                if existing_size > 0 {
-                    status.state = "Verifying...".to_string();
-                } else {
-                    status.state = "Connecting...".to_string();
-                }
-            }
-        }
-
-        let mut hasher = Sha256::new();
-
-        if existing_size > 0 {
-            info!(
-                "Verifying {} bytes of existing partial download for {}...",
-                existing_size, id_clone
-            );
-            let hash_start = std::time::Instant::now();
-            let tmp_file_path_clone = tmp_file_path.clone();
-
-            let hash_result =
-                tokio::task::spawn_blocking(move || -> std::io::Result<(u64, Sha256)> {
-                    let mut h = Sha256::new();
-                    use std::io::Read;
-                    let mut f = std::fs::File::open(&tmp_file_path_clone)?;
-                    let mut buf = vec![0u8; 4 * 1024 * 1024];
-                    let mut read_bytes = 0;
-                    loop {
-                        let n = f.read(&mut buf)?;
-                        if n == 0 {
-                            break;
-                        }
-                        h.update(&buf[..n]);
-                        read_bytes += n as u64;
-                    }
-                    Ok((read_bytes, h))
-                })
-                .await;
-
-            match hash_result {
-                Ok(Ok((new_size, new_hasher))) => {
-                    existing_size = new_size;
-                    hasher = new_hasher;
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("Failed to read existing temp file for hashing: {}", e);
-                    existing_size = 0;
-                    hasher = Sha256::new();
-                }
-                Err(e) => {
-                    tracing::error!("Hashing task panicked or was cancelled: {}", e);
-                    existing_size = 0;
-                    hasher = Sha256::new();
-                }
-            }
-
-            if existing_size > 0 {
-                info!(
-                    "Verification complete in {:.2}s. Opening network stream for {}...",
-                    hash_start.elapsed().as_secs_f64(),
-                    id_clone
-                );
-            }
-        }
-
-        let mut req = client.get(&url);
-        if existing_size > 0 {
-            req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_size));
-        }
-
-        let mut res = match req.send().await {
-            Ok(r) => {
-                if r.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                    existing_size = 0;
-                    hasher = Sha256::new();
-                    match client.get(&url).send().await {
-                        Ok(r2) => r2,
-                        Err(e) => {
-                            error!("Download failed for {}: {}", id_clone, e);
-                            state_clone
-                                .active_downloads
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .remove(&id_clone);
-                            return;
-                        }
-                    }
-                } else if !r.status().is_success() {
-                    error!(
-                        "Download failed for {} with status: {}",
-                        id_clone,
-                        r.status()
-                    );
-                    state_clone
-                        .active_downloads
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(&id_clone);
-                    return;
-                } else {
-                    r
-                }
-            }
-            Err(e) => {
-                error!("Download failed for {}: {}", id_clone, e);
-                state_clone
-                    .active_downloads
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id_clone);
-                return;
-            }
-        };
-
-        let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-        if !is_partial && existing_size > 0 {
-            info!(
-                "Server did not return partial content, restarting download for {}",
-                id_clone
-            );
-            existing_size = 0;
-            hasher = Sha256::new();
-        }
-
-        let mut expected_hash = None;
-        if let Some(etag) = res
-            .headers()
-            .get("X-Linked-Etag")
-            .or_else(|| res.headers().get("ETag"))
-        {
-            let etag_str = etag.to_str().unwrap_or("").trim_matches('"');
-            let clean_etag = etag_str
-                .strip_prefix("W/")
-                .unwrap_or(etag_str)
-                .trim_matches('"');
-            if clean_etag.len() == 64 {
-                expected_hash = Some(clean_etag.to_string());
-            }
-        }
-
-        let total_size = if is_partial {
-            existing_size + res.content_length().unwrap_or(0)
-        } else {
-            res.content_length().unwrap_or(0)
-        };
-
-        {
-            let mut dl = state_clone
-                .active_downloads
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(status) = dl.get_mut(&id_clone) {
-                status.total_bytes = total_size;
-                status.bytes_transferred = existing_size; // SHOW PROGRESS IMMEDIATELY
-                status.state = "Downloading...".to_string();
-            }
-        }
-
-        let mut file = match if is_partial && existing_size > 0 {
-            tokio::fs::OpenOptions::new()
-                .append(true)
-                .open(&tmp_file_path)
-                .await
-        } else {
-            tokio::fs::File::create(&tmp_file_path).await
-        } {
-            Ok(f) => f,
-            Err(e) => {
-                error!("Failed to open/create file for {}: {}", id_clone, e);
-                state_clone
-                    .active_downloads
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id_clone);
-                return;
-            }
-        };
-
-        let start_time = std::time::Instant::now();
-        let mut downloaded: u64 = existing_size;
-        let mut stream_error = false;
-
-        use tokio::io::AsyncWriteExt;
-
-        while let Some(chunk) = res.chunk().await.transpose() {
-            match chunk {
-                Ok(bytes) => {
-                    hasher.update(&bytes);
-                    if let Err(e) = file.write_all(&bytes).await {
-                        error!("Failed to write to file for {}: {}", id_clone, e);
-                        stream_error = true;
-                        break;
-                    }
-                    downloaded += bytes.len() as u64;
-
-                    let elapsed = start_time.elapsed().as_secs_f64();
-                    let speed = if elapsed > 0.0 {
-                        (downloaded.saturating_sub(existing_size)) as f64 / elapsed
-                    } else {
-                        0.0
-                    };
-
-                    let mut dl = state_clone
-                        .active_downloads
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Some(status) = dl.get_mut(&id_clone) {
-                        status.bytes_transferred = downloaded;
-                        status.current_speed_bps = speed;
-                        status.state = "Downloading...".to_string();
-                    }
-                }
-                Err(e) => {
-                    error!("Error while streaming {}: {}", id_clone, e);
-                    stream_error = true;
-                    break;
-                }
-            }
-        }
-
-        // Explicitly drop the file handle so Windows allows us to rename/delete it
-        drop(file);
-
-        if !stream_error {
-            let final_hash = hex::encode(hasher.finalize());
-            if let Some(expected) = expected_hash {
-                if final_hash != expected {
-                    warn!(
-                        "Checksum mismatch for {}. Expected {}, got {}. Saving anyway; CDN ETags may differ from raw SHA256.",
-                        id_clone, expected, final_hash
-                    );
-                } else {
-                    info!("Checksum validated successfully for {}.", id_clone);
-                }
-            } else {
-                info!(
-                    "No SHA-256 ETag found for {}. Saving. Computed: {}",
-                    id_clone, final_hash
-                );
-            }
-        }
-
-        if stream_error {
-            info!(
-                "Network interrupted. Kept partial temp file for {} to resume later.",
-                id_clone
-            );
-        } else {
-            let _ = tokio::fs::rename(&tmp_file_path, &file_path).await;
-            info!("Finished downloading {}", id_clone);
-            manager::set_model_downloaded(&id_clone, true).await;
-        }
-
-        let mut dl = state_clone
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        dl.remove(&id_clone);
+        perform_model_download(state_clone, id_clone, repo, filename).await;
     });
 
     (StatusCode::ACCEPTED, format!("Download started for {}", id)).into_response()
+}
+
+async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, filename: String) {
+    let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, filename);
+    let client = &state.reqwest_client;
+
+    let _ = tokio::fs::create_dir_all("downloads").await;
+    let file_path = format!("downloads/{}", filename);
+    let tmp_file_path = format!("{}.tmp", file_path);
+
+    let mut existing_size = 0;
+    if let Ok(meta) = tokio::fs::metadata(&tmp_file_path).await {
+        existing_size = meta.len();
+    }
+
+    {
+        let mut dl = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(status) = dl.get_mut(&id) {
+            status.bytes_transferred = existing_size;
+            if existing_size > 0 {
+                status.state = "Verifying...".to_string();
+            } else {
+                status.state = "Connecting...".to_string();
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+
+    if existing_size > 0 {
+        info!(
+            "Verifying {} bytes of existing partial download for {}...",
+            existing_size, id
+        );
+        let hash_start = std::time::Instant::now();
+        let tmp_file_path_clone = tmp_file_path.clone();
+
+        let hash_result = tokio::task::spawn_blocking(move || -> std::io::Result<(u64, Sha256)> {
+            let mut h = Sha256::new();
+            use std::io::Read;
+            let mut f = std::fs::File::open(&tmp_file_path_clone)?;
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            let mut read_bytes = 0;
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+                read_bytes += n as u64;
+            }
+            Ok((read_bytes, h))
+        })
+        .await;
+
+        match hash_result {
+            Ok(Ok((new_size, new_hasher))) => {
+                existing_size = new_size;
+                hasher = new_hasher;
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Failed to read existing temp file for hashing: {}", e);
+                existing_size = 0;
+                hasher = Sha256::new();
+            }
+            Err(e) => {
+                tracing::error!("Hashing task panicked or was cancelled: {}", e);
+                existing_size = 0;
+                hasher = Sha256::new();
+            }
+        }
+
+        if existing_size > 0 {
+            info!(
+                "Verification complete in {:.2}s. Opening network stream for {}...",
+                hash_start.elapsed().as_secs_f64(),
+                id
+            );
+        }
+    }
+
+    let mut req = client.get(&url);
+    if existing_size > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_size));
+    }
+
+    let mut res = match req.send().await {
+        Ok(r) => {
+            if r.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                existing_size = 0;
+                hasher = Sha256::new();
+                match client.get(&url).send().await {
+                    Ok(r2) => r2,
+                    Err(e) => {
+                        error!("Download failed for {}: {}", id, e);
+                        state
+                            .active_downloads
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(&id);
+                        return;
+                    }
+                }
+            } else if !r.status().is_success() {
+                error!("Download failed for {} with status: {}", id, r.status());
+                state
+                    .active_downloads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id);
+                return;
+            } else {
+                r
+            }
+        }
+        Err(e) => {
+            error!("Download failed for {}: {}", id, e);
+            state
+                .active_downloads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return;
+        }
+    };
+
+    let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if !is_partial && existing_size > 0 {
+        info!(
+            "Server did not return partial content, restarting download for {}",
+            id
+        );
+        existing_size = 0;
+        hasher = Sha256::new();
+    }
+
+    let mut expected_hash = None;
+    if let Some(etag) = res
+        .headers()
+        .get("X-Linked-Etag")
+        .or_else(|| res.headers().get("ETag"))
+    {
+        let etag_str = etag.to_str().unwrap_or("").trim_matches('"');
+        let clean_etag = etag_str
+            .strip_prefix("W/")
+            .unwrap_or(etag_str)
+            .trim_matches('"');
+        if clean_etag.len() == 64 {
+            expected_hash = Some(clean_etag.to_string());
+        }
+    }
+
+    let total_size = if is_partial {
+        existing_size + res.content_length().unwrap_or(0)
+    } else {
+        res.content_length().unwrap_or(0)
+    };
+
+    {
+        let mut dl = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(status) = dl.get_mut(&id) {
+            status.total_bytes = total_size;
+            status.bytes_transferred = existing_size; // SHOW PROGRESS IMMEDIATELY
+            status.state = "Downloading...".to_string();
+        }
+    }
+
+    let mut file = match if is_partial && existing_size > 0 {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp_file_path)
+            .await
+    } else {
+        tokio::fs::File::create(&tmp_file_path).await
+    } {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to open/create file for {}: {}", id, e);
+            state
+                .active_downloads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+            return;
+        }
+    };
+
+    let start_time = std::time::Instant::now();
+    let mut downloaded: u64 = existing_size;
+    let mut stream_error = false;
+
+    use tokio::io::AsyncWriteExt;
+
+    while let Some(chunk) = res.chunk().await.transpose() {
+        match chunk {
+            Ok(bytes) => {
+                hasher.update(&bytes);
+                if let Err(e) = file.write_all(&bytes).await {
+                    error!("Failed to write to file for {}: {}", id, e);
+                    stream_error = true;
+                    break;
+                }
+                downloaded += bytes.len() as u64;
+
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let speed = if elapsed > 0.0 {
+                    (downloaded.saturating_sub(existing_size)) as f64 / elapsed
+                } else {
+                    0.0
+                };
+
+                let mut dl = state
+                    .active_downloads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(status) = dl.get_mut(&id) {
+                    status.bytes_transferred = downloaded;
+                    status.current_speed_bps = speed;
+                    status.state = "Downloading...".to_string();
+                }
+            }
+            Err(e) => {
+                error!("Error while streaming {}: {}", id, e);
+                stream_error = true;
+                break;
+            }
+        }
+    }
+
+    // Explicitly drop the file handle so Windows allows us to rename/delete it
+    drop(file);
+
+    if !stream_error {
+        let final_hash = hex::encode(hasher.finalize());
+        if let Some(expected) = expected_hash {
+            if final_hash != expected {
+                warn!(
+                    "Checksum mismatch for {}. Expected {}, got {}. Saving anyway; CDN ETags may differ from raw SHA256.",
+                    id, expected, final_hash
+                );
+            } else {
+                info!("Checksum validated successfully for {}.", id);
+            }
+        } else {
+            info!(
+                "No SHA-256 ETag found for {}. Saving. Computed: {}",
+                id, final_hash
+            );
+        }
+    }
+
+    if stream_error {
+        info!(
+            "Network interrupted. Kept partial temp file for {} to resume later.",
+            id
+        );
+    } else {
+        let _ = tokio::fs::rename(&tmp_file_path, &file_path).await;
+        info!("Finished downloading {}", id);
+        manager::set_model_downloaded(&id, true).await;
+    }
+
+    let mut dl = state
+        .active_downloads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dl.remove(&id);
 }
 
 // Delete a downloaded model from disk

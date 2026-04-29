@@ -337,12 +337,10 @@ impl LlamaCppEngine {
                             }
 
                             n_gpu_layers = n_gpu_layers.min(config.num_layers as u32);
-                            if strategy != MemoryStrategy::Compress {
-                                info!(
-                                    "CPU Offloading Active: Fitting {} / {} layers on GPU.",
-                                    n_gpu_layers, config.num_layers
-                                );
-                            }
+                            info!(
+                                "CPU Offloading Active: Fitting {} / {} layers on GPU.",
+                                n_gpu_layers, config.num_layers
+                            );
                             let offload_pct =
                                 1.0 - (n_gpu_layers as f32 / config.num_layers.max(1) as f32);
                             if offload_pct > 0.0 {

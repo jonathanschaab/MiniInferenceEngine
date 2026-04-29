@@ -436,16 +436,14 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                     Some(meta)
                 } else if let Some(gguf_path) = cache.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename) {
                     is_downloaded = true;
-                    if size_on_disk_gb.is_none() {
-                        tokio::fs::metadata(&gguf_path).await.ok()
-                    } else {
-                        None
-                    }
+                    tokio::fs::metadata(&gguf_path).await.ok()
                 } else {
                     None
                 };
 
-                if size_on_disk_gb.is_none() && let Some(meta) = cached_meta {
+                if let None = size_on_disk_gb
+                    && let Some(meta) = cached_meta
+                {
                     size_on_disk_gb = Some(meta.len() as f32 / 1024.0 / 1024.0 / 1024.0);
                     provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
                 }
