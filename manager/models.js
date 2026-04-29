@@ -184,8 +184,13 @@ window.startDownload = async function(modelId) {
             `;
             rightCol.prepend(progressDiv);
             
-            progressDiv.querySelector('.dl-cancel-btn').addEventListener('click', () => {
+            progressDiv.querySelector('.dl-cancel-btn').addEventListener('click', async () => {
                 cancelDownloadFlags.add(modelId);
+                try {
+                    await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
+                } catch (e) {
+                    console.error("Failed to send cancel request to server:", e);
+                }
             });
         } else {
             const cancelBtn = progressDiv.querySelector('.dl-cancel-btn');

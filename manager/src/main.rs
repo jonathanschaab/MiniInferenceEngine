@@ -212,6 +212,7 @@ pub struct AppState {
     pub log_reload_handle: LogReloadHandle,
     pub current_log_level: Arc<Mutex<String>>,
     pub active_downloads: Arc<Mutex<std::collections::HashMap<String, DownloadStatus>>>,
+    pub download_tasks: Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
 }
 
@@ -334,18 +335,48 @@ pub(crate) async fn trigger_download(
     let repo = model.repo.clone();
     let filename = model.filename.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         perform_model_download(state_clone, id_clone, repo, filename).await;
     });
+
+    state.download_tasks.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), task);
 
     (StatusCode::ACCEPTED, format!("Download started for {}", id)).into_response()
 }
 
+struct DownloadCleanupGuard {
+    state: Arc<AppState>,
+    id: String,
+}
+
+impl Drop for DownloadCleanupGuard {
+    fn drop(&mut self) {
+        self.state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+        self.state
+            .download_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
 async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, filename: String) {
+    let _guard = DownloadCleanupGuard {
+        state: state.clone(),
+        id: id.clone(),
+    };
+
     let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, filename);
     let client = &state.reqwest_client;
 
-    let _ = tokio::fs::create_dir_all("downloads").await;
+    if let Err(e) = tokio::fs::create_dir_all("downloads").await {
+        error!("Failed to create downloads directory for {}: {}", id, e);
+        return;
+    }
     let file_path = format!("downloads/{}", filename);
     let tmp_file_path = format!("{}.tmp", file_path);
 
@@ -434,24 +465,20 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
                 existing_size = 0;
                 hasher = Sha256::new();
                 match client.get(&url).send().await {
-                    Ok(r2) => r2,
+                    Ok(r2) => {
+                        if !r2.status().is_success() {
+                            error!("Download failed for {} with status: {}", id, r2.status());
+                            return;
+                        }
+                        r2
+                    }
                     Err(e) => {
                         error!("Download failed for {}: {}", id, e);
-                        state
-                            .active_downloads
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&id);
                         return;
                     }
                 }
             } else if !r.status().is_success() {
                 error!("Download failed for {} with status: {}", id, r.status());
-                state
-                    .active_downloads
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
                 return;
             } else {
                 r
@@ -459,11 +486,6 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
         }
         Err(e) => {
             error!("Download failed for {}: {}", id, e);
-            state
-                .active_downloads
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
             return;
         }
     };
@@ -523,11 +545,6 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
         Ok(f) => f,
         Err(e) => {
             error!("Failed to open/create file for {}: {}", id, e);
-            state
-                .active_downloads
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
             return;
         }
     };
@@ -602,16 +619,13 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
             id
         );
     } else {
-        let _ = tokio::fs::rename(&tmp_file_path, &file_path).await;
-        info!("Finished downloading {}", id);
-        manager::set_model_downloaded(&id, true).await;
+        if let Err(e) = tokio::fs::rename(&tmp_file_path, &file_path).await {
+            error!("Failed to rename temp file to final file for {}: {}", id, e);
+        } else {
+            info!("Finished downloading {}", id);
+            manager::set_model_downloaded(&id, true).await;
+        }
     }
-
-    let mut dl = state
-        .active_downloads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    dl.remove(&id);
 }
 
 // Delete a downloaded model from disk
@@ -628,7 +642,25 @@ pub(crate) async fn delete_model(
             .into_response();
     }
 
-    {
+    let download_task = {
+        let mut tasks = state
+            .download_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tasks.remove(&id)
+    };
+
+    if let Some(task) = download_task {
+        task.abort();
+        let _ = task.await; // Wait for the task to finish cancelling
+        info!("Aborted active download task for model {}", id);
+
+        let mut dl = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        dl.remove(&id);
+    } else {
         let downloads = state
             .active_downloads
             .lock()
@@ -1828,6 +1860,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_reload_handle,
         current_log_level: Arc::new(Mutex::new(config.log_level_memory.clone())),
         active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         db: db_client.clone(),
     });
 
@@ -2047,6 +2080,7 @@ mod tests {
             log_reload_handle,
             current_log_level: Arc::new(Mutex::new("info".to_string())),
             active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             db,
         })
     }

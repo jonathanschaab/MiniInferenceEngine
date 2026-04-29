@@ -585,8 +585,13 @@ async function startChatDownload(modelId, modelName) {
 
     let isCanceled = false;
     const cancelBtn = document.getElementById(`dl-cancel-${modelId}`);
-    cancelBtn.addEventListener('click', () => {
+    cancelBtn.addEventListener('click', async () => {
         isCanceled = true;
+        try {
+            await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
+        } catch (e) {
+            console.error("Failed to send cancel request to server:", e);
+        }
     });
 
     while (!isCanceled) {

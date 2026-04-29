@@ -49,12 +49,29 @@ impl PromptFormatter for ModelArch {
                 prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
             }
             ModelArch::Mistral => {
+                prompt.push_str("<s>");
+                let mut system_prompt = String::new();
                 for msg in messages {
-                    if msg.role == "user" || msg.role == "system" {
-                        prompt.push_str(&format!("[INST] {} [/INST]", msg.content));
+                    if msg.role == "system" {
+                        if !system_prompt.is_empty() {
+                            system_prompt.push_str("\n\n");
+                        }
+                        system_prompt.push_str(&msg.content);
+                    } else if msg.role == "user" {
+                        prompt.push_str("[INST] ");
+                        if !system_prompt.is_empty() {
+                            prompt.push_str(&system_prompt);
+                            prompt.push_str("\n\n");
+                            system_prompt.clear();
+                        }
+                        prompt.push_str(&msg.content);
+                        prompt.push_str(" [/INST]");
                     } else {
                         prompt.push_str(&format!("{}</s>", msg.content));
                     }
+                }
+                if !system_prompt.is_empty() {
+                    prompt.push_str(&format!("[INST] {} [/INST]", system_prompt));
                 }
             }
             _ => {
@@ -790,7 +807,7 @@ mod tests {
             content: "Hi".into(),
         }];
         let prompt = arch.format_chat(&msgs);
-        assert_eq!(prompt, "[INST] Hi [/INST]");
+        assert_eq!(prompt, "<s>[INST] Hi [/INST]");
     }
 
     #[test]
@@ -816,7 +833,7 @@ mod tests {
             "<|im_start|>assistant\n"
         );
         assert_eq!(ModelArch::XLMRoberta.format_chat(&msgs), "assistant: ");
-        assert_eq!(ModelArch::Mistral.format_chat(&msgs), "");
+        assert_eq!(ModelArch::Mistral.format_chat(&msgs), "<s>");
     }
 
     #[test]
