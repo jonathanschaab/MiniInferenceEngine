@@ -373,39 +373,41 @@ pub(crate) async fn trigger_download(
             let hash_start = std::time::Instant::now();
             let tmp_file_path_clone = tmp_file_path.clone();
 
-            let (new_size, new_hasher) = tokio::task::spawn_blocking(move || {
-                let mut h = Sha256::new();
-                use std::io::Read;
-                match std::fs::File::open(&tmp_file_path_clone) {
-                    Ok(mut f) => {
-                        let mut buf = vec![0u8; 4 * 1024 * 1024];
-                        let mut read_bytes = 0;
-                        loop {
-                            match f.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    h.update(&buf[..n]);
-                                    read_bytes += n as u64;
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "Failed to read existing temp file for hashing: {}",
-                                        e
-                                    );
-                                    return (0, Sha256::new());
-                                }
-                            }
+            let hash_result =
+                tokio::task::spawn_blocking(move || -> std::io::Result<(u64, Sha256)> {
+                    let mut h = Sha256::new();
+                    use std::io::Read;
+                    let mut f = std::fs::File::open(&tmp_file_path_clone)?;
+                    let mut buf = vec![0u8; 4 * 1024 * 1024];
+                    let mut read_bytes = 0;
+                    loop {
+                        let n = f.read(&mut buf)?;
+                        if n == 0 {
+                            break;
                         }
-                        (read_bytes, h)
+                        h.update(&buf[..n]);
+                        read_bytes += n as u64;
                     }
-                    Err(_) => (0, Sha256::new()),
-                }
-            })
-            .await
-            .unwrap_or((0, Sha256::new()));
+                    Ok((read_bytes, h))
+                })
+                .await;
 
-            existing_size = new_size;
-            hasher = new_hasher;
+            match hash_result {
+                Ok(Ok((new_size, new_hasher))) => {
+                    existing_size = new_size;
+                    hasher = new_hasher;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to read existing temp file for hashing: {}", e);
+                    existing_size = 0;
+                    hasher = Sha256::new();
+                }
+                Err(e) => {
+                    tracing::error!("Hashing task panicked or was cancelled: {}", e);
+                    existing_size = 0;
+                    hasher = Sha256::new();
+                }
+            }
 
             if existing_size > 0 {
                 info!(
