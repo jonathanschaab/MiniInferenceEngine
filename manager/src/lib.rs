@@ -443,6 +443,7 @@ pub async fn run_batcher_loop(
                     error!("Chat model load failed: {}", e);
                     {
                         let mut s = lock_status(&status);
+                        s.model_health.insert(config.id.clone(), false);
                         s.log_vram(
                             "Fail",
                             "Orchestrator",
@@ -487,6 +488,9 @@ pub async fn run_batcher_loop(
 
             {
                 let mut current_status = lock_status(&status);
+                current_status
+                    .model_health
+                    .insert(active_model_id.clone(), true);
                 current_status.active_chat_model_id = Some(active_model_id.clone());
                 current_status.active_backend = Some(target_backend_name);
             }
@@ -552,7 +556,9 @@ pub async fn run_batcher_loop(
             // This rough heuristic is only for the Candle backend's dynamic memory check.
             // Llama.cpp calculates this precisely during its static allocation.
             let bytes_per_token = config.estimate_kv_bytes_per_token();
-            let safe_free_vram = free_vram.saturating_sub(CANDLE_COMPUTE_MARGIN_BYTES);
+            let compute_margin =
+                (CANDLE_COMPUTE_MARGIN_BYTES as f64 * config.compute_margin_multiplier()) as u64;
+            let safe_free_vram = free_vram.saturating_sub(compute_margin);
             let absolute_max_tokens =
                 (safe_free_vram as usize / bytes_per_token).min(active_max_context);
 
@@ -688,6 +694,7 @@ pub async fn run_batcher_loop(
             {
                 {
                     let mut s = lock_status(&status);
+                    s.model_health.insert(comp_config.id.clone(), false);
                     s.log_vram(
                         "Fail",
                         "Orchestrator",
@@ -723,6 +730,9 @@ pub async fn run_batcher_loop(
 
             {
                 let mut current_status = lock_status(&status);
+                current_status
+                    .model_health
+                    .insert(request.compressor_model_id.clone(), true);
                 current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
             }
 
@@ -746,6 +756,11 @@ pub async fn run_batcher_loop(
                             "Server Error: Context compression failed: {}",
                             e
                         )));
+                        {
+                            let mut s = lock_status(&status);
+                            s.model_health
+                                .insert(request.compressor_model_id.clone(), false);
+                        }
                         continue 'main;
                     }
                 }
@@ -771,6 +786,11 @@ pub async fn run_batcher_loop(
                             "Server Error: Generation failed: {}",
                             e
                         )));
+                        {
+                            let mut s = lock_status(&status);
+                            s.model_health
+                                .insert(request.compressor_model_id.clone(), false);
+                        }
                         continue 'main;
                     }
                 }
@@ -910,6 +930,10 @@ pub async fn run_batcher_loop(
                     StreamEvent::Error(e) => {
                         terminal_received = true;
                         let _ = responder.send(StreamEvent::Error(e));
+                        {
+                            let mut s = lock_status(&status);
+                            s.model_health.insert(active_model_id.clone(), false);
+                        }
                         break;
                     }
                     other => {

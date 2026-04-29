@@ -26,6 +26,20 @@ button {
 }
 button:hover { filter: brightness(1.15); }
 
+.btn-download {
+    background: #89b4fa;
+    color: #11111b;
+    padding: 5px 15px;
+    font-size: 0.85rem;
+}
+
+.model-undownloaded {
+    opacity: 0.6;
+    border-left: 5px solid #6c7086 !important;
+    filter: grayscale(80%);
+    transition: filter 0.3s, opacity 0.3s;
+}
+
 /* Shared Tables */
 table { 
     width: 100%; border-collapse: collapse; margin-bottom: 20px; 

@@ -1,5 +1,6 @@
 benchmark_prompts
 target
+downloads
 api_keys.json
 client_secret.apps.googleusercontent.com.json
 config.json
