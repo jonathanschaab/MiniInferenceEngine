@@ -281,9 +281,13 @@ impl LlamaCppEngine {
                         let res = (|| -> Result<(usize, f32), String> {
                             let api = Api::new().map_err(|e| e.to_string())?;
                             let repo = api.model(config.repo.clone());
-                            let weights_path = repo
-                                .get(&config.filename)
-                                .map_err(|e| format!("Missing weights: {}", e))?;
+                            let local_weights = format!("downloads/{}", config.filename);
+                            let weights_path = if std::path::Path::new(&local_weights).exists() {
+                                std::path::PathBuf::from(local_weights)
+                            } else {
+                                repo.get(&config.filename)
+                                    .map_err(|e| format!("Missing weights: {}", e))?
+                            };
 
                             let available_vram =
                                 crate::get_vram_info(nvml.as_ref(), gpu_device_index)
@@ -292,7 +296,9 @@ impl LlamaCppEngine {
 
                             let bytes_per_token = config.estimate_kv_bytes_per_token();
 
-                            let compute_margin: u64 = LLAMA_CPP_COMPUTE_MARGIN_BYTES;
+                            let compute_margin: u64 = (LLAMA_CPP_COMPUTE_MARGIN_BYTES as f64
+                                * config.compute_margin_multiplier())
+                                as u64;
                             let mut final_ctx_len =
                                 required_ctx.max(2048).min(config.max_context_len);
                             let mut n_gpu_layers = config.num_layers as u32;
@@ -328,13 +334,15 @@ impl LlamaCppEngine {
                                     .saturating_sub(non_layer_weights_est);
                                 n_gpu_layers =
                                     (vram_for_layers / total_cost_per_gpu_layer.max(1)) as u32;
+                            }
+
+                            n_gpu_layers = n_gpu_layers.min(config.num_layers as u32);
+                            if strategy != MemoryStrategy::Compress {
                                 info!(
                                     "CPU Offloading Active: Fitting {} / {} layers on GPU.",
                                     n_gpu_layers, config.num_layers
                                 );
                             }
-
-                            n_gpu_layers = n_gpu_layers.min(config.num_layers as u32);
                             let offload_pct =
                                 1.0 - (n_gpu_layers as f32 / config.num_layers.max(1) as f32);
                             if offload_pct > 0.0 {
@@ -369,11 +377,91 @@ impl LlamaCppEngine {
                             let model_params = LlamaModelParams::default()
                                 .with_n_gpu_layers(n_gpu_layers)
                                 .with_main_gpu(gpu_device_index as i32);
-                            let model =
-                                LlamaModel::load_from_file(backend, weights_path, &model_params)
-                                    .map_err(|e| {
-                                        format!("Failed to load llama.cpp model: {}", e)
-                                    })?;
+
+                            let model = match LlamaModel::load_from_file(
+                                backend,
+                                &weights_path,
+                                &model_params,
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    if weights_path.to_string_lossy().contains("downloads") {
+                                        warn!(
+                                            "Llama.cpp failed to load the model. Verifying file integrity..."
+                                        );
+                                        let mut expected_hash = None;
+
+                                        // Spin up a brief runtime to fetch the exact ETag from Hugging Face
+                                        if let Ok(rt) =
+                                            tokio::runtime::Builder::new_current_thread()
+                                                .enable_all()
+                                                .build()
+                                        {
+                                            expected_hash = rt.block_on(async {
+                                                let client = reqwest::Client::builder()
+                                                    .redirect(reqwest::redirect::Policy::none())
+                                                    .build()
+                                                    .unwrap_or_default();
+                                                let url = format!(
+                                                    "https://huggingface.co/{}/resolve/main/{}",
+                                                    config.repo, config.filename
+                                                );
+                                                if let Ok(res) = client.head(&url).send().await
+                                                    && let Some(etag) = res
+                                                        .headers()
+                                                        .get("X-Linked-Etag")
+                                                        .or_else(|| res.headers().get("ETag"))
+                                                {
+                                                    let etag_str = etag
+                                                        .to_str()
+                                                        .unwrap_or("")
+                                                        .trim_matches('"');
+                                                    let clean_etag = etag_str
+                                                        .strip_prefix("W/")
+                                                        .unwrap_or(etag_str)
+                                                        .trim_matches('"');
+                                                    if clean_etag.len() == 64 {
+                                                        return Some(clean_etag.to_string());
+                                                    }
+                                                }
+                                                None
+                                            });
+                                        }
+
+                                        if let Some(expected) = expected_hash {
+                                            use sha2::{Digest, Sha256};
+                                            use std::io::Read;
+                                            let mut hasher = Sha256::new();
+                                            if let Ok(mut f) = std::fs::File::open(&weights_path) {
+                                                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                                                while let Ok(n) = f.read(&mut buf) {
+                                                    if n == 0 {
+                                                        break;
+                                                    }
+                                                    hasher.update(&buf[..n]);
+                                                }
+                                                let final_hash = hex::encode(hasher.finalize());
+
+                                                if final_hash != expected {
+                                                    warn!(
+                                                        "Checksum mismatch for model file: {:?} (Expected: {}, Got: {}). File may be corrupted, but auto-deletion is disabled.",
+                                                        weights_path, expected, final_hash
+                                                    );
+                                                } else {
+                                                    warn!(
+                                                        "File integrity verified (SHA256 matches). The load failure is not due to a corrupted download."
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            warn!(
+                                                "Could not retrieve expected SHA256 from Hugging Face. Skipping auto-deletion."
+                                            );
+                                        }
+                                    }
+                                    return Err(format!("Failed to load llama.cpp model: {}", e));
+                                }
+                            };
 
                             let (vram_used_after, _, vram_free_after) =
                                 crate::get_vram_info(nvml.as_ref(), gpu_device_index)

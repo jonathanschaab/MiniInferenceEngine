@@ -16,6 +16,7 @@ const SESSION_LIMIT = 20;
 let sessionOffset = 0;
 let hasMoreSessions = false;
 let isLoadingSessions = false;
+let allModels = [];
 
 const chatScrollObserver = new IntersectionObserver((entries) => {
     if (entries[0].isIntersecting && hasMoreMessages && !isLoadingMessages && currentSessionId) {
@@ -126,6 +127,7 @@ async function initializeUI() {
         let models = [];
         if (modelsResult.status === 'fulfilled') {
             models = modelsResult.value;
+            allModels = models;
         } else {
             console.error("Critical: Failed to fetch models.", modelsResult.reason);
             appendMessage("System Error: Could not connect to the model registry.", false);
@@ -563,19 +565,137 @@ async function truncateMessagesInDB(fromIndex) {
     } catch(e) { console.error("Failed to truncate messages", e); }
 }
 
+async function startChatDownload(modelId, modelName) {
+    const div = document.createElement('div');
+    div.className = 'message ai-message';
+    div.innerHTML = `
+        <div>Downloading <strong>${modelName}</strong>...</div>
+        <div class="download-progress-container" style="margin-top: 10px;">
+            <div style="width: 100%; max-width: 300px; background: #313244; border-radius: 4px; overflow: hidden; border: 1px solid #45475a;">
+                <div id="dl-bar-${modelId}" style="width: 0%; height: 8px; background: #a6e3a1; transition: width 0.5s ease-out;"></div>
+            </div>
+                <div style="display: flex; justify-content: space-between; max-width: 300px; align-items: center; margin-top: 5px;">
+                    <div id="dl-stats-${modelId}" style="font-size: 0.75rem; color: #a6adc8;">Starting...</div>
+                    <button id="dl-cancel-${modelId}" style="padding: 4px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Cancel</button>
+                </div>
+        </div>
+    `;
+    chatContainer.appendChild(div);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+
+    let isCanceled = false;
+    const cancelBtn = document.getElementById(`dl-cancel-${modelId}`);
+    cancelBtn.addEventListener('click', () => {
+        isCanceled = true;
+    });
+
+    while (!isCanceled) {
+        try {
+            const progCheck = await fetchWithAuth('/api/models/download/progress');
+            const activeDls = await progCheck.json();
+            
+            if (!activeDls[modelId]) {
+                const res = await fetch(`/api/models/${modelId}/download`, { method: 'POST' });
+                if (res.status === 401) { window.location.href = '/auth/login'; return; }
+                if (!res.ok && res.status !== 409) { 
+                    const stats = document.getElementById(`dl-stats-${modelId}`);
+                    if (stats) stats.innerText = `Failed to start. Retrying in 5s...`;
+                    await sleep(5000);
+                    continue;
+                }
+            }
+
+            await new Promise((resolve, reject) => {
+                const interval = setInterval(async () => {
+                    if (isCanceled) {
+                        clearInterval(interval);
+                        reject(new Error("Canceled"));
+                        return;
+                    }
+                    
+                    try {
+                        const progRes = await fetchWithAuth('/api/models/download/progress');
+                        const downloads = await progRes.json();
+                        const status = downloads[modelId];
+                        
+                        if (status) {
+                            const pct = status.total_bytes > 0 ? (status.bytes_transferred / status.total_bytes) * 100 : 0;
+                            const speedMB = (status.current_speed_bps / 1024 / 1024).toFixed(1);
+                            const transMB = (status.bytes_transferred / 1024 / 1024).toFixed(1);
+                            const totalMB = (status.total_bytes / 1024 / 1024).toFixed(1);
+                            
+                            let etaStr = "Calculating...";
+                            if (status.current_speed_bps > 0 && status.total_bytes > 0) {
+                                const bytesLeft = status.total_bytes - status.bytes_transferred;
+                                const secsLeft = bytesLeft / status.current_speed_bps;
+                                etaStr = secsLeft > 60 ? `${Math.floor(secsLeft/60)}m ${Math.round(secsLeft%60)}s` : `${Math.round(secsLeft)}s`;
+                            }
+                            const bar = document.getElementById(`dl-bar-${modelId}`);
+                            const stats = document.getElementById(`dl-stats-${modelId}`);
+                            if (bar) bar.style.width = `${pct}%`;
+                            if (stats) {
+                                if (status.state === 'Verifying...') {
+                                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | Verifying...`;
+                                } else {
+                                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
+                                }
+                            }
+                        } else {
+                            clearInterval(interval);
+                            
+                            const verifyRes = await fetchWithAuth('/api/models');
+                            const verifyModels = await verifyRes.json();
+                            const verifyModel = verifyModels.find(m => m.id === modelId);
+                            
+                            if (verifyModel && verifyModel.is_downloaded) {
+                                const bar = document.getElementById(`dl-bar-${modelId}`);
+                                const stats = document.getElementById(`dl-stats-${modelId}`);
+                                if (bar) bar.style.width = '100%';
+                                if (stats) stats.innerText = 'Download Complete!';
+                                if (cancelBtn) cancelBtn.style.display = 'none';
+                                setTimeout(() => resolve(), 500);
+                            } else {
+                                reject(new Error("Interrupted"));
+                            }
+                        }
+                    } catch (e) {
+                        clearInterval(interval);
+                        reject(e);
+                    }
+                }, 1000);
+            });
+
+            return; // Download succeeded!
+
+        } catch (e) {
+            if (isCanceled) {
+                const stats = document.getElementById(`dl-stats-${modelId}`);
+                if (stats) stats.innerText = 'Download Canceled.';
+                throw new Error("Download canceled by user.");
+            }
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (stats) stats.innerText = `Download Interrupted. Retrying in 5s...`;
+            console.error(`Download ${modelId} interrupted, retrying in 5s...`, e);
+            await sleep(5000);
+        }
+    }
+    
+    // If loop exited because of cancellation
+    const stats = document.getElementById(`dl-stats-${modelId}`);
+    if (stats) stats.innerText = 'Download Canceled.';
+    throw new Error("Download canceled by user.");
+
+    async function sleep(ms) {
+        for (let i = 0; i < ms; i += 100) {
+            if (isCanceled) return;
+            await new Promise(r => setTimeout(r, 100));
+        }
+    }
+}
+
 async function sendMessage() {
     const text = inputField.value.trim();
     if (!text) return;
-
-    // Grab the IDs from the UI dropdowns
-    const chatModelId = document.getElementById('chat-model-select').value;
-    const compModelId = document.getElementById('compressor-model-select').value;
-    const targetBackend = document.getElementById('backend-select').value;
-
-    if (!chatModelId || !compModelId) {
-        alert("Please select a valid chat model and compressor model. Check your backend compatibility if options are disabled.");
-        return;
-    }
 
     await ensureSession(text);
 
@@ -586,11 +706,54 @@ async function sendMessage() {
     
     inputField.value = '';
     inputField.style.height = 'auto'; 
+
+    await requestAiResponse();
+}
+
+async function requestAiResponse() {
+    // Grab the IDs from the UI dropdowns
+    const chatModelId = document.getElementById('chat-model-select').value;
+    const compModelId = document.getElementById('compressor-model-select').value;
+    const targetBackend = document.getElementById('backend-select').value;
+
+    if (!chatModelId || !compModelId) {
+        alert("Please select a valid chat model and compressor model. Check your backend compatibility if options are disabled.");
+        return;
+    }
+
+    const chatModel = allModels.find(m => m.id === chatModelId);
+    const compModel = allModels.find(m => m.id === compModelId);
+
     sendBtn.disabled = true;
     sendBtn.style.display = 'none';
     stopBtn.style.display = 'inline-flex';
     regenBtn.style.display = 'none';
     typingIndicator.style.display = 'block';
+    
+    if (chatModel && !chatModel.is_downloaded) {
+        try { await startChatDownload(chatModel.id, chatModel.name); chatModel.is_downloaded = true; } 
+        catch (e) {
+            console.error("Chat model download failed:", e);
+            typingIndicator.style.display = 'none';
+            sendBtn.style.display = 'inline-flex';
+            stopBtn.style.display = 'none';
+            if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
+            sendBtn.disabled = false;
+            return;
+        }
+    }
+    if (compModel && !compModel.is_downloaded) {
+        try { await startChatDownload(compModel.id, compModel.name); compModel.is_downloaded = true; } 
+        catch (e) {
+            console.error("Compressor model download failed:", e);
+            typingIndicator.style.display = 'none';
+            sendBtn.style.display = 'inline-flex';
+            stopBtn.style.display = 'none';
+            if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
+            sendBtn.disabled = false;
+            return;
+        }
+    }
     
     currentAbortController = new AbortController();
 
@@ -686,15 +849,12 @@ async function regenerateLast() {
     if (chatHistory[chatHistory.length - 1].role === 'assistant') {
         chatHistory.pop();
         chatContainer.removeChild(chatContainer.lastChild);
+        await truncateMessagesInDB(chatHistory.length);
     }
     
-    // Remove the user's last message, place it in the input box, and immediately re-send
+    // If the last remaining message is from the user, request a new response
     if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'user') {
-        const lastUserMsg = chatHistory.pop();
-        chatContainer.removeChild(chatContainer.lastChild);
-        await truncateMessagesInDB(chatHistory.length);
-        inputField.value = lastUserMsg.content;
-        sendMessage();
+        await requestAiResponse();
     }
 }
 

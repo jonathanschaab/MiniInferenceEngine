@@ -66,7 +66,8 @@ export default [
         submitNewKey: 'readonly',
         deleteKey: 'readonly',
         loadKeys: 'readonly',
-        loadModels: 'readonly'
+        loadModels: 'readonly',
+        startDownload: 'readonly'
       }
     },
     // Customize rules as needed.

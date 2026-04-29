@@ -61,9 +61,13 @@ pub fn load_engine(
 
     if config.filename.ends_with(".safetensors") {
         let repo = api.model(config.repo.clone());
-        let weights_path = repo
-            .get(&config.filename)
-            .map_err(|e| format!("Missing weights: {}", e))?;
+        let local_weights = format!("downloads/{}", config.filename);
+        let weights_path = if std::path::Path::new(&local_weights).exists() {
+            std::path::PathBuf::from(local_weights)
+        } else {
+            repo.get(&config.filename)
+                .map_err(|e| format!("Missing weights: {}", e))?
+        };
         let config_path = repo
             .get("config.json")
             .map_err(|e| format!("Missing config.json: {}", e))?;
@@ -100,10 +104,14 @@ pub fn load_engine(
         return Ok((DynamicModel::XLMRoberta(model), tokenizer, None));
     }
 
-    let weights_path = api
-        .model(config.repo.clone())
-        .get(&config.filename)
-        .map_err(|e| e.to_string())?;
+    let local_weights = format!("downloads/{}", config.filename);
+    let weights_path = if std::path::Path::new(&local_weights).exists() {
+        std::path::PathBuf::from(local_weights)
+    } else {
+        api.model(config.repo.clone())
+            .get(&config.filename)
+            .map_err(|e| e.to_string())?
+    };
     let tokenizer_path = api
         .model(config.tokenizer_repo.clone())
         .get("tokenizer.json")

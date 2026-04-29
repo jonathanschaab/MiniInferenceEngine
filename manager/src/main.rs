@@ -11,6 +11,7 @@ use axum::{
 use hf_hub::api::sync::Api;
 use oauth2::basic::BasicClient;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use sysinfo::System;
 use tokenizers::Tokenizer;
@@ -23,8 +24,9 @@ use tracing::{error, info, warn}; // Ensure this is imported for AppState
 use tracing_subscriber::EnvFilter;
 
 use manager::{
-    ApiRequest, BenchmarkRequest, EngineStatus, Message, ModelArch, ModelConfig, ModelRole,
-    StreamEvent, TelemetryStore, UserRequest, get_model_registry, lock_status, run_batcher_loop,
+    ApiRequest, BenchmarkRequest, DownloadStatus, EngineStatus, Message, ModelArch, ModelConfig,
+    ModelRole, StreamEvent, TelemetryStore, UserRequest, get_model_registry, lock_status,
+    run_batcher_loop,
 };
 
 // --- CONFIGURATION ---
@@ -209,6 +211,7 @@ pub struct AppState {
     pub log_buffer: SharedLogBuffer,
     pub log_reload_handle: LogReloadHandle,
     pub current_log_level: Arc<Mutex<String>>,
+    pub active_downloads: Arc<Mutex<std::collections::HashMap<String, DownloadStatus>>>,
     pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
 }
 
@@ -265,6 +268,394 @@ pub(crate) async fn handle_generate(
 pub(crate) async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
     let current_status = lock_status(&state.engine_status).clone();
     Json(current_status)
+}
+
+// Retrieve the progress of all active downloads
+pub(crate) async fn get_download_progress(
+    State(state): State<Arc<AppState>>,
+) -> Json<std::collections::HashMap<String, DownloadStatus>> {
+    let downloads = state
+        .active_downloads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    Json(downloads)
+}
+
+// Start a background streaming download
+pub(crate) async fn trigger_download(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            "Admin access required for downloading",
+        )
+            .into_response();
+    }
+
+    let registry = get_model_registry().await;
+    let model = match registry.into_iter().find(|m| m.id == id) {
+        Some(m) => m,
+        None => return (StatusCode::NOT_FOUND, "Model not found").into_response(),
+    };
+
+    if model.is_downloaded {
+        return (StatusCode::CONFLICT, "Model is already downloaded").into_response();
+    }
+
+    {
+        let mut downloads = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if downloads.contains_key(&id) {
+            return (StatusCode::CONFLICT, "Download already in progress").into_response();
+        }
+        downloads.insert(
+            id.clone(),
+            DownloadStatus {
+                bytes_transferred: 0,
+                total_bytes: 0,
+                start_time: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                current_speed_bps: 0.0,
+                state: "Connecting...".to_string(),
+            },
+        );
+    }
+
+    let state_clone = state.clone();
+    let id_clone = id.clone();
+
+    tokio::spawn(async move {
+        let url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            model.repo, model.filename
+        );
+        let client = &state_clone.reqwest_client;
+
+        let _ = tokio::fs::create_dir_all("downloads").await;
+        let file_path = format!("downloads/{}", model.filename);
+        let tmp_file_path = format!("{}.tmp", file_path);
+
+        let mut existing_size = 0;
+        if let Ok(meta) = tokio::fs::metadata(&tmp_file_path).await {
+            existing_size = meta.len();
+        }
+
+        {
+            let mut dl = state_clone
+                .active_downloads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(status) = dl.get_mut(&id_clone) {
+                status.bytes_transferred = existing_size;
+                if existing_size > 0 {
+                    status.state = "Verifying...".to_string();
+                } else {
+                    status.state = "Connecting...".to_string();
+                }
+            }
+        }
+
+        let mut hasher = Sha256::new();
+
+        if existing_size > 0 {
+            info!(
+                "Verifying {} bytes of existing partial download for {}...",
+                existing_size, id_clone
+            );
+            let hash_start = std::time::Instant::now();
+            let tmp_file_path_clone = tmp_file_path.clone();
+
+            let (new_size, new_hasher) = tokio::task::spawn_blocking(move || {
+                let mut h = Sha256::new();
+                use std::io::Read;
+                match std::fs::File::open(&tmp_file_path_clone) {
+                    Ok(mut f) => {
+                        let mut buf = vec![0u8; 4 * 1024 * 1024];
+                        let mut read_bytes = 0;
+                        loop {
+                            match f.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    h.update(&buf[..n]);
+                                    read_bytes += n as u64;
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to read existing temp file for hashing: {}",
+                                        e
+                                    );
+                                    return (0, Sha256::new());
+                                }
+                            }
+                        }
+                        (read_bytes, h)
+                    }
+                    Err(_) => (0, Sha256::new()),
+                }
+            })
+            .await
+            .unwrap_or((0, Sha256::new()));
+
+            existing_size = new_size;
+            hasher = new_hasher;
+
+            if existing_size > 0 {
+                info!(
+                    "Verification complete in {:.2}s. Opening network stream for {}...",
+                    hash_start.elapsed().as_secs_f64(),
+                    id_clone
+                );
+            }
+        }
+
+        let mut req = client.get(&url);
+        if existing_size > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_size));
+        }
+
+        let mut res = match req.send().await {
+            Ok(r) => {
+                if r.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                    existing_size = 0;
+                    hasher = Sha256::new();
+                    match client.get(&url).send().await {
+                        Ok(r2) => r2,
+                        Err(e) => {
+                            error!("Download failed for {}: {}", id_clone, e);
+                            state_clone
+                                .active_downloads
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&id_clone);
+                            return;
+                        }
+                    }
+                } else if !r.status().is_success() {
+                    error!(
+                        "Download failed for {} with status: {}",
+                        id_clone,
+                        r.status()
+                    );
+                    state_clone
+                        .active_downloads
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id_clone);
+                    return;
+                } else {
+                    r
+                }
+            }
+            Err(e) => {
+                error!("Download failed for {}: {}", id_clone, e);
+                state_clone
+                    .active_downloads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id_clone);
+                return;
+            }
+        };
+
+        let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        if !is_partial && existing_size > 0 {
+            info!(
+                "Server did not return partial content, restarting download for {}",
+                id_clone
+            );
+            existing_size = 0;
+            hasher = Sha256::new();
+        }
+
+        let mut expected_hash = None;
+        if let Some(etag) = res
+            .headers()
+            .get("X-Linked-Etag")
+            .or_else(|| res.headers().get("ETag"))
+        {
+            let etag_str = etag.to_str().unwrap_or("").trim_matches('"');
+            let clean_etag = etag_str
+                .strip_prefix("W/")
+                .unwrap_or(etag_str)
+                .trim_matches('"');
+            if clean_etag.len() == 64 {
+                expected_hash = Some(clean_etag.to_string());
+            }
+        }
+
+        let total_size = if is_partial {
+            existing_size + res.content_length().unwrap_or(0)
+        } else {
+            res.content_length().unwrap_or(0)
+        };
+
+        {
+            let mut dl = state_clone
+                .active_downloads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(status) = dl.get_mut(&id_clone) {
+                status.total_bytes = total_size;
+                status.bytes_transferred = existing_size; // SHOW PROGRESS IMMEDIATELY
+                status.state = "Downloading...".to_string();
+            }
+        }
+
+        let mut file = match if is_partial && existing_size > 0 {
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&tmp_file_path)
+                .await
+        } else {
+            tokio::fs::File::create(&tmp_file_path).await
+        } {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to open/create file for {}: {}", id_clone, e);
+                state_clone
+                    .active_downloads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&id_clone);
+                return;
+            }
+        };
+
+        let start_time = std::time::Instant::now();
+        let mut downloaded: u64 = existing_size;
+        let mut stream_error = false;
+
+        use tokio::io::AsyncWriteExt;
+
+        while let Some(chunk) = res.chunk().await.transpose() {
+            match chunk {
+                Ok(bytes) => {
+                    hasher.update(&bytes);
+                    if let Err(e) = file.write_all(&bytes).await {
+                        error!("Failed to write to file for {}: {}", id_clone, e);
+                        stream_error = true;
+                        break;
+                    }
+                    downloaded += bytes.len() as u64;
+
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (downloaded.saturating_sub(existing_size)) as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+
+                    let mut dl = state_clone
+                        .active_downloads
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(status) = dl.get_mut(&id_clone) {
+                        status.bytes_transferred = downloaded;
+                        status.current_speed_bps = speed;
+                        status.state = "Downloading...".to_string();
+                    }
+                }
+                Err(e) => {
+                    error!("Error while streaming {}: {}", id_clone, e);
+                    stream_error = true;
+                    break;
+                }
+            }
+        }
+
+        // Explicitly drop the file handle so Windows allows us to rename/delete it
+        drop(file);
+
+        if !stream_error {
+            let final_hash = hex::encode(hasher.finalize());
+            if let Some(expected) = expected_hash {
+                if final_hash != expected {
+                    warn!(
+                        "Checksum mismatch for {}. Expected {}, got {}. Saving anyway; CDN ETags may differ from raw SHA256.",
+                        id_clone, expected, final_hash
+                    );
+                } else {
+                    info!("Checksum validated successfully for {}.", id_clone);
+                }
+            } else {
+                info!(
+                    "No SHA-256 ETag found for {}. Saving. Computed: {}",
+                    id_clone, final_hash
+                );
+            }
+        }
+
+        if stream_error {
+            info!(
+                "Network interrupted. Kept partial temp file for {} to resume later.",
+                id_clone
+            );
+        } else {
+            let _ = tokio::fs::rename(&tmp_file_path, &file_path).await;
+            info!("Finished downloading {}", id_clone);
+            manager::set_model_downloaded(&id_clone, true).await;
+        }
+
+        let mut dl = state_clone
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        dl.remove(&id_clone);
+    });
+
+    (StatusCode::ACCEPTED, format!("Download started for {}", id)).into_response()
+}
+
+// Delete a downloaded model from disk
+pub(crate) async fn delete_model(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            "Admin access required for deleting models",
+        )
+            .into_response();
+    }
+
+    let registry = get_model_registry().await;
+    let model = match registry.into_iter().find(|m| m.id == id) {
+        Some(m) => m,
+        None => return (StatusCode::NOT_FOUND, "Model not found").into_response(),
+    };
+
+    let file_path = format!("downloads/{}", model.filename);
+    let tmp_file_path = format!("{}.tmp", file_path);
+    let mut deleted = false;
+
+    if std::path::Path::new(&file_path).exists() {
+        let _ = tokio::fs::remove_file(&file_path).await;
+        deleted = true;
+    }
+    if std::path::Path::new(&tmp_file_path).exists() {
+        let _ = tokio::fs::remove_file(&tmp_file_path).await;
+        deleted = true;
+    }
+
+    if deleted {
+        {
+            let mut status = lock_status(&state.engine_status);
+            status.model_health.remove(&id);
+        }
+        manager::set_model_downloaded(&id, false).await;
+        info!("Deleted model {} from disk", id);
+    }
+    (StatusCode::OK, "Model deleted").into_response()
 }
 
 // The Automated Benchmark Trigger
@@ -1415,6 +1806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_buffer: memory_buffer,
         log_reload_handle,
         current_log_level: Arc::new(Mutex::new(config.log_level_memory.clone())),
+        active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
         db: db_client.clone(),
     });
 
@@ -1633,6 +2025,7 @@ mod tests {
             )))),
             log_reload_handle,
             current_log_level: Arc::new(Mutex::new("info".to_string())),
+            active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
             db,
         })
     }
@@ -1959,5 +2352,77 @@ mod tests {
         )
         .await;
         assert_eq!(res1_retry, Ok(StatusCode::OK));
+    }
+
+    #[tokio::test]
+    async fn test_get_download_progress() {
+        let state = create_test_app_state().await;
+
+        // Initially empty
+        let Json(progress) = get_download_progress(State(state.clone())).await;
+        assert!(progress.is_empty());
+
+        // Insert mock progress
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert(
+                "test-model".to_string(),
+                DownloadStatus {
+                    bytes_transferred: 50,
+                    total_bytes: 100,
+                    start_time: 123456789,
+                    current_speed_bps: 10.0,
+                    state: "Downloading...".to_string(),
+                },
+            );
+        }
+
+        // Fetch again and verify
+        let Json(progress) = get_download_progress(State(state.clone())).await;
+        assert_eq!(progress.len(), 1);
+        let status = progress.get("test-model").unwrap();
+        assert_eq!(status.bytes_transferred, 50);
+        assert_eq!(status.total_bytes, 100);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_download_validation() {
+        let state = create_test_app_state().await;
+        let admin_user = mock_user("admin@local", true);
+        let normal_user = mock_user("user@local", false);
+
+        // 1. Non-admin should be rejected (403)
+        let res = trigger_download(
+            State(state.clone()),
+            normal_user,
+            Path("llama-3.1-8b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // 2. Admin requesting non-existent model should fail (404)
+        let res = trigger_download(
+            State(state.clone()),
+            admin_user.clone(),
+            Path("fake-model-id".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // 3. Admin requesting an already active download should fail (409)
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("llama-3.1-8b".to_string(), DownloadStatus::default());
+        }
+        let res = trigger_download(
+            State(state.clone()),
+            admin_user.clone(),
+            Path("llama-3.1-8b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 }
