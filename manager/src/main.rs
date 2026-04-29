@@ -628,6 +628,27 @@ pub(crate) async fn delete_model(
             .into_response();
     }
 
+    {
+        let downloads = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if downloads.contains_key(&id) {
+            return (
+                StatusCode::CONFLICT,
+                "Cannot delete a model while it is downloading.",
+            )
+                .into_response();
+        }
+    }
+
+    {
+        let status = lock_status(&state.engine_status);
+        if status.models_vram.iter().any(|m| m.id == id) {
+            return (StatusCode::CONFLICT, "Cannot delete a model while it is loaded in memory. Please load a different model first to free the VRAM.").into_response();
+        }
+    }
+
     let registry = get_model_registry().await;
     let model = match registry.into_iter().find(|m| m.id == id) {
         Some(m) => m,
@@ -2355,6 +2376,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
     async fn test_get_download_progress() {
         let state = create_test_app_state().await;
 
@@ -2386,6 +2408,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
     async fn test_trigger_download_validation() {
         let state = create_test_app_state().await;
         let admin_user = mock_user("admin@local", true);

@@ -199,12 +199,15 @@ window.startDownload = async function(modelId) {
             const activeDls = await progCheck.json();
             
             if (!activeDls[modelId]) {
-                const res = await fetch(`/api/models/${modelId}/download`, { method: 'POST' });
-                if (res.status === 401) { window.location.href = '/auth/login'; return; }
-                if (!res.ok && res.status !== 409) {
-                    updateDownloadStatusText(modelId, `Failed to start. Retrying in 5s...`);
-                    await sleep(5000, modelId);
-                    continue;
+                try {
+                    await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'POST' });
+                } catch (e) {
+                    if (e.message === 'Unauthorized') return;
+                    if (!e.message.includes('409')) {
+                        updateDownloadStatusText(modelId, `Failed to start. Retrying in 5s...`);
+                        await sleep(5000, modelId);
+                        continue;
+                    }
                 }
             }
 

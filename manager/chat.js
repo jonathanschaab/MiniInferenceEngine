@@ -595,13 +595,16 @@ async function startChatDownload(modelId, modelName) {
             const activeDls = await progCheck.json();
             
             if (!activeDls[modelId]) {
-                const res = await fetch(`/api/models/${modelId}/download`, { method: 'POST' });
-                if (res.status === 401) { window.location.href = '/auth/login'; return; }
-                if (!res.ok && res.status !== 409) { 
-                    const stats = document.getElementById(`dl-stats-${modelId}`);
-                    if (stats) stats.innerText = `Failed to start. Retrying in 5s...`;
-                    await sleep(5000);
-                    continue;
+                try {
+                    await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'POST' });
+                } catch (e) {
+                    if (e.message === 'Unauthorized') return;
+                    if (!e.message.includes('409')) {
+                        const stats = document.getElementById(`dl-stats-${modelId}`);
+                        if (stats) stats.innerText = `Failed to start. Retrying in 5s...`;
+                        await sleep(5000);
+                        continue;
+                    }
                 }
             }
 
