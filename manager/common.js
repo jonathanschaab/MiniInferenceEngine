@@ -77,58 +77,48 @@ function downloadModel(modelId, callbacks = {}) {
                     }
                 }
 
-                await new Promise((resolve, reject) => {
-                    const interval = setInterval(async () => {
-                        if (isCanceled) {
-                            clearInterval(interval);
-                            reject(new Error("Canceled"));
-                            return;
+                while (!isCanceled) {
+                    const progRes = await fetchWithAuth('/api/models/download/progress');
+                    const downloads = await progRes.json();
+                    const status = downloads[modelId];
+                    
+                    if (status) {
+                        const pct = status.total_bytes > 0 ? (status.bytes_transferred / status.total_bytes) * 100 : 0;
+                        const speedMB = (status.current_speed_bps / 1024 / 1024).toFixed(1);
+                        const transMB = (status.bytes_transferred / 1024 / 1024).toFixed(1);
+                        const totalMB = (status.total_bytes / 1024 / 1024).toFixed(1);
+                        
+                        let etaStr = "Calculating...";
+                        if (status.current_speed_bps > 0 && status.total_bytes > 0) {
+                            const bytesLeft = status.total_bytes - status.bytes_transferred;
+                            const secsLeft = bytesLeft / status.current_speed_bps;
+                            etaStr = secsLeft > 60 ? `${Math.floor(secsLeft/60)}m ${Math.round(secsLeft%60)}s` : `${Math.round(secsLeft)}s`;
                         }
                         
-                        try {
-                            const progRes = await fetchWithAuth('/api/models/download/progress');
-                            const downloads = await progRes.json();
-                            const status = downloads[modelId];
-                            
-                            if (status) {
-                                const pct = status.total_bytes > 0 ? (status.bytes_transferred / status.total_bytes) * 100 : 0;
-                                const speedMB = (status.current_speed_bps / 1024 / 1024).toFixed(1);
-                                const transMB = (status.bytes_transferred / 1024 / 1024).toFixed(1);
-                                const totalMB = (status.total_bytes / 1024 / 1024).toFixed(1);
-                                
-                                let etaStr = "Calculating...";
-                                if (status.current_speed_bps > 0 && status.total_bytes > 0) {
-                                    const bytesLeft = status.total_bytes - status.bytes_transferred;
-                                    const secsLeft = bytesLeft / status.current_speed_bps;
-                                    etaStr = secsLeft > 60 ? `${Math.floor(secsLeft/60)}m ${Math.round(secsLeft%60)}s` : `${Math.round(secsLeft)}s`;
-                                }
-                                
-                                if (callbacks.onProgress) {
-                                    callbacks.onProgress(status, pct, speedMB, transMB, totalMB, etaStr);
-                                }
-                            } else {
-                                clearInterval(interval);
-                                
-                                const verifyRes = await fetchWithAuth('/api/models');
-                                const verifyModels = await verifyRes.json();
-                                const verifyModel = verifyModels.find(m => m.id === modelId);
-                                
-                                if (verifyModel && verifyModel.is_downloaded) {
-                                    if (callbacks.onStatusText) callbacks.onStatusText('Download Complete!');
-                                    if (callbacks.onComplete) callbacks.onComplete();
-                                    setTimeout(() => resolve(), 500);
-                                } else {
-                                    reject(new Error("Interrupted"));
-                                }
-                            }
-                        } catch (e) {
-                            clearInterval(interval);
-                            reject(e);
+                        if (callbacks.onProgress) {
+                            callbacks.onProgress(status, pct, speedMB, transMB, totalMB, etaStr);
                         }
-                    }, 1000);
-                });
+                        
+                        await sleep(1000);
+                    } else {
+                        const verifyRes = await fetchWithAuth('/api/models');
+                        const verifyModels = await verifyRes.json();
+                        const verifyModel = verifyModels.find(m => m.id === modelId);
+                        
+                        if (verifyModel && verifyModel.is_downloaded) {
+                            if (callbacks.onStatusText) callbacks.onStatusText('Download Complete!');
+                            if (callbacks.onComplete) callbacks.onComplete();
+                            await sleep(500);
+                            return; // Download succeeded!
+                        } else {
+                            throw new Error("Interrupted");
+                        }
+                    }
+                }
 
-                return; // Download succeeded!
+                if (isCanceled) {
+                    throw new Error("Canceled");
+                }
 
             } catch (e) {
                 if (isCanceled) {

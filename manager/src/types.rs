@@ -53,6 +53,8 @@ pub struct EngineStatus {
     pub models_vram: Vec<ModelMemory>,
     #[serde(default)]
     pub model_health: std::collections::HashMap<String, bool>,
+    #[serde(default)]
+    pub downloaded_models: std::collections::HashSet<String>,
 }
 
 impl EngineStatus {

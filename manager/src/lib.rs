@@ -89,16 +89,21 @@ impl ActiveBackend {
     pub async fn load_model(
         &mut self,
         config: &ModelConfig,
+        downloads_dir: &str,
         status: Arc<Mutex<EngineStatus>>,
         strategy: &MemoryStrategy,
         required_ctx: usize,
     ) -> Result<usize, String> {
         match self {
             #[cfg(feature = "backend-candle")]
-            ActiveBackend::Candle(b) => b.load_model(config, status, strategy, required_ctx).await,
+            ActiveBackend::Candle(b) => {
+                b.load_model(config, downloads_dir, status, strategy, required_ctx)
+                    .await
+            }
             #[cfg(feature = "backend-llamacpp")]
             ActiveBackend::LlamaCpp(b) => {
-                b.load_model(config, status, strategy, required_ctx).await
+                b.load_model(config, downloads_dir, status, strategy, required_ctx)
+                    .await
             }
         }
     }
@@ -200,6 +205,7 @@ pub async fn run_batcher_loop(
     status: Arc<Mutex<EngineStatus>>,
     telemetry: Arc<Mutex<TelemetryStore>>,
     gpu_device_index: u32,
+    downloads_directory: String,
 ) {
     let nvml = Nvml::init().ok();
 
@@ -438,6 +444,7 @@ pub async fn run_batcher_loop(
             let actual_context = match backend
                 .load_model(
                     &config,
+                    &downloads_directory,
                     status.clone(),
                     &active_memory_strategy,
                     target_allocated_ctx,
@@ -690,6 +697,7 @@ pub async fn run_batcher_loop(
             if let Err(e) = comp_backend
                 .load_model(
                     &comp_config,
+                    &downloads_directory,
                     status.clone(),
                     &MemoryStrategy::Offload,
                     comp_required_ctx,

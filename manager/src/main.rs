@@ -77,6 +77,8 @@ pub struct AppConfig {
     pub log_level_memory: String,
     #[serde(default = "default_log_file_name")]
     pub log_file_name: String,
+    #[serde(default = "default_downloads_directory")]
+    pub downloads_directory: String,
     #[serde(default)]
     pub database: DatabaseConfig,
 }
@@ -109,6 +111,10 @@ fn default_telemetry_retention_days() -> u64 {
     30
 }
 
+fn default_downloads_directory() -> String {
+    "downloads".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -127,6 +133,7 @@ impl Default for AppConfig {
             log_level_file: default_log_level_file(),
             log_level_memory: default_log_level_memory(),
             log_file_name: default_log_file_name(),
+            downloads_directory: default_downloads_directory(),
             database: DatabaseConfig::default(),
         }
     }
@@ -226,8 +233,16 @@ pub(crate) async fn serve_ui(
 }
 
 // Send the model roster to the Javascript dropdowns
-pub(crate) async fn get_models() -> Json<Vec<ModelConfig>> {
-    Json(get_model_registry().await)
+pub(crate) async fn get_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelConfig>> {
+    let mut models = get_model_registry().await;
+    let status = lock_status(&state.engine_status);
+    let downloaded_ids = &status.downloaded_models;
+
+    for model in &mut models {
+        model.is_downloaded = downloaded_ids.contains(&model.id);
+    }
+
+    Json(models)
 }
 
 // Handle incoming chat requests
@@ -377,11 +392,12 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
     let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, filename);
     let client = &state.reqwest_client;
 
-    if let Err(e) = tokio::fs::create_dir_all("downloads").await {
+    let downloads_dir = &state.config.downloads_directory;
+    if let Err(e) = tokio::fs::create_dir_all(downloads_dir).await {
         error!("Failed to create downloads directory for {}: {}", id, e);
         return;
     }
-    let file_path = format!("downloads/{}", filename);
+    let file_path = format!("{}/{}", downloads_dir, filename);
     let tmp_file_path = format!("{}.tmp", file_path);
     let meta_file_path = format!("{}.meta", file_path);
 
@@ -533,6 +549,11 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
     let mut downloaded: u64 = existing_size;
     let mut stream_error = false;
     let mut last_meta_save = std::time::Instant::now();
+    let mut last_ui_update = std::time::Instant::now();
+    let mut bytes_since_last_ui_update = 0;
+
+    let update_interval_ms = 500;
+    let update_bytes_threshold = 1024 * 1024; // 1 MB
 
     use tokio::io::AsyncWriteExt;
 
@@ -548,24 +569,32 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
                     break;
                 }
                 downloaded += bytes.len() as u64;
+                bytes_since_last_ui_update += bytes.len() as u64;
 
-                let elapsed = start_time.elapsed().as_secs_f64();
-                let speed = if elapsed > 0.0 {
-                    (downloaded.saturating_sub(existing_size)) as f64 / elapsed
-                } else {
-                    0.0
-                };
-
+                if last_ui_update.elapsed().as_millis() >= update_interval_ms
+                    || bytes_since_last_ui_update >= update_bytes_threshold
                 {
-                    let mut dl = state
-                        .active_downloads
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Some(status) = dl.get_mut(&id) {
-                        status.bytes_transferred = downloaded;
-                        status.current_speed_bps = speed;
-                        status.state = "Downloading...".to_string();
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (downloaded.saturating_sub(existing_size)) as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+
+                    {
+                        let mut dl = state
+                            .active_downloads
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if let Some(status) = dl.get_mut(&id) {
+                            status.bytes_transferred = downloaded;
+                            status.current_speed_bps = speed;
+                            status.state = "Downloading...".to_string();
+                        }
                     }
+
+                    last_ui_update = std::time::Instant::now();
+                    bytes_since_last_ui_update = 0;
                 }
 
                 if last_meta_save.elapsed().as_secs() > 5 {
@@ -666,7 +695,10 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
         } else {
             let _ = tokio::fs::remove_file(&meta_file_path).await;
             info!("Finished downloading {}", id);
-            manager::set_model_downloaded(&id, true).await;
+            {
+                let mut status = lock_status(&state.engine_status);
+                status.downloaded_models.insert(id.clone());
+            }
         }
     }
 }
@@ -730,21 +762,19 @@ pub(crate) async fn delete_model(
         None => return (StatusCode::NOT_FOUND, "Model not found").into_response(),
     };
 
-    let file_path = format!("downloads/{}", model.filename);
+    let downloads_dir = &state.config.downloads_directory;
+    let file_path = format!("{}/{}", downloads_dir, model.filename);
     let tmp_file_path = format!("{}.tmp", file_path);
     let meta_file_path = format!("{}.meta", file_path);
     let mut deleted = false;
 
-    if std::path::Path::new(&file_path).exists() {
-        let _ = tokio::fs::remove_file(&file_path).await;
+    if tokio::fs::remove_file(&file_path).await.is_ok() {
         deleted = true;
     }
-    if std::path::Path::new(&tmp_file_path).exists() {
-        let _ = tokio::fs::remove_file(&tmp_file_path).await;
+    if tokio::fs::remove_file(&tmp_file_path).await.is_ok() {
         deleted = true;
     }
-    if std::path::Path::new(&meta_file_path).exists() {
-        let _ = tokio::fs::remove_file(&meta_file_path).await;
+    if tokio::fs::remove_file(&meta_file_path).await.is_ok() {
         deleted = true;
     }
 
@@ -752,8 +782,8 @@ pub(crate) async fn delete_model(
         {
             let mut status = lock_status(&state.engine_status);
             status.model_health.remove(&id);
+            status.downloaded_models.remove(&id);
         }
-        manager::set_model_downloaded(&id, false).await;
         info!("Deleted model {} from disk", id);
     }
     (StatusCode::OK, "Model deleted").into_response()
@@ -917,7 +947,7 @@ pub(crate) async fn trigger_benchmark(
         for size in sorted_sizes {
             let filename = format!("benchmark_prompts/prompt_{}.txt", size);
 
-            if !std::path::Path::new(&filename).exists() {
+            if !tokio::fs::try_exists(&filename).await.unwrap_or(false) {
                 let mut should_save = false;
                 let mut final_content = String::new();
 
@@ -1853,12 +1883,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Boot up the GPU Orchestrator in the background
     let batcher_gpu_idx = config.gpu_device_index;
+    let downloads_dir = config.downloads_directory.clone();
     tokio::spawn(async move {
         run_batcher_loop(
             rx,
             status_for_batcher,
             telemetry_for_batcher,
             batcher_gpu_idx,
+            downloads_dir,
         )
         .await;
     });
@@ -1892,8 +1924,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Eagerly initialize the model registry in the background
-    tokio::spawn(async {
-        manager::get_model_registry().await;
+    let engine_status_for_init = engine_status.clone();
+    let downloads_dir_for_init = config.downloads_directory.clone();
+    tokio::spawn(async move {
+        let models = manager::get_model_registry().await;
+        let cache = hf_hub::Cache::default();
+        let mut downloaded_ids = Vec::new();
+        for model in models {
+            let local_path = format!("{}/{}", downloads_dir_for_init, model.filename);
+            let is_in_hf_cache = cache
+                .repo(hf_hub::Repo::model(model.repo.clone()))
+                .get(&model.filename)
+                .is_some();
+            if tokio::fs::try_exists(&local_path).await.unwrap_or(false) || is_in_hf_cache {
+                downloaded_ids.push(model.id);
+            }
+        }
+
+        let mut status = lock_status(&engine_status_for_init);
+        for id in downloaded_ids {
+            status.downloaded_models.insert(id);
+        }
+        info!(
+            "Found {} downloaded models on disk.",
+            status.downloaded_models.len()
+        );
     });
 
     let shared_state = Arc::new(AppState {

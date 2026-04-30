@@ -134,6 +134,7 @@ pub struct ModelConfig {
     pub is_default_compressor: bool,
     pub provenance: std::collections::HashMap<String, String>,
     #[serde(default)]
+    #[serde(skip_serializing)]
     pub is_downloaded: bool,
 }
 
@@ -444,15 +445,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                     check_override(num_experts_per_tok.is_some(), "num_experts_per_tok");
                     check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
 
-                let mut is_downloaded = false;
-                let local_path = format!("downloads/{}", reg.filename);
-
-                // 1. Check if GGUF is cached locally to get exact size instantly
-                let cached_meta = if let Ok(meta) = tokio::fs::metadata(&local_path).await {
-                    is_downloaded = true;
-                    Some(meta)
-                } else if let Some(gguf_path) = cache.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename) {
-                    is_downloaded = true;
+                let cached_meta = if let Some(gguf_path) = cache.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename) {
                     tokio::fs::metadata(&gguf_path).await.ok()
                 } else {
                     None
@@ -684,7 +677,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                         non_layer_params_billions: reg.non_layer_params_billions,
                         size_on_disk_gb: size_on_disk_gb.unwrap_or(fallback_size_gb),
                         provenance,
-                        is_downloaded,
+                        is_downloaded: false, // This will be populated at runtime by the orchestrator
                     }
                 }));
             }
@@ -708,14 +701,6 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
 pub async fn get_model_registry() -> Vec<ModelConfig> {
     let lock = get_registry_lock().await;
     lock.read().await.clone()
-}
-
-pub async fn set_model_downloaded(id: &str, is_downloaded: bool) {
-    let lock = get_registry_lock().await;
-    let mut registry = lock.write().await;
-    if let Some(model) = registry.iter_mut().find(|m| m.id == id) {
-        model.is_downloaded = is_downloaded;
-    }
 }
 
 #[cfg(test)]

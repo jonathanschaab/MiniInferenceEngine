@@ -55,13 +55,14 @@ impl DynamicModel {
 
 pub fn load_engine(
     config: &ModelConfig,
+    downloads_dir: &str,
     device: &Device,
 ) -> Result<(DynamicModel, Tokenizer, Option<std::fs::File>), String> {
     let api = Api::new().map_err(|e| e.to_string())?;
 
     if config.filename.ends_with(".safetensors") {
         let repo = api.model(config.repo.clone());
-        let local_weights = format!("downloads/{}", config.filename);
+        let local_weights = format!("{}/{}", downloads_dir, config.filename);
         let weights_path = if std::path::Path::new(&local_weights).exists() {
             std::path::PathBuf::from(local_weights)
         } else {
@@ -104,7 +105,7 @@ pub fn load_engine(
         return Ok((DynamicModel::XLMRoberta(model), tokenizer, None));
     }
 
-    let local_weights = format!("downloads/{}", config.filename);
+    let local_weights = format!("{}/{}", downloads_dir, config.filename);
     let weights_path = if std::path::Path::new(&local_weights).exists() {
         std::path::PathBuf::from(local_weights)
     } else {
@@ -496,6 +497,7 @@ impl InferenceBackend for CandleEngine {
     async fn load_model(
         &mut self,
         config: &ModelConfig,
+        downloads_dir: &str,
         status: Arc<Mutex<EngineStatus>>,
         _strategy: &MemoryStrategy,
         _required_ctx: usize,
@@ -513,7 +515,7 @@ impl InferenceBackend for CandleEngine {
             );
         }
 
-        let (m, t, f) = load_engine(config, &self.device)?;
+        let (m, t, f) = load_engine(config, downloads_dir, &self.device)?;
         self.model = Some(m);
         self.tokenizer = Some(t);
         self._file = f;

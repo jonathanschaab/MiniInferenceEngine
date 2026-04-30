@@ -59,6 +59,7 @@ self_cell! {
 enum EngineCommand {
     LoadModel {
         config: Box<ModelConfig>,
+        downloads_dir: String,
         status: Arc<Mutex<EngineStatus>>,
         strategy: MemoryStrategy,
         required_ctx: usize,
@@ -273,6 +274,7 @@ impl LlamaCppEngine {
                 match cmd {
                     EngineCommand::LoadModel {
                         config,
+                        downloads_dir,
                         status,
                         strategy,
                         required_ctx,
@@ -281,7 +283,7 @@ impl LlamaCppEngine {
                         let res = (|| -> Result<(usize, f32), String> {
                             let api = Api::new().map_err(|e| e.to_string())?;
                             let repo = api.model(config.repo.clone());
-                            let local_weights = format!("downloads/{}", config.filename);
+                            let local_weights = format!("{}/{}", downloads_dir, config.filename);
                             let weights_path = if std::path::Path::new(&local_weights).exists() {
                                 std::path::PathBuf::from(local_weights)
                             } else {
@@ -576,6 +578,7 @@ impl InferenceBackend for LlamaCppEngine {
     async fn load_model(
         &mut self,
         config: &ModelConfig,
+        downloads_dir: &str,
         status: Arc<Mutex<EngineStatus>>,
         strategy: &MemoryStrategy,
         required_ctx: usize,
@@ -584,6 +587,7 @@ impl InferenceBackend for LlamaCppEngine {
         self.command_tx
             .send(EngineCommand::LoadModel {
                 config: Box::new(config.clone()),
+                downloads_dir: downloads_dir.to_string(),
                 status,
                 strategy: strategy.clone(),
                 required_ctx,
