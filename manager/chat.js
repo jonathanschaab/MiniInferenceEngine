@@ -580,7 +580,10 @@ async function startChatDownload(modelId, modelName) {
             </div>
                 <div style="display: flex; justify-content: space-between; max-width: 300px; align-items: center; margin-top: 5px;">
                     <div id="dl-stats-${modelId}" style="font-size: 0.75rem; color: #a6adc8;">Starting...</div>
-                    <button id="dl-cancel-${modelId}" style="padding: 4px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Cancel</button>
+                    <div style="display: flex; gap: 5px;">
+                        <button id="dl-pause-${modelId}" style="padding: 4px 8px; background: #f9e2af; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Pause</button>
+                        <button id="dl-cancel-${modelId}" style="padding: 4px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Cancel</button>
+                    </div>
                 </div>
         </div>
     `;
@@ -588,6 +591,7 @@ async function startChatDownload(modelId, modelName) {
     chatContainer.scrollTop = chatContainer.scrollHeight;
 
     const cancelBtn = document.getElementById(`dl-cancel-${modelId}`);
+    const pauseBtn = document.getElementById(`dl-pause-${modelId}`);
     const dl = downloadModel(modelId, {
         onProgress: (status, pct, speedMB, transMB, totalMB, etaStr) => {
             const bar = document.getElementById(`dl-bar-${modelId}`);
@@ -611,11 +615,15 @@ async function startChatDownload(modelId, modelName) {
             if (bar) bar.style.width = '100%';
             if (stats) stats.innerText = 'Download Complete!';
             if (cancelBtn) cancelBtn.style.display = 'none';
+            if (pauseBtn) pauseBtn.style.display = 'none';
         }
     });
 
     cancelBtn.addEventListener('click', () => {
         dl.cancel();
+    });
+    pauseBtn.addEventListener('click', () => {
+        dl.pause();
     });
 
     await dl.promise;

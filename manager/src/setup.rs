@@ -14,7 +14,7 @@ use crate::{
     serve_common_js, serve_console_js, serve_console_ui, serve_memory_js, serve_memory_ui,
     serve_models_js, serve_models_ui, serve_settings_js, serve_settings_ui, serve_stats_js,
     serve_stats_ui, serve_ui, set_console_loglevel, trigger_benchmark, trigger_download,
-    truncate_chat_messages,
+    pause_download, truncate_chat_messages,
 };
 
 pub async fn init_db(
@@ -191,6 +191,10 @@ pub fn build_engine_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/models/{id}/download",
             post(trigger_download).delete(delete_model),
+        )
+        .route(
+            "/api/models/{id}/pause",
+            post(pause_download),
         )
         .route("/api/status", get(get_status))
         .route("/api/stats/data", get(get_stats_data))

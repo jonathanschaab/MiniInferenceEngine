@@ -154,13 +154,18 @@ async function startDownload(modelId) {
                 </div>
                 <div style="display: flex; justify-content: space-between; align-items: center;">
                     <div class="download-stats" style="font-size: 0.75rem; color: #a6adc8; text-align: left; white-space: nowrap;">Starting...</div>
-                    <button class="dl-cancel-btn" style="padding: 3px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Cancel</button>
+                    <div style="display: flex; gap: 5px;">
+                        <button class="dl-pause-btn" style="padding: 3px 8px; background: #f9e2af; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Pause</button>
+                        <button class="dl-cancel-btn" style="padding: 3px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Cancel</button>
+                    </div>
                 </div>
             `;
             rightCol.prepend(progressDiv);
         } else {
             const cancelBtn = progressDiv.querySelector('.dl-cancel-btn');
             if (cancelBtn) cancelBtn.style.display = 'block';
+            const pauseBtn = progressDiv.querySelector('.dl-pause-btn');
+            if (pauseBtn) pauseBtn.style.display = 'block';
         }
     }
 
@@ -192,6 +197,9 @@ async function startDownload(modelId) {
             
             const cancelBtn = card ? card.querySelector('.dl-cancel-btn') : null;
             if (cancelBtn) cancelBtn.style.display = 'none';
+
+            const pauseBtn = card ? card.querySelector('.dl-pause-btn') : null;
+            if (pauseBtn) pauseBtn.style.display = 'none';
         }
     });
 
@@ -204,12 +212,21 @@ async function startDownload(modelId) {
         });
     }
 
+    const pauseBtn = card.querySelector('.dl-pause-btn');
+    if (pauseBtn) {
+        const newPauseBtn = pauseBtn.cloneNode(true);
+        pauseBtn.parentNode.replaceChild(newPauseBtn, pauseBtn);
+        newPauseBtn.addEventListener('click', () => {
+            dl.pause();
+        });
+    }
+
     activeDownloads.set(modelId, dl);
 
     try {
         await dl.promise;
     } catch (e) {
-        if (e.message !== "Canceled" && e.message !== "Download canceled by user.") {
+        if (e.message !== "Canceled" && e.message !== "Download canceled by user." && e.message !== "Download paused by user.") {
             console.error(`Download failed for ${modelId}:`, e);
         }
     } finally {

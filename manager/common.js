@@ -36,14 +36,16 @@ function getGenerationParameters() {
  * @param {Function} [callbacks.onProgress] - Called with (status, pct, speedMB, transMB, totalMB, etaStr).
  * @param {Function} [callbacks.onStatusText] - Called with string status updates.
  * @param {Function} [callbacks.onComplete] - Called when the download successfully completes.
- * @returns {Object} An object containing a `promise` that resolves when complete, and a `cancel` method.
+ * @returns {Object} An object containing a `promise` that resolves when complete, and `cancel`/`pause` methods.
  */
 /* eslint-disable-next-line no-unused-vars -- Called by: chat.js and models.js */
 function downloadModel(modelId, callbacks = {}) {
-    let isCanceled = false;
+    let isStopped = false;
+    let stopReason = null;
 
     const cancel = async () => {
-        isCanceled = true;
+        isStopped = true;
+        stopReason = "Canceled";
         try {
             await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
         } catch (e) {
@@ -51,15 +53,25 @@ function downloadModel(modelId, callbacks = {}) {
         }
     };
 
+    const pause = async () => {
+        isStopped = true;
+        stopReason = "Paused";
+        try {
+            await fetchWithAuth(`/api/models/${modelId}/pause`, { method: 'POST' });
+        } catch (e) {
+            console.error("Failed to send pause request to server:", e);
+        }
+    };
+
     async function sleep(ms) {
         for (let i = 0; i < ms; i += 100) {
-            if (isCanceled) return;
+            if (isStopped) return;
             await new Promise(r => setTimeout(r, 100));
         }
     }
 
     const promise = (async () => {
-        while (!isCanceled) {
+        while (!isStopped) {
             try {
                 const progCheck = await fetchWithAuth('/api/models/download/progress');
                 const activeDls = await progCheck.json();
@@ -77,7 +89,7 @@ function downloadModel(modelId, callbacks = {}) {
                     }
                 }
 
-                while (!isCanceled) {
+                while (!isStopped) {
                     const progRes = await fetchWithAuth('/api/models/download/progress');
                     const downloads = await progRes.json();
                     const status = downloads[modelId];
@@ -116,14 +128,13 @@ function downloadModel(modelId, callbacks = {}) {
                     }
                 }
 
-                if (isCanceled) {
-                    throw new Error("Canceled");
+                if (isStopped) {
+                    break;
                 }
 
             } catch (e) {
-                if (isCanceled) {
-                    if (callbacks.onStatusText) callbacks.onStatusText('Download Canceled.');
-                    throw new Error("Download canceled by user.");
+                if (isStopped) {
+                    break;
                 }
                 if (callbacks.onStatusText) callbacks.onStatusText('Download Interrupted. Retrying in 5s...');
                 console.error(`Download ${modelId} interrupted, retrying in 5s...`, e);
@@ -131,11 +142,16 @@ function downloadModel(modelId, callbacks = {}) {
             }
         }
         
-        if (callbacks.onStatusText) callbacks.onStatusText('Download Canceled.');
-        throw new Error("Download canceled by user.");
+        if (stopReason === "Paused") {
+            if (callbacks.onStatusText) callbacks.onStatusText('Download Paused.');
+            throw new Error("Download paused by user.");
+        } else {
+            if (callbacks.onStatusText) callbacks.onStatusText('Download Canceled.');
+            throw new Error("Download canceled by user.");
+        }
     })();
 
-    return { promise, cancel };
+    return { promise, cancel, pause };
 }
 
 /**

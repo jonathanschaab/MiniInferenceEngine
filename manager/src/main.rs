@@ -312,13 +312,29 @@ pub(crate) async fn trigger_download(
             .into_response();
     }
 
+    {
+        let status = lock_status(&state.engine_status);
+        if status.models_vram.iter().any(|m| m.id == id) {
+            return (
+                StatusCode::CONFLICT,
+                "Cannot download a model that is currently loaded in VRAM. Please load a different model first.",
+            )
+                .into_response();
+        }
+    }
+
     let registry = get_model_registry().await;
     let model = match registry.into_iter().find(|m| m.id == id) {
         Some(m) => m,
         None => return (StatusCode::NOT_FOUND, "Model not found").into_response(),
     };
 
-    if model.is_downloaded {
+    let is_downloaded = {
+        let status = lock_status(&state.engine_status);
+        status.downloaded_models.contains(&id)
+    };
+
+    if is_downloaded {
         return (StatusCode::CONFLICT, "Model is already downloaded").into_response();
     }
 
@@ -361,6 +377,44 @@ pub(crate) async fn trigger_download(
         .insert(id.clone(), task);
 
     (StatusCode::ACCEPTED, format!("Download started for {}", id)).into_response()
+}
+
+// Pause an active download without deleting the partial files
+pub(crate) async fn pause_download(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            "Admin access required for pausing downloads",
+        )
+            .into_response();
+    }
+
+    let download_task = {
+        let mut tasks = state
+            .download_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tasks.remove(&id)
+    };
+
+    if let Some(task) = download_task {
+        task.abort();
+        let _ = task.await; // Wait for the task to finish cancelling
+        info!("Aborted active download task for model {} (Paused)", id);
+
+        let mut dl = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        dl.remove(&id);
+        (StatusCode::OK, "Download paused").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "No active download to pause").into_response()
+    }
 }
 
 struct DownloadCleanupGuard {
