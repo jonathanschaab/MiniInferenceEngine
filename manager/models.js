@@ -49,7 +49,7 @@ async function loadModels() {
 
             let adminDeleteBtn = '';
             if (isAdmin && model.is_downloaded) {
-                adminDeleteBtn = `<button class="btn-cancel" style="padding: 5px 10px; font-size: 0.85rem;" onclick="deleteModel('${model.id}')">🗑️ Delete</button>`;
+                adminDeleteBtn = `<button class="btn-delete btn-cancel" style="padding: 5px 10px; font-size: 0.85rem;">🗑️ Delete</button>`;
             }
 
             const downloadBtnHtml = model.is_downloaded
@@ -93,6 +93,11 @@ async function loadModels() {
                 downloadBtn.addEventListener('click', () => startDownload(model.id));
             }
 
+            const deleteBtn = card.querySelector('.btn-delete');
+            if (deleteBtn) {
+                deleteBtn.addEventListener('click', () => deleteModel(model.id));
+            }
+
             container.appendChild(card);
         });
     } catch (e) {
@@ -128,7 +133,7 @@ async function discoverActiveDownloads() {
     }
 }
 
-window.startDownload = async function(modelId) {
+async function startDownload(modelId) {
     if (activeDownloads.has(modelId)) return;
     
     let card = document.getElementById(`model-card-${modelId}`);
@@ -213,7 +218,7 @@ window.startDownload = async function(modelId) {
     }
 };
 
-window.deleteModel = async function(modelId) {
+async function deleteModel(modelId) {
     if (!confirm(`Are you sure you want to permanently delete the weights for ${modelId} from disk?`)) return;
     try {
         const res = await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });

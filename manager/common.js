@@ -68,7 +68,7 @@ function downloadModel(modelId, callbacks = {}) {
                     try {
                         await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'POST' });
                     } catch (e) {
-                        if (e.message === 'Unauthorized') return;
+                        if (e.message === 'Unauthorized') throw e;
                         if (!e.message.includes('409')) {
                             if (callbacks.onStatusText) callbacks.onStatusText(`Failed to start. Retrying in 5s...`);
                             await sleep(5000);
