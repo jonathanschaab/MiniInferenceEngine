@@ -100,36 +100,31 @@ async function loadModels() {
     }
 }
 
-let activePollInterval = null;
 const activeDownloads = new Map();
 
-async function pollDownloads() {
+/**
+ * Discovers downloads that might be active on the server (e.g., from a previous session or another tab)
+ * and initializes the UI and polling for them on the current page. This runs periodically.
+ */
+async function discoverActiveDownloads() {
     try {
         const res = await fetchWithAuth('/api/models/download/progress');
         if (!res.ok) return;
         const downloads = await res.json();
         
         const activeIds = Object.keys(downloads);
-        
-        if (activeIds.length > 0) {
-            activeIds.forEach(id => {
+
+        activeIds.forEach(id => {
+            // If a download is active on the server but not tracked on this page, start tracking it.
+            if (!activeDownloads.has(id)) {
                 const card = document.getElementById(`model-card-${id}`);
-                if (card && !card.querySelector('.download-progress-container')) {
-                    startDownload(id);
+                if (card) { // Check if the model card is rendered on the page
+                    startDownload(id); // This will create the UI and start the poller via downloadModel
                 }
-            });
-            
-            if (!activePollInterval) {
-                activePollInterval = setInterval(pollDownloads, 5000);
             }
-        } else {
-            if (activePollInterval) {
-                clearInterval(activePollInterval);
-                activePollInterval = null;
-            }
-        }
+        });
     } catch (e) {
-        console.error("Polling failed", e);
+        console.error("Failed to discover active downloads:", e);
     }
 }
 
@@ -237,5 +232,6 @@ window.deleteModel = async function(modelId) {
 document.addEventListener('DOMContentLoaded', async () => {
     await checkAdmin();
     loadModels();
-    pollDownloads();
+    discoverActiveDownloads();
+    setInterval(discoverActiveDownloads, 5000);
 });

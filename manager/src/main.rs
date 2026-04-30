@@ -593,8 +593,50 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
     drop(file);
 
     if !stream_error {
-        if existing_size == 0 {
-            let final_hash = hex::encode(hasher.finalize());
+        let final_hash_opt = if existing_size == 0 {
+            Some(hex::encode(hasher.finalize()))
+        } else {
+            {
+                let mut dl = state
+                    .active_downloads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(status) = dl.get_mut(&id) {
+                    status.state = "Verifying...".to_string();
+                }
+            }
+
+            let tmp_file_path_clone = tmp_file_path.clone();
+            let hash_result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+                let mut h = Sha256::new();
+                use std::io::Read;
+                let mut f = std::fs::File::open(&tmp_file_path_clone)?;
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                loop {
+                    let n = f.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    h.update(&buf[..n]);
+                }
+                Ok(hex::encode(h.finalize()))
+            })
+            .await;
+
+            match hash_result {
+                Ok(Ok(hash)) => Some(hash),
+                Ok(Err(e)) => {
+                    error!("Failed to read file for verification {}: {}", id, e);
+                    None
+                }
+                Err(e) => {
+                    error!("Hashing task panicked or was cancelled for {}: {}", id, e);
+                    None
+                }
+            }
+        };
+
+        if let Some(final_hash) = final_hash_opt {
             if let Some(ref expected) = expected_hash {
                 if &final_hash != expected {
                     warn!(
@@ -610,11 +652,6 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
                     id, final_hash
                 );
             }
-        } else {
-            info!(
-                "Resumed download completed successfully for {}. Skipping full checksum validation.",
-                id
-            );
         }
     }
 
@@ -624,10 +661,10 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
             id
         );
     } else {
-        let _ = tokio::fs::remove_file(&meta_file_path).await;
         if let Err(e) = tokio::fs::rename(&tmp_file_path, &file_path).await {
             error!("Failed to rename temp file to final file for {}: {}", id, e);
         } else {
+            let _ = tokio::fs::remove_file(&meta_file_path).await;
             info!("Finished downloading {}", id);
             manager::set_model_downloaded(&id, true).await;
         }

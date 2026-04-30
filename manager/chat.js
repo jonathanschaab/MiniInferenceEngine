@@ -573,7 +573,7 @@ async function startChatDownload(modelId, modelName) {
     const div = document.createElement('div');
     div.className = 'message ai-message';
     div.innerHTML = `
-        <div>Downloading <strong>${modelName}</strong>...</div>
+        <div>Downloading <strong>${DOMPurify.sanitize(modelName)}</strong>...</div>
         <div class="download-progress-container" style="margin-top: 10px;">
             <div style="width: 100%; max-width: 300px; background: #313244; border-radius: 4px; overflow: hidden; border: 1px solid #45475a;">
                 <div id="dl-bar-${modelId}" style="width: 0%; height: 8px; background: #a6e3a1; transition: width 0.5s ease-out;"></div>
