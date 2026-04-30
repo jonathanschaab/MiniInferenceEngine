@@ -1,3 +1,5 @@
+/* global downloadModel */
+
 const chatContainer = document.getElementById('chat-container');
 const inputField = document.getElementById('prompt-input');
 const sendBtn = document.getElementById('send-btn');
@@ -209,12 +211,13 @@ function updateDropdownCompatibility() {
         Array.from(chatSelect.options).forEach(opt => {
             const supported = opt.dataset.backends && opt.dataset.backends.split(',').includes(selectedBackend);
             opt.disabled = !supported;
+            opt.title = supported ? '' : 'Incompatible with selected backend';
         });
-        if (chatSelect.options[chatSelect.selectedIndex]?.disabled) {
-            chatSelect.value = Array.from(chatSelect.options).find(o => !o.disabled)?.value || '';
-        }
     } else {
-        Array.from(chatSelect.options).forEach(opt => opt.disabled = false);
+        Array.from(chatSelect.options).forEach(opt => {
+            opt.disabled = false;
+            opt.title = '';
+        });
     }
 
     // 2. Filter backends based on selected Chat model
@@ -223,16 +226,17 @@ function updateDropdownCompatibility() {
     const chatBackends = chatOpt && chatOpt.dataset.backends ? chatOpt.dataset.backends.split(',') : [];
 
     Array.from(backendSelect.options).forEach(opt => {
-        if (opt.value === '') { opt.disabled = false; return; } // Auto is always allowed
+        if (opt.value === '') { 
+            opt.disabled = false; 
+            opt.title = '';
+            return; 
+        } // Auto is always allowed
         
         let supported = chatOpt && chatBackends.includes(opt.value);
         
         opt.disabled = !supported;
+        opt.title = supported ? '' : 'Incompatible with selected chat model';
     });
-    if (backendSelect.options[backendSelect.selectedIndex]?.disabled) {
-        backendSelect.value = ''; // Fallback to Auto
-        Array.from(chatSelect.options).forEach(opt => opt.disabled = false);
-    }
 }
 
 async function loadSessions() {
@@ -583,122 +587,49 @@ async function startChatDownload(modelId, modelName) {
     chatContainer.appendChild(div);
     chatContainer.scrollTop = chatContainer.scrollHeight;
 
-    let isCanceled = false;
     const cancelBtn = document.getElementById(`dl-cancel-${modelId}`);
-    cancelBtn.addEventListener('click', async () => {
-        isCanceled = true;
-        try {
-            await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
-        } catch (e) {
-            console.error("Failed to send cancel request to server:", e);
+    const dl = downloadModel(modelId, {
+        onProgress: (status, pct, speedMB, transMB, totalMB, etaStr) => {
+            const bar = document.getElementById(`dl-bar-${modelId}`);
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (bar) bar.style.width = `${pct}%`;
+            if (stats) {
+                if (status.state === 'Verifying...') {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | Verifying...`;
+                } else {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
+                }
+            }
+        },
+        onStatusText: (text) => {
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (stats) stats.innerText = text;
+        },
+        onComplete: () => {
+            const bar = document.getElementById(`dl-bar-${modelId}`);
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (bar) bar.style.width = '100%';
+            if (stats) stats.innerText = 'Download Complete!';
+            if (cancelBtn) cancelBtn.style.display = 'none';
         }
     });
 
-    while (!isCanceled) {
-        try {
-            const progCheck = await fetchWithAuth('/api/models/download/progress');
-            const activeDls = await progCheck.json();
-            
-            if (!activeDls[modelId]) {
-                try {
-                    await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'POST' });
-                } catch (e) {
-                    if (e.message === 'Unauthorized') return;
-                    if (!e.message.includes('409')) {
-                        const stats = document.getElementById(`dl-stats-${modelId}`);
-                        if (stats) stats.innerText = `Failed to start. Retrying in 5s...`;
-                        await sleep(5000);
-                        continue;
-                    }
-                }
-            }
+    cancelBtn.addEventListener('click', () => {
+        dl.cancel();
+    });
 
-            await new Promise((resolve, reject) => {
-                const interval = setInterval(async () => {
-                    if (isCanceled) {
-                        clearInterval(interval);
-                        reject(new Error("Canceled"));
-                        return;
-                    }
-                    
-                    try {
-                        const progRes = await fetchWithAuth('/api/models/download/progress');
-                        const downloads = await progRes.json();
-                        const status = downloads[modelId];
-                        
-                        if (status) {
-                            const pct = status.total_bytes > 0 ? (status.bytes_transferred / status.total_bytes) * 100 : 0;
-                            const speedMB = (status.current_speed_bps / 1024 / 1024).toFixed(1);
-                            const transMB = (status.bytes_transferred / 1024 / 1024).toFixed(1);
-                            const totalMB = (status.total_bytes / 1024 / 1024).toFixed(1);
-                            
-                            let etaStr = "Calculating...";
-                            if (status.current_speed_bps > 0 && status.total_bytes > 0) {
-                                const bytesLeft = status.total_bytes - status.bytes_transferred;
-                                const secsLeft = bytesLeft / status.current_speed_bps;
-                                etaStr = secsLeft > 60 ? `${Math.floor(secsLeft/60)}m ${Math.round(secsLeft%60)}s` : `${Math.round(secsLeft)}s`;
-                            }
-                            const bar = document.getElementById(`dl-bar-${modelId}`);
-                            const stats = document.getElementById(`dl-stats-${modelId}`);
-                            if (bar) bar.style.width = `${pct}%`;
-                            if (stats) {
-                                if (status.state === 'Verifying...') {
-                                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | Verifying...`;
-                                } else {
-                                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
-                                }
-                            }
-                        } else {
-                            clearInterval(interval);
-                            
-                            const verifyRes = await fetchWithAuth('/api/models');
-                            const verifyModels = await verifyRes.json();
-                            const verifyModel = verifyModels.find(m => m.id === modelId);
-                            
-                            if (verifyModel && verifyModel.is_downloaded) {
-                                const bar = document.getElementById(`dl-bar-${modelId}`);
-                                const stats = document.getElementById(`dl-stats-${modelId}`);
-                                if (bar) bar.style.width = '100%';
-                                if (stats) stats.innerText = 'Download Complete!';
-                                if (cancelBtn) cancelBtn.style.display = 'none';
-                                setTimeout(() => resolve(), 500);
-                            } else {
-                                reject(new Error("Interrupted"));
-                            }
-                        }
-                    } catch (e) {
-                        clearInterval(interval);
-                        reject(e);
-                    }
-                }, 1000);
-            });
+    await dl.promise;
+}
 
-            return; // Download succeeded!
-
-        } catch (e) {
-            if (isCanceled) {
-                const stats = document.getElementById(`dl-stats-${modelId}`);
-                if (stats) stats.innerText = 'Download Canceled.';
-                throw new Error("Download canceled by user.");
-            }
-            const stats = document.getElementById(`dl-stats-${modelId}`);
-            if (stats) stats.innerText = `Download Interrupted. Retrying in 5s...`;
-            console.error(`Download ${modelId} interrupted, retrying in 5s...`, e);
-            await sleep(5000);
-        }
-    }
-    
-    // If loop exited because of cancellation
-    const stats = document.getElementById(`dl-stats-${modelId}`);
-    if (stats) stats.innerText = 'Download Canceled.';
-    throw new Error("Download canceled by user.");
-
-    async function sleep(ms) {
-        for (let i = 0; i < ms; i += 100) {
-            if (isCanceled) return;
-            await new Promise(r => setTimeout(r, 100));
-        }
-    }
+/**
+ * Resets the chat UI state after generation or upon failure.
+ */
+function resetChatUI() {
+    typingIndicator.style.display = 'none';
+    sendBtn.style.display = 'inline-flex';
+    stopBtn.style.display = 'none';
+    if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
+    sendBtn.disabled = false;
 }
 
 async function sendMessage() {
@@ -720,11 +651,16 @@ async function sendMessage() {
 
 async function requestAiResponse() {
     // Grab the IDs from the UI dropdowns
-    const chatModelId = document.getElementById('chat-model-select').value;
+    const chatSelect = document.getElementById('chat-model-select');
+    const backendSelect = document.getElementById('backend-select');
+    const chatModelId = chatSelect.value;
     const compModelId = document.getElementById('compressor-model-select').value;
-    const targetBackend = document.getElementById('backend-select').value;
 
-    if (!chatModelId || !compModelId) {
+    const targetBackend = backendSelect.value;
+
+    if (!chatModelId || !compModelId || 
+        chatSelect.options[chatSelect.selectedIndex]?.disabled || 
+        backendSelect.options[backendSelect.selectedIndex]?.disabled) {
         alert("Please select a valid chat model and compressor model. Check your backend compatibility if options are disabled.");
         return;
     }
@@ -742,11 +678,7 @@ async function requestAiResponse() {
         try { await startChatDownload(chatModel.id, chatModel.name); chatModel.is_downloaded = true; } 
         catch (e) {
             console.error("Chat model download failed:", e);
-            typingIndicator.style.display = 'none';
-            sendBtn.style.display = 'inline-flex';
-            stopBtn.style.display = 'none';
-            if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
-            sendBtn.disabled = false;
+            resetChatUI();
             return;
         }
     }
@@ -754,11 +686,7 @@ async function requestAiResponse() {
         try { await startChatDownload(compModel.id, compModel.name); compModel.is_downloaded = true; } 
         catch (e) {
             console.error("Compressor model download failed:", e);
-            typingIndicator.style.display = 'none';
-            sendBtn.style.display = 'inline-flex';
-            stopBtn.style.display = 'none';
-            if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
-            sendBtn.disabled = false;
+            resetChatUI();
             return;
         }
     }
@@ -825,16 +753,12 @@ async function requestAiResponse() {
             updateStatus();
             await appendMessageToDB("assistant", aiMessageDiv.textContent, aiIndex);
         } else {
-            typingIndicator.style.display = 'none';
             aiMessageDiv.textContent = "Error: Failed to connect to engine.";
             chatHistory.pop(); 
         }
     }
     
-    sendBtn.style.display = 'inline-flex';
-    stopBtn.style.display = 'none';
-    if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
-    sendBtn.disabled = false;
+    resetChatUI();
     inputField.focus();
     currentAbortController = null;
     

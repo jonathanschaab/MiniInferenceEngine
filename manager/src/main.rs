@@ -339,7 +339,11 @@ pub(crate) async fn trigger_download(
         perform_model_download(state_clone, id_clone, repo, filename).await;
     });
 
-    state.download_tasks.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), task);
+    state
+        .download_tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), task);
 
     (StatusCode::ACCEPTED, format!("Download started for {}", id)).into_response()
 }
@@ -379,10 +383,32 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
     }
     let file_path = format!("downloads/{}", filename);
     let tmp_file_path = format!("{}.tmp", file_path);
+    let meta_file_path = format!("{}.meta", file_path);
 
     let mut existing_size = 0;
-    if let Ok(meta) = tokio::fs::metadata(&tmp_file_path).await {
-        existing_size = meta.len();
+    let mut expected_hash = None;
+
+    if let Ok(meta_str) = tokio::fs::read_to_string(&meta_file_path).await
+        && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str)
+    {
+        if let Some(bytes) = meta.get("downloaded_bytes").and_then(|v| v.as_u64()) {
+            existing_size = bytes;
+        }
+        if let Some(hash) = meta.get("expected_hash").and_then(|v| v.as_str()) {
+            expected_hash = Some(hash.to_string());
+        }
+    }
+
+    if existing_size > 0 {
+        if let Ok(file) = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp_file_path)
+            .await
+        {
+            let _ = file.set_len(existing_size).await;
+        } else {
+            existing_size = 0;
+        }
     }
 
     {
@@ -392,67 +418,11 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
             .unwrap_or_else(|e| e.into_inner());
         if let Some(status) = dl.get_mut(&id) {
             status.bytes_transferred = existing_size;
-            if existing_size > 0 {
-                status.state = "Verifying...".to_string();
-            } else {
-                status.state = "Connecting...".to_string();
-            }
+            status.state = "Connecting...".to_string();
         }
     }
 
     let mut hasher = Sha256::new();
-
-    if existing_size > 0 {
-        info!(
-            "Verifying {} bytes of existing partial download for {}...",
-            existing_size, id
-        );
-        let hash_start = std::time::Instant::now();
-        let tmp_file_path_clone = tmp_file_path.clone();
-
-        let hash_result = tokio::task::spawn_blocking(move || -> std::io::Result<(u64, Sha256)> {
-            let mut h = Sha256::new();
-            use std::io::Read;
-            let mut f = std::fs::File::open(&tmp_file_path_clone)?;
-            let mut buf = vec![0u8; 4 * 1024 * 1024];
-            let mut read_bytes = 0;
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-                read_bytes += n as u64;
-            }
-            Ok((read_bytes, h))
-        })
-        .await;
-
-        match hash_result {
-            Ok(Ok((new_size, new_hasher))) => {
-                existing_size = new_size;
-                hasher = new_hasher;
-            }
-            Ok(Err(e)) => {
-                tracing::error!("Failed to read existing temp file for hashing: {}", e);
-                existing_size = 0;
-                hasher = Sha256::new();
-            }
-            Err(e) => {
-                tracing::error!("Hashing task panicked or was cancelled: {}", e);
-                existing_size = 0;
-                hasher = Sha256::new();
-            }
-        }
-
-        if existing_size > 0 {
-            info!(
-                "Verification complete in {:.2}s. Opening network stream for {}...",
-                hash_start.elapsed().as_secs_f64(),
-                id
-            );
-        }
-    }
 
     let mut req = client.get(&url);
     if existing_size > 0 {
@@ -500,7 +470,6 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
         hasher = Sha256::new();
     }
 
-    let mut expected_hash = None;
     if let Some(etag) = res
         .headers()
         .get("X-Linked-Etag")
@@ -521,6 +490,17 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
     } else {
         res.content_length().unwrap_or(0)
     };
+
+    // Pre-initialize metadata
+    let _ = tokio::fs::write(
+        &meta_file_path,
+        serde_json::json!({
+            "downloaded_bytes": existing_size,
+            "expected_hash": expected_hash
+        })
+        .to_string(),
+    )
+    .await;
 
     {
         let mut dl = state
@@ -552,13 +532,16 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
     let start_time = std::time::Instant::now();
     let mut downloaded: u64 = existing_size;
     let mut stream_error = false;
+    let mut last_meta_save = std::time::Instant::now();
 
     use tokio::io::AsyncWriteExt;
 
     while let Some(chunk) = res.chunk().await.transpose() {
         match chunk {
             Ok(bytes) => {
-                hasher.update(&bytes);
+                if existing_size == 0 {
+                    hasher.update(&bytes);
+                }
                 if let Err(e) = file.write_all(&bytes).await {
                     error!("Failed to write to file for {}: {}", id, e);
                     stream_error = true;
@@ -573,14 +556,29 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
                     0.0
                 };
 
-                let mut dl = state
-                    .active_downloads
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if let Some(status) = dl.get_mut(&id) {
-                    status.bytes_transferred = downloaded;
-                    status.current_speed_bps = speed;
-                    status.state = "Downloading...".to_string();
+                {
+                    let mut dl = state
+                        .active_downloads
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(status) = dl.get_mut(&id) {
+                        status.bytes_transferred = downloaded;
+                        status.current_speed_bps = speed;
+                        status.state = "Downloading...".to_string();
+                    }
+                }
+
+                if last_meta_save.elapsed().as_secs() > 5 {
+                    let _ = tokio::fs::write(
+                        &meta_file_path,
+                        serde_json::json!({
+                            "downloaded_bytes": downloaded,
+                            "expected_hash": expected_hash
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                    last_meta_save = std::time::Instant::now();
                 }
             }
             Err(e) => {
@@ -595,20 +593,27 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
     drop(file);
 
     if !stream_error {
-        let final_hash = hex::encode(hasher.finalize());
-        if let Some(expected) = expected_hash {
-            if final_hash != expected {
-                warn!(
-                    "Checksum mismatch for {}. Expected {}, got {}. Saving anyway; CDN ETags may differ from raw SHA256.",
-                    id, expected, final_hash
-                );
+        if existing_size == 0 {
+            let final_hash = hex::encode(hasher.finalize());
+            if let Some(ref expected) = expected_hash {
+                if &final_hash != expected {
+                    warn!(
+                        "Checksum mismatch for {}. Expected {}, got {}. Saving anyway; CDN ETags may differ from raw SHA256.",
+                        id, expected, final_hash
+                    );
+                } else {
+                    info!("Checksum validated successfully for {}.", id);
+                }
             } else {
-                info!("Checksum validated successfully for {}.", id);
+                info!(
+                    "No SHA-256 ETag found for {}. Saving. Computed: {}",
+                    id, final_hash
+                );
             }
         } else {
             info!(
-                "No SHA-256 ETag found for {}. Saving. Computed: {}",
-                id, final_hash
+                "Resumed download completed successfully for {}. Skipping full checksum validation.",
+                id
             );
         }
     }
@@ -619,6 +624,7 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
             id
         );
     } else {
+        let _ = tokio::fs::remove_file(&meta_file_path).await;
         if let Err(e) = tokio::fs::rename(&tmp_file_path, &file_path).await {
             error!("Failed to rename temp file to final file for {}: {}", id, e);
         } else {
@@ -689,6 +695,7 @@ pub(crate) async fn delete_model(
 
     let file_path = format!("downloads/{}", model.filename);
     let tmp_file_path = format!("{}.tmp", file_path);
+    let meta_file_path = format!("{}.meta", file_path);
     let mut deleted = false;
 
     if std::path::Path::new(&file_path).exists() {
@@ -697,6 +704,10 @@ pub(crate) async fn delete_model(
     }
     if std::path::Path::new(&tmp_file_path).exists() {
         let _ = tokio::fs::remove_file(&tmp_file_path).await;
+        deleted = true;
+    }
+    if std::path::Path::new(&meta_file_path).exists() {
+        let _ = tokio::fs::remove_file(&meta_file_path).await;
         deleted = true;
     }
 

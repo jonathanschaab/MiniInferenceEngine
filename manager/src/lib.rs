@@ -174,6 +174,12 @@ impl ActiveBackend {
     }
 }
 
+/// Helper function to update the health status of a model in the engine status
+pub fn set_model_health(status: &Arc<Mutex<EngineStatus>>, model_id: &str, is_healthy: bool) {
+    let mut s = lock_status(status);
+    s.model_health.insert(model_id.to_string(), is_healthy);
+}
+
 pub fn create_backend(btype: &BackendType, gpu_device_index: u32) -> Result<ActiveBackend, String> {
     match btype {
         #[cfg(feature = "backend-candle")]
@@ -441,9 +447,9 @@ pub async fn run_batcher_loop(
                 Ok(ctx) => ctx,
                 Err(e) => {
                     error!("Chat model load failed: {}", e);
+                    set_model_health(&status, &config.id, false);
                     {
                         let mut s = lock_status(&status);
-                        s.model_health.insert(config.id.clone(), false);
                         s.log_vram(
                             "Fail",
                             "Orchestrator",
@@ -486,11 +492,9 @@ pub async fn run_batcher_loop(
                 active_max_context
             );
 
+            set_model_health(&status, &active_model_id, true);
             {
                 let mut current_status = lock_status(&status);
-                current_status
-                    .model_health
-                    .insert(active_model_id.clone(), true);
                 current_status.active_chat_model_id = Some(active_model_id.clone());
                 current_status.active_backend = Some(target_backend_name);
             }
@@ -692,9 +696,9 @@ pub async fn run_batcher_loop(
                 )
                 .await
             {
+                set_model_health(&status, &comp_config.id, false);
                 {
                     let mut s = lock_status(&status);
-                    s.model_health.insert(comp_config.id.clone(), false);
                     s.log_vram(
                         "Fail",
                         "Orchestrator",
@@ -728,11 +732,9 @@ pub async fn run_batcher_loop(
                 );
             }
 
+            set_model_health(&status, &request.compressor_model_id, true);
             {
                 let mut current_status = lock_status(&status);
-                current_status
-                    .model_health
-                    .insert(request.compressor_model_id.clone(), true);
                 current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
             }
 
@@ -756,11 +758,7 @@ pub async fn run_batcher_loop(
                             "Server Error: Context compression failed: {}",
                             e
                         )));
-                        {
-                            let mut s = lock_status(&status);
-                            s.model_health
-                                .insert(request.compressor_model_id.clone(), false);
-                        }
+                        set_model_health(&status, &request.compressor_model_id, false);
                         continue 'main;
                     }
                 }
@@ -786,11 +784,7 @@ pub async fn run_batcher_loop(
                             "Server Error: Generation failed: {}",
                             e
                         )));
-                        {
-                            let mut s = lock_status(&status);
-                            s.model_health
-                                .insert(request.compressor_model_id.clone(), false);
-                        }
+                        set_model_health(&status, &request.compressor_model_id, false);
                         continue 'main;
                     }
                 }
@@ -930,10 +924,7 @@ pub async fn run_batcher_loop(
                     StreamEvent::Error(e) => {
                         terminal_received = true;
                         let _ = responder.send(StreamEvent::Error(e));
-                        {
-                            let mut s = lock_status(&status);
-                            s.model_health.insert(active_model_id.clone(), false);
-                        }
+                        set_model_health(&status, &active_model_id, false);
                         break;
                     }
                     other => {

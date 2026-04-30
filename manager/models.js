@@ -1,3 +1,5 @@
+/* global downloadModel */
+
 let isAdmin = false;
 
 async function checkAdmin() {
@@ -98,8 +100,8 @@ async function loadModels() {
     }
 }
 
-const cancelDownloadFlags = new Set();
 let activePollInterval = null;
+const activeDownloads = new Map();
 
 async function pollDownloads() {
     try {
@@ -131,35 +133,8 @@ async function pollDownloads() {
     }
 }
 
-function updateDownloadUI(modelId, status) {
-    const pct = status.total_bytes > 0 ? (status.bytes_transferred / status.total_bytes) * 100 : 0;
-    const speedMB = (status.current_speed_bps / 1024 / 1024).toFixed(1);
-    const transMB = (status.bytes_transferred / 1024 / 1024).toFixed(1);
-    const totalMB = (status.total_bytes / 1024 / 1024).toFixed(1);
-    
-    let etaStr = "Calculating...";
-    if (status.current_speed_bps > 0 && status.total_bytes > 0) {
-        const bytesLeft = status.total_bytes - status.bytes_transferred;
-        const secsLeft = bytesLeft / status.current_speed_bps;
-        etaStr = secsLeft > 60 ? `${Math.floor(secsLeft/60)}m ${Math.round(secsLeft%60)}s` : `${Math.round(secsLeft)}s`;
-    }
-
-    const card = document.getElementById(`model-card-${modelId}`);
-    const bar = card ? card.querySelector('.download-progress-bar') : null;
-    const stats = card ? card.querySelector('.download-stats') : null;
-    
-    if (bar) bar.style.width = `${pct}%`;
-    if (stats) {
-        if (status.state === 'Verifying...') {
-            stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | Verifying...`;
-        } else {
-            stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
-        }
-    }
-}
-
 window.startDownload = async function(modelId) {
-    cancelDownloadFlags.delete(modelId);
+    if (activeDownloads.has(modelId)) return;
     
     let card = document.getElementById(`model-card-${modelId}`);
     if (!card) return;
@@ -183,114 +158,65 @@ window.startDownload = async function(modelId) {
                 </div>
             `;
             rightCol.prepend(progressDiv);
-            
-            progressDiv.querySelector('.dl-cancel-btn').addEventListener('click', async () => {
-                cancelDownloadFlags.add(modelId);
-                try {
-                    await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
-                } catch (e) {
-                    console.error("Failed to send cancel request to server:", e);
-                }
-            });
         } else {
             const cancelBtn = progressDiv.querySelector('.dl-cancel-btn');
             if (cancelBtn) cancelBtn.style.display = 'block';
         }
     }
 
-    while (!cancelDownloadFlags.has(modelId)) {
-        try {
-            const progCheck = await fetchWithAuth('/api/models/download/progress');
-            const activeDls = await progCheck.json();
+    const dl = downloadModel(modelId, {
+        onProgress: (status, pct, speedMB, transMB, totalMB, etaStr) => {
+            const card = document.getElementById(`model-card-${modelId}`);
+            const bar = card ? card.querySelector('.download-progress-bar') : null;
+            const stats = card ? card.querySelector('.download-stats') : null;
             
-            if (!activeDls[modelId]) {
-                try {
-                    await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'POST' });
-                } catch (e) {
-                    if (e.message === 'Unauthorized') return;
-                    if (!e.message.includes('409')) {
-                        updateDownloadStatusText(modelId, `Failed to start. Retrying in 5s...`);
-                        await sleep(5000, modelId);
-                        continue;
-                    }
+            if (bar) bar.style.width = `${pct}%`;
+            if (stats) {
+                if (status.state === 'Verifying...') {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | Verifying...`;
+                } else {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
                 }
             }
-
-            await new Promise((resolve, reject) => {
-                const interval = setInterval(async () => {
-                    if (cancelDownloadFlags.has(modelId)) {
-                        clearInterval(interval);
-                        reject(new Error("Canceled"));
-                        return;
-                    }
-                    
-                    try {
-                        const progRes = await fetchWithAuth('/api/models/download/progress');
-                        const downloads = await progRes.json();
-                        const status = downloads[modelId];
-                        
-                        if (status) {
-                            updateDownloadUI(modelId, status);
-                        } else {
-                            clearInterval(interval);
-                            
-                            const verifyRes = await fetchWithAuth('/api/models');
-                            const verifyModels = await verifyRes.json();
-                            const verifyModel = verifyModels.find(m => m.id === modelId);
-                            
-                            if (verifyModel && verifyModel.is_downloaded) {
-                                updateDownloadStatusText(modelId, 'Download Complete!');
-                                const card = document.getElementById(`model-card-${modelId}`);
-                                const bar = card ? card.querySelector('.download-progress-bar') : null;
-                                if (bar) bar.style.width = '100%';
-                                
-                                const cancelBtn = card ? card.querySelector('.dl-cancel-btn') : null;
-                                if (cancelBtn) cancelBtn.style.display = 'none';
-                                
-                                setTimeout(() => loadModels(), 1500); 
-                                resolve();
-                            } else {
-                                reject(new Error("Interrupted"));
-                            }
-                        }
-                    } catch (e) {
-                        clearInterval(interval);
-                        reject(e);
-                    }
-                }, 1000);
-            });
+        },
+        onStatusText: (text) => {
+            const card = document.getElementById(`model-card-${modelId}`);
+            if (!card) return;
+            const stats = card.querySelector('.download-stats');
+            if (stats) stats.innerText = text;
+        },
+        onComplete: () => {
+            const card = document.getElementById(`model-card-${modelId}`);
+            const bar = card ? card.querySelector('.download-progress-bar') : null;
+            if (bar) bar.style.width = '100%';
             
-            return; 
-
-        } catch (e) {
-            if (cancelDownloadFlags.has(modelId)) {
-                updateDownloadStatusText(modelId, 'Download Canceled.');
-                setTimeout(() => loadModels(), 1500);
-                return;
-            }
-            updateDownloadStatusText(modelId, 'Interrupted. Retrying in 5s...');
-            console.error(`Download ${modelId} interrupted, retrying in 5s...`, e);
-            await sleep(5000, modelId);
+            const cancelBtn = card ? card.querySelector('.dl-cancel-btn') : null;
+            if (cancelBtn) cancelBtn.style.display = 'none';
         }
+    });
+
+    const cancelBtn = card.querySelector('.dl-cancel-btn');
+    if (cancelBtn) {
+        const newCancelBtn = cancelBtn.cloneNode(true);
+        cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+        newCancelBtn.addEventListener('click', () => {
+            dl.cancel();
+        });
     }
-    
-    updateDownloadStatusText(modelId, 'Download Canceled.');
-    setTimeout(() => loadModels(), 1500);
+
+    activeDownloads.set(modelId, dl);
+
+    try {
+        await dl.promise;
+    } catch (e) {
+        if (e.message !== "Canceled" && e.message !== "Download canceled by user.") {
+            console.error(`Download failed for ${modelId}:`, e);
+        }
+    } finally {
+        activeDownloads.delete(modelId);
+        setTimeout(() => loadModels(), 1500);
+    }
 };
-
-function updateDownloadStatusText(modelId, text) {
-    const card = document.getElementById(`model-card-${modelId}`);
-    if (!card) return;
-    const stats = card.querySelector('.download-stats');
-    if (stats) stats.innerText = text;
-}
-
-async function sleep(ms, modelId) {
-    for (let i = 0; i < ms; i += 100) {
-        if (cancelDownloadFlags.has(modelId)) return;
-        await new Promise(r => setTimeout(r, 100));
-    }
-}
 
 window.deleteModel = async function(modelId) {
     if (!confirm(`Are you sure you want to permanently delete the weights for ${modelId} from disk?`)) return;
