@@ -1,7 +1,26 @@
+/* global downloadModel */
+
+let isAdmin = false;
+
+async function checkAdmin() {
+    try {
+        const res = await fetchWithAuth('/api/console/loglevel');
+        if (res.ok) isAdmin = true;
+    } catch (e) {
+        console.debug("Could not verify admin status, assuming non-admin.", e);
+        isAdmin = false;
+    }
+}
+
 async function loadModels() {
     try {
-        const res = await fetchWithAuth('/api/models');
-        const models = await res.json();
+        const [modelsRes, statusRes] = await Promise.all([
+            fetchWithAuth('/api/models'),
+            fetchWithAuth('/api/status')
+        ]);
+        const models = await modelsRes.json();
+        const engineStatus = statusRes.ok ? await statusRes.json() : { model_health: {} };
+        const healthMap = engineStatus.model_health || {};
         const container = document.getElementById('models-container');
         container.innerHTML = '';
 
@@ -15,24 +34,47 @@ async function loadModels() {
             };
 
             const card = document.createElement('div');
-            card.className = 'model-card';
+            card.className = `model-card ${model.is_downloaded ? '' : 'model-undownloaded'}`;
+            card.id = `model-card-${model.id}`;
 
             const rolesStr = model.roles.join(', ');
             const backendsStr = model.supported_backends.join(', ');
 
+            let healthBadge = '';
+            if (healthMap[model.id] === true) {
+                healthBadge = `<span class="badge" style="background: #a6e3a1; color: #11111b; margin-left: 10px;" title="Last run succeeded">✅ Passed</span>`;
+            } else if (healthMap[model.id] === false) {
+                healthBadge = `<span class="badge" style="background: #f38ba8; color: #11111b; margin-left: 10px;" title="Last run failed">❌ Failed</span>`;
+            }
+
+            let adminDeleteBtn = '';
+            if (isAdmin && model.is_downloaded) {
+                adminDeleteBtn = `<button class="btn-delete btn-cancel" style="padding: 5px 10px; font-size: 0.85rem;">🗑️ Delete</button>`;
+            }
+
+            const downloadBtnHtml = model.is_downloaded
+                ? `<div style="display: flex; gap: 8px; align-items: center;">${adminDeleteBtn}<span class="badge badge-json" style="padding: 5px 10px;">Ready</span></div>`
+                : `<button class="btn-download">Download Model</button>`;
+
+            const moeHtml = (model.num_local_experts != null && model.num_experts_per_tok != null)
+                ? `<div class="setting-item setting-moe"><span>MoE Routing</span> <span>${model.num_experts_per_tok} / ${model.num_local_experts} Active ${getBadge(model.provenance.num_local_experts)}</span></div>`
+                : '';
+
             const cardHtml = `
                 <div class="model-header">
                     <div>
-                        <h2 style="margin:0; color: #fab387;">${model.name}</h2>
+                        <h2 style="margin:0; color: ${model.is_downloaded ? '#fab387' : '#6c7086'}; display: flex; align-items: center;">${model.name} ${healthBadge}</h2>
                         <p style="margin: 5px 0 0 0; color: #a6adc8; font-size: 0.9rem;">ID: ${model.id} | Repo: <a href="https://huggingface.co/${model.repo}" target="_blank" style="color: #89b4fa;">${model.repo}</a></p>
                     </div>
-                    <div style="text-align: right;">
+                    <div style="text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">
+                        ${downloadBtnHtml}
                         <div style="font-size: 0.85rem; color: #cba6f7; margin-bottom: 4px;"><strong>Roles:</strong> ${rolesStr}</div>
                         <div style="font-size: 0.85rem; color: #a6e3a1;"><strong>Backends:</strong> ${backendsStr}</div>
                     </div>
                 </div>
                 <div class="model-settings">
                     <div class="setting-item"><span>Architecture</span> <span>${model.arch} ${getBadge(model.provenance.arch)}</span></div>
+                    ${moeHtml}
                     <div class="setting-item"><span>KV Cache DType</span> <span>${model.kv_cache_dtype} ${getBadge(model.provenance.kv_cache_dtype)}</span></div>
                     <div class="setting-item"><span>Max Context Len</span> <span>${model.max_context_len} ${getBadge(model.provenance.max_context_len)}</span></div>
                     <div class="setting-item"><span>Sliding Window</span> <span>${model.sliding_window || 'None'} ${getBadge(model.provenance.sliding_window)}</span></div>
@@ -45,6 +87,17 @@ async function loadModels() {
                 </div>
             `;
             card.innerHTML = DOMPurify.sanitize(cardHtml, { ADD_ATTR: ['target'] });
+
+            const downloadBtn = card.querySelector('.btn-download');
+            if (downloadBtn) {
+                downloadBtn.addEventListener('click', () => startDownload(model.id));
+            }
+
+            const deleteBtn = card.querySelector('.btn-delete');
+            if (deleteBtn) {
+                deleteBtn.addEventListener('click', () => deleteModel(model.id));
+            }
+
             container.appendChild(card);
         });
     } catch (e) {
@@ -52,4 +105,155 @@ async function loadModels() {
     }
 }
 
-document.addEventListener('DOMContentLoaded', loadModels);
+const activeDownloads = new Map();
+
+/**
+ * Discovers downloads that might be active on the server (e.g., from a previous session or another tab)
+ * and initializes the UI and polling for them on the current page. This runs periodically.
+ */
+async function discoverActiveDownloads() {
+    try {
+        const res = await fetchWithAuth('/api/models/download/progress');
+        if (!res.ok) return;
+        const downloads = await res.json();
+        
+        const activeIds = Object.keys(downloads);
+
+        activeIds.forEach(id => {
+            // If a download is active on the server but not tracked on this page, start tracking it.
+            if (!activeDownloads.has(id)) {
+                const card = document.getElementById(`model-card-${id}`);
+                if (card) { // Check if the model card is rendered on the page
+                    startDownload(id); // This will create the UI and start the poller via downloadModel
+                }
+            }
+        });
+    } catch (e) {
+        console.error("Failed to discover active downloads:", e);
+    }
+}
+
+async function startDownload(modelId) {
+    if (activeDownloads.has(modelId)) return;
+    
+    let card = document.getElementById(`model-card-${modelId}`);
+    if (!card) return;
+    
+    const rightCol = card.querySelector('.model-header > div:nth-child(2)');
+    if (rightCol) {
+        const btn = rightCol.querySelector('.btn-download');
+        if (btn) btn.style.display = 'none';
+
+        let progressDiv = card.querySelector('.download-progress-container');
+        if (!progressDiv) {
+            progressDiv = document.createElement('div');
+            progressDiv.className = 'download-progress-container';
+            progressDiv.innerHTML = `
+                <div style="width: 250px; background: #313244; border-radius: 4px; overflow: hidden; margin-bottom: 4px; border: 1px solid #45475a;">
+                    <div class="download-progress-bar" style="width: 0%; height: 8px; background: #a6e3a1; transition: width 0.5s ease-out;"></div>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div class="download-stats" style="font-size: 0.75rem; color: #a6adc8; text-align: left; white-space: nowrap;">Starting...</div>
+                    <div style="display: flex; gap: 5px;">
+                        <button class="dl-pause-btn" style="padding: 3px 8px; background: #f9e2af; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Pause</button>
+                        <button class="dl-cancel-btn" style="padding: 3px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Cancel</button>
+                    </div>
+                </div>
+            `;
+            rightCol.prepend(progressDiv);
+        } else {
+            const cancelBtn = progressDiv.querySelector('.dl-cancel-btn');
+            if (cancelBtn) cancelBtn.style.display = 'block';
+            const pauseBtn = progressDiv.querySelector('.dl-pause-btn');
+            if (pauseBtn) pauseBtn.style.display = 'block';
+        }
+    }
+
+    const dl = downloadModel(modelId, {
+        onProgress: (status, pct, speedMB, transMB, totalMB, etaStr) => {
+            const card = document.getElementById(`model-card-${modelId}`);
+            const bar = card ? card.querySelector('.download-progress-bar') : null;
+            const stats = card ? card.querySelector('.download-stats') : null;
+            
+            if (bar) bar.style.width = `${pct}%`;
+            if (stats) {
+                if (status.state === 'Verifying...') {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | Verifying...`;
+                } else {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
+                }
+            }
+        },
+        onStatusText: (text) => {
+            const card = document.getElementById(`model-card-${modelId}`);
+            if (!card) return;
+            const stats = card.querySelector('.download-stats');
+            if (stats) stats.innerText = text;
+        },
+        onComplete: () => {
+            const card = document.getElementById(`model-card-${modelId}`);
+            const bar = card ? card.querySelector('.download-progress-bar') : null;
+            if (bar) bar.style.width = '100%';
+            
+            const cancelBtn = card ? card.querySelector('.dl-cancel-btn') : null;
+            if (cancelBtn) cancelBtn.style.display = 'none';
+
+            const pauseBtn = card ? card.querySelector('.dl-pause-btn') : null;
+            if (pauseBtn) pauseBtn.style.display = 'none';
+        }
+    });
+
+    const cancelBtn = card.querySelector('.dl-cancel-btn');
+    if (cancelBtn) {
+        const newCancelBtn = cancelBtn.cloneNode(true);
+        cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
+        newCancelBtn.addEventListener('click', () => {
+            dl.cancel();
+        });
+    }
+
+    const pauseBtn = card.querySelector('.dl-pause-btn');
+    if (pauseBtn) {
+        const newPauseBtn = pauseBtn.cloneNode(true);
+        pauseBtn.parentNode.replaceChild(newPauseBtn, pauseBtn);
+        newPauseBtn.addEventListener('click', () => {
+            dl.pause();
+        });
+    }
+
+    activeDownloads.set(modelId, dl);
+
+    try {
+        await dl.promise;
+    } catch (e) {
+        if (e.message !== "Canceled" && e.message !== "Download canceled by user." && e.message !== "Download paused by user.") {
+            console.error(`Download failed for ${modelId}:`, e);
+        }
+    } finally {
+        activeDownloads.delete(modelId);
+        setTimeout(() => loadModels(), 1500);
+    }
+};
+
+async function deleteModel(modelId) {
+    if (!confirm(`Are you sure you want to permanently delete the weights for ${modelId} from disk?`)) return;
+    try {
+        const res = await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
+        if (res.ok) {
+            loadModels();
+        } else {
+            const text = await res.text();
+            alert(`Failed to delete model: ${text}`);
+        }
+    } catch (e) {
+        console.error("Error deleting model:", e);
+        alert("Error deleting model. Check console.");
+    }
+};
+
+document.addEventListener('DOMContentLoaded', async () => {
+    await checkAdmin();
+    loadModels();
+    discoverActiveDownloads();
+    setInterval(discoverActiveDownloads, 5000);
+});

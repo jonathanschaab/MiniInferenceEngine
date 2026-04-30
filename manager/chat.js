@@ -1,3 +1,5 @@
+/* global downloadModel */
+
 const chatContainer = document.getElementById('chat-container');
 const inputField = document.getElementById('prompt-input');
 const sendBtn = document.getElementById('send-btn');
@@ -16,6 +18,7 @@ const SESSION_LIMIT = 20;
 let sessionOffset = 0;
 let hasMoreSessions = false;
 let isLoadingSessions = false;
+let allModels = [];
 
 const chatScrollObserver = new IntersectionObserver((entries) => {
     if (entries[0].isIntersecting && hasMoreMessages && !isLoadingMessages && currentSessionId) {
@@ -126,6 +129,7 @@ async function initializeUI() {
         let models = [];
         if (modelsResult.status === 'fulfilled') {
             models = modelsResult.value;
+            allModels = models;
         } else {
             console.error("Critical: Failed to fetch models.", modelsResult.reason);
             appendMessage("System Error: Could not connect to the model registry.", false);
@@ -207,12 +211,13 @@ function updateDropdownCompatibility() {
         Array.from(chatSelect.options).forEach(opt => {
             const supported = opt.dataset.backends && opt.dataset.backends.split(',').includes(selectedBackend);
             opt.disabled = !supported;
+            opt.title = supported ? '' : 'Incompatible with selected backend';
         });
-        if (chatSelect.options[chatSelect.selectedIndex]?.disabled) {
-            chatSelect.value = Array.from(chatSelect.options).find(o => !o.disabled)?.value || '';
-        }
     } else {
-        Array.from(chatSelect.options).forEach(opt => opt.disabled = false);
+        Array.from(chatSelect.options).forEach(opt => {
+            opt.disabled = false;
+            opt.title = '';
+        });
     }
 
     // 2. Filter backends based on selected Chat model
@@ -221,16 +226,17 @@ function updateDropdownCompatibility() {
     const chatBackends = chatOpt && chatOpt.dataset.backends ? chatOpt.dataset.backends.split(',') : [];
 
     Array.from(backendSelect.options).forEach(opt => {
-        if (opt.value === '') { opt.disabled = false; return; } // Auto is always allowed
+        if (opt.value === '') { 
+            opt.disabled = false; 
+            opt.title = '';
+            return; 
+        } // Auto is always allowed
         
         let supported = chatOpt && chatBackends.includes(opt.value);
         
         opt.disabled = !supported;
+        opt.title = supported ? '' : 'Incompatible with selected chat model';
     });
-    if (backendSelect.options[backendSelect.selectedIndex]?.disabled) {
-        backendSelect.value = ''; // Fallback to Auto
-        Array.from(chatSelect.options).forEach(opt => opt.disabled = false);
-    }
 }
 
 async function loadSessions() {
@@ -563,19 +569,80 @@ async function truncateMessagesInDB(fromIndex) {
     } catch(e) { console.error("Failed to truncate messages", e); }
 }
 
+async function startChatDownload(modelId, modelName) {
+    const div = document.createElement('div');
+    div.className = 'message ai-message';
+    div.innerHTML = `
+        <div>Downloading <strong>${DOMPurify.sanitize(modelName)}</strong>...</div>
+        <div class="download-progress-container" style="margin-top: 10px;">
+            <div style="width: 100%; max-width: 300px; background: #313244; border-radius: 4px; overflow: hidden; border: 1px solid #45475a;">
+                <div id="dl-bar-${modelId}" style="width: 0%; height: 8px; background: #a6e3a1; transition: width 0.5s ease-out;"></div>
+            </div>
+                <div style="display: flex; justify-content: space-between; max-width: 300px; align-items: center; margin-top: 5px;">
+                    <div id="dl-stats-${modelId}" style="font-size: 0.75rem; color: #a6adc8;">Starting...</div>
+                    <div style="display: flex; gap: 5px;">
+                        <button id="dl-pause-${modelId}" style="padding: 4px 8px; background: #f9e2af; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Pause</button>
+                        <button id="dl-cancel-${modelId}" style="padding: 4px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Cancel</button>
+                    </div>
+                </div>
+        </div>
+    `;
+    chatContainer.appendChild(div);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+
+    const cancelBtn = document.getElementById(`dl-cancel-${modelId}`);
+    const pauseBtn = document.getElementById(`dl-pause-${modelId}`);
+    const dl = downloadModel(modelId, {
+        onProgress: (status, pct, speedMB, transMB, totalMB, etaStr) => {
+            const bar = document.getElementById(`dl-bar-${modelId}`);
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (bar) bar.style.width = `${pct}%`;
+            if (stats) {
+                if (status.state === 'Verifying...') {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | Verifying...`;
+                } else {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
+                }
+            }
+        },
+        onStatusText: (text) => {
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (stats) stats.innerText = text;
+        },
+        onComplete: () => {
+            const bar = document.getElementById(`dl-bar-${modelId}`);
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (bar) bar.style.width = '100%';
+            if (stats) stats.innerText = 'Download Complete!';
+            if (cancelBtn) cancelBtn.style.display = 'none';
+            if (pauseBtn) pauseBtn.style.display = 'none';
+        }
+    });
+
+    cancelBtn.addEventListener('click', () => {
+        dl.cancel();
+    });
+    pauseBtn.addEventListener('click', () => {
+        dl.pause();
+    });
+
+    await dl.promise;
+}
+
+/**
+ * Resets the chat UI state after generation or upon failure.
+ */
+function resetChatUI() {
+    typingIndicator.style.display = 'none';
+    sendBtn.style.display = 'inline-flex';
+    stopBtn.style.display = 'none';
+    if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
+    sendBtn.disabled = false;
+}
+
 async function sendMessage() {
     const text = inputField.value.trim();
     if (!text) return;
-
-    // Grab the IDs from the UI dropdowns
-    const chatModelId = document.getElementById('chat-model-select').value;
-    const compModelId = document.getElementById('compressor-model-select').value;
-    const targetBackend = document.getElementById('backend-select').value;
-
-    if (!chatModelId || !compModelId) {
-        alert("Please select a valid chat model and compressor model. Check your backend compatibility if options are disabled.");
-        return;
-    }
 
     await ensureSession(text);
 
@@ -586,11 +653,51 @@ async function sendMessage() {
     
     inputField.value = '';
     inputField.style.height = 'auto'; 
+
+    await requestAiResponse();
+}
+
+async function requestAiResponse() {
+    // Grab the IDs from the UI dropdowns
+    const chatSelect = document.getElementById('chat-model-select');
+    const backendSelect = document.getElementById('backend-select');
+    const chatModelId = chatSelect.value;
+    const compModelId = document.getElementById('compressor-model-select').value;
+
+    const targetBackend = backendSelect.value;
+
+    if (!chatModelId || !compModelId || 
+        chatSelect.options[chatSelect.selectedIndex]?.disabled || 
+        backendSelect.options[backendSelect.selectedIndex]?.disabled) {
+        alert("Please select a valid chat model and compressor model. Check your backend compatibility if options are disabled.");
+        return;
+    }
+
+    const chatModel = allModels.find(m => m.id === chatModelId);
+    const compModel = allModels.find(m => m.id === compModelId);
+
     sendBtn.disabled = true;
     sendBtn.style.display = 'none';
     stopBtn.style.display = 'inline-flex';
     regenBtn.style.display = 'none';
     typingIndicator.style.display = 'block';
+    
+    if (chatModel && !chatModel.is_downloaded) {
+        try { await startChatDownload(chatModel.id, chatModel.name); chatModel.is_downloaded = true; } 
+        catch (e) {
+            console.error("Chat model download failed:", e);
+            resetChatUI();
+            return;
+        }
+    }
+    if (compModel && !compModel.is_downloaded) {
+        try { await startChatDownload(compModel.id, compModel.name); compModel.is_downloaded = true; } 
+        catch (e) {
+            console.error("Compressor model download failed:", e);
+            resetChatUI();
+            return;
+        }
+    }
     
     currentAbortController = new AbortController();
 
@@ -654,16 +761,12 @@ async function sendMessage() {
             updateStatus();
             await appendMessageToDB("assistant", aiMessageDiv.textContent, aiIndex);
         } else {
-            typingIndicator.style.display = 'none';
             aiMessageDiv.textContent = "Error: Failed to connect to engine.";
             chatHistory.pop(); 
         }
     }
     
-    sendBtn.style.display = 'inline-flex';
-    stopBtn.style.display = 'none';
-    if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
-    sendBtn.disabled = false;
+    resetChatUI();
     inputField.focus();
     currentAbortController = null;
     
@@ -686,15 +789,12 @@ async function regenerateLast() {
     if (chatHistory[chatHistory.length - 1].role === 'assistant') {
         chatHistory.pop();
         chatContainer.removeChild(chatContainer.lastChild);
+        await truncateMessagesInDB(chatHistory.length);
     }
     
-    // Remove the user's last message, place it in the input box, and immediately re-send
+    // If the last remaining message is from the user, request a new response
     if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'user') {
-        const lastUserMsg = chatHistory.pop();
-        chatContainer.removeChild(chatContainer.lastChild);
-        await truncateMessagesInDB(chatHistory.length);
-        inputField.value = lastUserMsg.content;
-        sendMessage();
+        await requestAiResponse();
     }
 }
 

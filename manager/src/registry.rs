@@ -19,6 +19,7 @@ pub enum ModelArch {
     Qwen2,
     XLMRoberta,
     GptOss,
+    Mistral,
 }
 
 pub trait PromptFormatter {
@@ -47,6 +48,32 @@ impl PromptFormatter for ModelArch {
                 }
                 prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
             }
+            ModelArch::Mistral => {
+                prompt.push_str("<s>");
+                let mut system_prompt = String::new();
+                for msg in messages {
+                    if msg.role == "system" {
+                        if !system_prompt.is_empty() {
+                            system_prompt.push_str("\n\n");
+                        }
+                        system_prompt.push_str(&msg.content);
+                    } else if msg.role == "user" {
+                        prompt.push_str("[INST] ");
+                        if !system_prompt.is_empty() {
+                            prompt.push_str(&system_prompt);
+                            prompt.push_str("\n\n");
+                            system_prompt.clear();
+                        }
+                        prompt.push_str(&msg.content);
+                        prompt.push_str(" [/INST]");
+                    } else {
+                        prompt.push_str(&format!("{}</s>", msg.content));
+                    }
+                }
+                if !system_prompt.is_empty() {
+                    prompt.push_str(&format!("[INST] {} [/INST]", system_prompt));
+                }
+            }
             _ => {
                 for msg in messages {
                     prompt.push_str(&format!("{}: {}\n", msg.role, msg.content));
@@ -65,6 +92,7 @@ pub enum ModelRole {
     CodeSpecialist,
     ToolCaller,
     Reasoning,
+    Vision,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
@@ -90,6 +118,8 @@ pub struct ModelConfig {
     pub n_head: usize,
     pub n_head_kv: usize,
     pub head_dim: usize,
+    pub num_local_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
     pub roles: Vec<ModelRole>,
     pub arch: ModelArch,
     pub compression_dtype: Option<ModelDType>,
@@ -103,6 +133,9 @@ pub struct ModelConfig {
     #[serde(default)]
     pub is_default_compressor: bool,
     pub provenance: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    pub is_downloaded: bool,
 }
 
 impl ModelConfig {
@@ -117,6 +150,17 @@ impl ModelConfig {
         };
 
         (2 * self.num_layers * self.head_dim * self.n_head_kv) * bytes_per_element
+    }
+
+    pub fn compute_margin_multiplier(&self) -> f64 {
+        if let (Some(local_experts), Some(active_experts)) =
+            (self.num_local_experts, self.num_experts_per_tok)
+            && local_experts > 0
+        {
+            // Clamp to 0.25 to ensure dense base layers and attention still have breathing room
+            return (active_experts as f64 / local_experts as f64).max(0.25);
+        }
+        1.0
     }
 }
 
@@ -133,6 +177,8 @@ struct ModelOverrides {
     pub n_head: Option<usize>,
     pub n_head_kv: Option<usize>,
     pub head_dim: Option<usize>,
+    pub num_local_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
     pub size_on_disk_gb: Option<f32>,
 }
 
@@ -153,9 +199,9 @@ struct ModelRegistration {
     overrides: ModelOverrides,
 }
 
-// Expose the registry so the web server can send it to the UI
-pub async fn get_model_registry() -> Vec<ModelConfig> {
-    static REGISTRY: OnceCell<Arc<RwLock<Vec<ModelConfig>>>> = OnceCell::const_new();
+static REGISTRY: OnceCell<Arc<RwLock<Vec<ModelConfig>>>> = OnceCell::const_new();
+
+pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
     let registry_lock = REGISTRY.get_or_init(|| async {
         let lock = Arc::new(RwLock::new(Vec::new()));
 
@@ -321,6 +367,40 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     ..Default::default()
                 },
             },
+            ModelRegistration {
+                id: "qwen-3.6-27b-gguf",
+                name: "Qwen 3.6 (27B)",
+                repo: "unsloth/Qwen3.6-27B-GGUF",
+                tokenizer_repo: "Qwen/Qwen3.6-27B",
+                filename: "Qwen3.6-27B-Q4_K_M.gguf",
+                roles: vec![ModelRole::GeneralChat, ModelRole::Vision],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 27.8,
+                non_layer_params_billions: 1.3,
+                overrides: ModelOverrides {
+                    ..Default::default()
+                },
+            },
+            ModelRegistration {
+                id: "mixtral-8x7b-instruct-v0.1",
+                name: "Mixtral 8x7B Instruct v0.1",
+                repo: "mradermacher/Mixtral-8x7B-Instruct-v0.1-GGUF",
+                tokenizer_repo: "mistralai/Mixtral-8x7B-Instruct-v0.1",
+                filename: "Mixtral-8x7B-Instruct-v0.1.Q4_K_M.gguf",
+                roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 46.7,
+                non_layer_params_billions: 0.3,
+                overrides: ModelOverrides {
+                    ..Default::default()
+                },
+            },
         ];
 
         let mut handles = Vec::new();
@@ -343,6 +423,8 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     let mut n_head = reg.overrides.n_head;
                     let mut n_head_kv = reg.overrides.n_head_kv;
                     let mut head_dim = reg.overrides.head_dim;
+                    let mut num_local_experts = reg.overrides.num_local_experts;
+                    let mut num_experts_per_tok = reg.overrides.num_experts_per_tok;
                     let mut size_on_disk_gb = reg.overrides.size_on_disk_gb;
 
                     let mut check_override = |opt: bool, name: &str| {
@@ -359,15 +441,22 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     check_override(n_head.is_some(), "n_head");
                     check_override(n_head_kv.is_some(), "n_head_kv");
                     check_override(head_dim.is_some(), "head_dim");
+                    check_override(num_local_experts.is_some(), "num_local_experts");
+                    check_override(num_experts_per_tok.is_some(), "num_experts_per_tok");
                     check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
 
-                // 1. Check if GGUF is cached locally to get exact size instantly
-                if size_on_disk_gb.is_none()
-                    && let Some(gguf_path) = cache.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename)
-                        && let Ok(meta) = tokio::fs::metadata(&gguf_path).await {
-                            size_on_disk_gb = Some(meta.len() as f32 / 1024.0 / 1024.0 / 1024.0);
-                            provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
-                        }
+                let cached_meta = if let Some(gguf_path) = cache.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename) {
+                    tokio::fs::metadata(&gguf_path).await.ok()
+                } else {
+                    None
+                };
+
+                if let None = size_on_disk_gb
+                    && let Some(meta) = cached_meta
+                {
+                    size_on_disk_gb = Some(meta.len() as f32 / 1024.0 / 1024.0 / 1024.0);
+                    provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
+                }
 
                 // 2. Fetch config.json from tokenizer repo to dynamically populate architectural details
                 if num_layers.is_none() || n_head.is_none() || arch.is_none() || kv_cache_dtype.is_none() || max_context_len.is_none() || sliding_window.is_none() || rope_scaling_factor.is_none() || original_max_position_embeddings.is_none() {
@@ -391,7 +480,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                     }
                                                 }
                                                 _ => {
-                                                    if key != "head_dim" && key != "num_key_value_heads" && key != "sliding_window" {
+                                                    if key != "head_dim" && key != "num_key_value_heads" && key != "sliding_window" && key != "num_local_experts" && key != "num_experts_per_tok" {
                                                     warn!("Missing '{}' in config.json for {}", key, reg.id);
                                                     }
                                                     None
@@ -423,9 +512,10 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                             && let Some(model_type) = get_str("model_type") {
                                                 arch = match model_type.as_str() {
                                                     "llama" => Some(ModelArch::Llama),
-                                                    "qwen2" | "qwen3_5_moe" | "qwen3_5_moe_text" => Some(ModelArch::Qwen2),
+                                                    "qwen2" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Some(ModelArch::Qwen2),
                                                     "xlm-roberta" => Some(ModelArch::XLMRoberta),
                                                     "gpt_oss" => Some(ModelArch::GptOss),
+                                                    "mistral" | "mixtral" => Some(ModelArch::Mistral),
                                                     _ => {
                                                     warn!("Unrecognized 'model_type' ({}) in config.json for {}", model_type, reg.id);
                                                         None
@@ -492,6 +582,16 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                 head_dim = Some(v);
                                                 provenance.insert("head_dim".to_string(), "config.json".to_string());
                                             }
+                                        if num_local_experts.is_none()
+                                            && let Some(v) = get_u64("num_local_experts") {
+                                                num_local_experts = Some(v);
+                                                provenance.insert("num_local_experts".to_string(), "config.json".to_string());
+                                            }
+                                        if num_experts_per_tok.is_none()
+                                            && let Some(v) = get_u64("num_experts_per_tok") {
+                                                num_experts_per_tok = Some(v);
+                                                provenance.insert("num_experts_per_tok".to_string(), "config.json".to_string());
+                                            }
                                         if kv_cache_dtype.is_none() {
                                             if let Some(dt) = get_str("dtype").or_else(|| get_str("torch_dtype")) {
                                                 kv_cache_dtype = match dt.as_str() {
@@ -522,7 +622,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     let n_head_val = n_head.unwrap_or(1);
                     let n_embd_val = n_embd.unwrap_or(4096);
 
-                    for name in &["arch", "kv_cache_dtype", "max_context_len", "sliding_window", "rope_scaling_factor", "original_max_position_embeddings", "num_layers", "n_embd", "n_head", "n_head_kv", "head_dim", "size_on_disk_gb"] {
+                    for name in &["arch", "kv_cache_dtype", "max_context_len", "sliding_window", "rope_scaling_factor", "original_max_position_embeddings", "num_layers", "n_embd", "n_head", "n_head_kv", "head_dim", "num_local_experts", "num_experts_per_tok", "size_on_disk_gb"] {
                         if !provenance.contains_key(*name) {
                             provenance.insert(name.to_string(), "fallback".to_string());
                         }
@@ -571,10 +671,13 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                         n_head: n_head_val,
                         n_head_kv: n_head_kv.unwrap_or(n_head_val),
                         head_dim: head_dim.unwrap_or(n_embd_val / n_head_val.max(1)),
+                        num_local_experts,
+                        num_experts_per_tok,
                         parameters_billions: reg.parameters_billions,
                         non_layer_params_billions: reg.non_layer_params_billions,
                         size_on_disk_gb: size_on_disk_gb.unwrap_or(fallback_size_gb),
                         provenance,
+                        is_downloaded: false, // This will be populated at runtime by the orchestrator
                     }
                 }));
             }
@@ -591,7 +694,13 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
         lock
     }).await;
 
-    registry_lock.read().await.clone()
+    registry_lock.clone()
+}
+
+// Expose the registry so the web server can send it to the UI
+pub async fn get_model_registry() -> Vec<ModelConfig> {
+    let lock = get_registry_lock().await;
+    lock.read().await.clone()
 }
 
 #[cfg(test)]
@@ -616,6 +725,8 @@ mod tests {
             n_head: 32,
             n_head_kv: 8,
             head_dim: 128,
+            num_local_experts: None,
+            num_experts_per_tok: None,
             roles: vec![],
             arch,
             compression_dtype: None,
@@ -627,6 +738,7 @@ mod tests {
             is_default_chat: false,
             is_default_compressor: false,
             provenance: HashMap::new(),
+            is_downloaded: false,
         }
     }
 
@@ -673,6 +785,17 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_formatter_mistral() {
+        let arch = ModelArch::Mistral;
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+        }];
+        let prompt = arch.format_chat(&msgs);
+        assert_eq!(prompt, "<s>[INST] Hi [/INST]");
+    }
+
+    #[test]
     fn test_prompt_formatter_fallback() {
         let arch = ModelArch::XLMRoberta;
         let msgs = vec![Message {
@@ -695,6 +818,7 @@ mod tests {
             "<|im_start|>assistant\n"
         );
         assert_eq!(ModelArch::XLMRoberta.format_chat(&msgs), "assistant: ");
+        assert_eq!(ModelArch::Mistral.format_chat(&msgs), "<s>");
     }
 
     #[test]

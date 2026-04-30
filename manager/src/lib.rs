@@ -89,16 +89,21 @@ impl ActiveBackend {
     pub async fn load_model(
         &mut self,
         config: &ModelConfig,
+        downloads_dir: &str,
         status: Arc<Mutex<EngineStatus>>,
         strategy: &MemoryStrategy,
         required_ctx: usize,
     ) -> Result<usize, String> {
         match self {
             #[cfg(feature = "backend-candle")]
-            ActiveBackend::Candle(b) => b.load_model(config, status, strategy, required_ctx).await,
+            ActiveBackend::Candle(b) => {
+                b.load_model(config, downloads_dir, status, strategy, required_ctx)
+                    .await
+            }
             #[cfg(feature = "backend-llamacpp")]
             ActiveBackend::LlamaCpp(b) => {
-                b.load_model(config, status, strategy, required_ctx).await
+                b.load_model(config, downloads_dir, status, strategy, required_ctx)
+                    .await
             }
         }
     }
@@ -174,6 +179,12 @@ impl ActiveBackend {
     }
 }
 
+/// Helper function to update the health status of a model in the engine status
+pub fn set_model_health(status: &Arc<Mutex<EngineStatus>>, model_id: &str, is_healthy: bool) {
+    let mut s = lock_status(status);
+    s.model_health.insert(model_id.to_string(), is_healthy);
+}
+
 pub fn create_backend(btype: &BackendType, gpu_device_index: u32) -> Result<ActiveBackend, String> {
     match btype {
         #[cfg(feature = "backend-candle")]
@@ -194,6 +205,7 @@ pub async fn run_batcher_loop(
     status: Arc<Mutex<EngineStatus>>,
     telemetry: Arc<Mutex<TelemetryStore>>,
     gpu_device_index: u32,
+    downloads_directory: String,
 ) {
     let nvml = Nvml::init().ok();
 
@@ -432,6 +444,7 @@ pub async fn run_batcher_loop(
             let actual_context = match backend
                 .load_model(
                     &config,
+                    &downloads_directory,
                     status.clone(),
                     &active_memory_strategy,
                     target_allocated_ctx,
@@ -441,6 +454,7 @@ pub async fn run_batcher_loop(
                 Ok(ctx) => ctx,
                 Err(e) => {
                     error!("Chat model load failed: {}", e);
+                    set_model_health(&status, &config.id, false);
                     {
                         let mut s = lock_status(&status);
                         s.log_vram(
@@ -485,6 +499,7 @@ pub async fn run_batcher_loop(
                 active_max_context
             );
 
+            set_model_health(&status, &active_model_id, true);
             {
                 let mut current_status = lock_status(&status);
                 current_status.active_chat_model_id = Some(active_model_id.clone());
@@ -552,7 +567,9 @@ pub async fn run_batcher_loop(
             // This rough heuristic is only for the Candle backend's dynamic memory check.
             // Llama.cpp calculates this precisely during its static allocation.
             let bytes_per_token = config.estimate_kv_bytes_per_token();
-            let safe_free_vram = free_vram.saturating_sub(CANDLE_COMPUTE_MARGIN_BYTES);
+            let compute_margin =
+                (CANDLE_COMPUTE_MARGIN_BYTES as f64 * config.compute_margin_multiplier()) as u64;
+            let safe_free_vram = free_vram.saturating_sub(compute_margin);
             let absolute_max_tokens =
                 (safe_free_vram as usize / bytes_per_token).min(active_max_context);
 
@@ -680,12 +697,14 @@ pub async fn run_batcher_loop(
             if let Err(e) = comp_backend
                 .load_model(
                     &comp_config,
+                    &downloads_directory,
                     status.clone(),
                     &MemoryStrategy::Offload,
                     comp_required_ctx,
                 )
                 .await
             {
+                set_model_health(&status, &comp_config.id, false);
                 {
                     let mut s = lock_status(&status);
                     s.log_vram(
@@ -721,6 +740,7 @@ pub async fn run_batcher_loop(
                 );
             }
 
+            set_model_health(&status, &request.compressor_model_id, true);
             {
                 let mut current_status = lock_status(&status);
                 current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
@@ -746,6 +766,7 @@ pub async fn run_batcher_loop(
                             "Server Error: Context compression failed: {}",
                             e
                         )));
+                        set_model_health(&status, &request.compressor_model_id, false);
                         continue 'main;
                     }
                 }
@@ -771,6 +792,7 @@ pub async fn run_batcher_loop(
                             "Server Error: Generation failed: {}",
                             e
                         )));
+                        set_model_health(&status, &request.compressor_model_id, false);
                         continue 'main;
                     }
                 }
@@ -910,6 +932,7 @@ pub async fn run_batcher_loop(
                     StreamEvent::Error(e) => {
                         terminal_received = true;
                         let _ = responder.send(StreamEvent::Error(e));
+                        set_model_health(&status, &active_model_id, false);
                         break;
                     }
                     other => {

@@ -11,6 +11,7 @@ use axum::{
 use hf_hub::api::sync::Api;
 use oauth2::basic::BasicClient;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use sysinfo::System;
 use tokenizers::Tokenizer;
@@ -23,8 +24,9 @@ use tracing::{error, info, warn}; // Ensure this is imported for AppState
 use tracing_subscriber::EnvFilter;
 
 use manager::{
-    ApiRequest, BenchmarkRequest, EngineStatus, Message, ModelArch, ModelConfig, ModelRole,
-    StreamEvent, TelemetryStore, UserRequest, get_model_registry, lock_status, run_batcher_loop,
+    ApiRequest, BenchmarkRequest, DownloadStatus, EngineStatus, Message, ModelArch, ModelConfig,
+    ModelRole, StreamEvent, TelemetryStore, UserRequest, get_model_registry, lock_status,
+    run_batcher_loop,
 };
 
 // --- CONFIGURATION ---
@@ -75,6 +77,8 @@ pub struct AppConfig {
     pub log_level_memory: String,
     #[serde(default = "default_log_file_name")]
     pub log_file_name: String,
+    #[serde(default = "default_downloads_directory")]
+    pub downloads_directory: String,
     #[serde(default)]
     pub database: DatabaseConfig,
 }
@@ -107,6 +111,10 @@ fn default_telemetry_retention_days() -> u64 {
     30
 }
 
+fn default_downloads_directory() -> String {
+    "downloads".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -125,6 +133,7 @@ impl Default for AppConfig {
             log_level_file: default_log_level_file(),
             log_level_memory: default_log_level_memory(),
             log_file_name: default_log_file_name(),
+            downloads_directory: default_downloads_directory(),
             database: DatabaseConfig::default(),
         }
     }
@@ -209,6 +218,8 @@ pub struct AppState {
     pub log_buffer: SharedLogBuffer,
     pub log_reload_handle: LogReloadHandle,
     pub current_log_level: Arc<Mutex<String>>,
+    pub active_downloads: Arc<Mutex<std::collections::HashMap<String, DownloadStatus>>>,
+    pub download_tasks: Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
 }
 
@@ -222,8 +233,16 @@ pub(crate) async fn serve_ui(
 }
 
 // Send the model roster to the Javascript dropdowns
-pub(crate) async fn get_models() -> Json<Vec<ModelConfig>> {
-    Json(get_model_registry().await)
+pub(crate) async fn get_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelConfig>> {
+    let mut models = get_model_registry().await;
+    let status = lock_status(&state.engine_status);
+    let downloaded_ids = &status.downloaded_models;
+
+    for model in &mut models {
+        model.is_downloaded = downloaded_ids.contains(&model.id);
+    }
+
+    Json(models)
 }
 
 // Handle incoming chat requests
@@ -265,6 +284,563 @@ pub(crate) async fn handle_generate(
 pub(crate) async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
     let current_status = lock_status(&state.engine_status).clone();
     Json(current_status)
+}
+
+// Retrieve the progress of all active downloads
+pub(crate) async fn get_download_progress(
+    State(state): State<Arc<AppState>>,
+) -> Json<std::collections::HashMap<String, DownloadStatus>> {
+    let downloads = state
+        .active_downloads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    Json(downloads)
+}
+
+// Start a background streaming download
+pub(crate) async fn trigger_download(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            "Admin access required for downloading",
+        )
+            .into_response();
+    }
+
+    {
+        let status = lock_status(&state.engine_status);
+        if status.models_vram.iter().any(|m| m.id == id) {
+            return (
+                StatusCode::CONFLICT,
+                "Cannot download a model that is currently loaded in VRAM. Please load a different model first.",
+            )
+                .into_response();
+        }
+    }
+
+    let registry = get_model_registry().await;
+    let model = match registry.into_iter().find(|m| m.id == id) {
+        Some(m) => m,
+        None => return (StatusCode::NOT_FOUND, "Model not found").into_response(),
+    };
+
+    let is_downloaded = {
+        let status = lock_status(&state.engine_status);
+        status.downloaded_models.contains(&id)
+    };
+
+    if is_downloaded {
+        return (StatusCode::CONFLICT, "Model is already downloaded").into_response();
+    }
+
+    {
+        let mut downloads = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if downloads.contains_key(&id) {
+            return (StatusCode::CONFLICT, "Download already in progress").into_response();
+        }
+        downloads.insert(
+            id.clone(),
+            DownloadStatus {
+                bytes_transferred: 0,
+                total_bytes: 0,
+                start_time: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                current_speed_bps: 0.0,
+                state: "Connecting...".to_string(),
+            },
+        );
+    }
+
+    let state_clone = state.clone();
+    let id_clone = id.clone();
+    let repo = model.repo.clone();
+    let filename = model.filename.clone();
+
+    let task = tokio::spawn(async move {
+        perform_model_download(state_clone, id_clone, repo, filename).await;
+    });
+
+    state
+        .download_tasks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), task);
+
+    (StatusCode::ACCEPTED, format!("Download started for {}", id)).into_response()
+}
+
+// Pause an active download without deleting the partial files
+pub(crate) async fn pause_download(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            "Admin access required for pausing downloads",
+        )
+            .into_response();
+    }
+
+    let download_task = {
+        let mut tasks = state
+            .download_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tasks.remove(&id)
+    };
+
+    if let Some(task) = download_task {
+        task.abort();
+        let _ = task.await; // Wait for the task to finish cancelling
+        info!("Aborted active download task for model {} (Paused)", id);
+
+        let mut dl = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        dl.remove(&id);
+        (StatusCode::OK, "Download paused").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "No active download to pause").into_response()
+    }
+}
+
+struct DownloadCleanupGuard {
+    state: Arc<AppState>,
+    id: String,
+}
+
+impl Drop for DownloadCleanupGuard {
+    fn drop(&mut self) {
+        self.state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+        self.state
+            .download_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, filename: String) {
+    let _guard = DownloadCleanupGuard {
+        state: state.clone(),
+        id: id.clone(),
+    };
+
+    let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, filename);
+    let client = &state.reqwest_client;
+
+    let downloads_dir = &state.config.downloads_directory;
+    if let Err(e) = tokio::fs::create_dir_all(downloads_dir).await {
+        error!("Failed to create downloads directory for {}: {}", id, e);
+        return;
+    }
+    let file_path = format!("{}/{}", downloads_dir, filename);
+    let tmp_file_path = format!("{}.tmp", file_path);
+    let meta_file_path = format!("{}.meta", file_path);
+
+    let mut existing_size = 0;
+    let mut expected_hash = None;
+
+    if let Ok(meta_str) = tokio::fs::read_to_string(&meta_file_path).await
+        && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str)
+    {
+        if let Some(bytes) = meta.get("downloaded_bytes").and_then(|v| v.as_u64()) {
+            existing_size = bytes;
+        }
+        if let Some(hash) = meta.get("expected_hash").and_then(|v| v.as_str()) {
+            expected_hash = Some(hash.to_string());
+        }
+    }
+
+    if existing_size > 0 {
+        if let Ok(file) = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp_file_path)
+            .await
+        {
+            let _ = file.set_len(existing_size).await;
+        } else {
+            existing_size = 0;
+        }
+    }
+
+    {
+        let mut dl = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(status) = dl.get_mut(&id) {
+            status.bytes_transferred = existing_size;
+            status.state = "Connecting...".to_string();
+        }
+    }
+
+    let mut hasher = Sha256::new();
+
+    let mut req = client.get(&url);
+    if existing_size > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_size));
+    }
+
+    let mut res = match req.send().await {
+        Ok(r) => {
+            if r.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                existing_size = 0;
+                hasher = Sha256::new();
+                match client.get(&url).send().await {
+                    Ok(r2) => {
+                        if !r2.status().is_success() {
+                            error!("Download failed for {} with status: {}", id, r2.status());
+                            return;
+                        }
+                        r2
+                    }
+                    Err(e) => {
+                        error!("Download failed for {}: {}", id, e);
+                        return;
+                    }
+                }
+            } else if !r.status().is_success() {
+                error!("Download failed for {} with status: {}", id, r.status());
+                return;
+            } else {
+                r
+            }
+        }
+        Err(e) => {
+            error!("Download failed for {}: {}", id, e);
+            return;
+        }
+    };
+
+    let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if !is_partial && existing_size > 0 {
+        info!(
+            "Server did not return partial content, restarting download for {}",
+            id
+        );
+        existing_size = 0;
+        hasher = Sha256::new();
+    }
+
+    if let Some(etag) = res
+        .headers()
+        .get("X-Linked-Etag")
+        .or_else(|| res.headers().get("ETag"))
+    {
+        let etag_str = etag.to_str().unwrap_or("").trim_matches('"');
+        let clean_etag = etag_str
+            .strip_prefix("W/")
+            .unwrap_or(etag_str)
+            .trim_matches('"');
+        if clean_etag.len() == 64 {
+            expected_hash = Some(clean_etag.to_string());
+        }
+    }
+
+    let total_size = if is_partial {
+        existing_size + res.content_length().unwrap_or(0)
+    } else {
+        res.content_length().unwrap_or(0)
+    };
+
+    // Pre-initialize metadata
+    let _ = tokio::fs::write(
+        &meta_file_path,
+        serde_json::json!({
+            "downloaded_bytes": existing_size,
+            "expected_hash": expected_hash
+        })
+        .to_string(),
+    )
+    .await;
+
+    {
+        let mut dl = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(status) = dl.get_mut(&id) {
+            status.total_bytes = total_size;
+            status.bytes_transferred = existing_size; // SHOW PROGRESS IMMEDIATELY
+            status.state = "Downloading...".to_string();
+        }
+    }
+
+    let mut file = match if is_partial && existing_size > 0 {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&tmp_file_path)
+            .await
+    } else {
+        tokio::fs::File::create(&tmp_file_path).await
+    } {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to open/create file for {}: {}", id, e);
+            return;
+        }
+    };
+
+    let start_time = std::time::Instant::now();
+    let mut downloaded: u64 = existing_size;
+    let mut stream_error = false;
+    let mut last_meta_save = std::time::Instant::now();
+    let mut last_ui_update = std::time::Instant::now();
+    let mut bytes_since_last_ui_update = 0;
+
+    let update_interval_ms = 500;
+    let update_bytes_threshold = 1024 * 1024; // 1 MB
+
+    use tokio::io::AsyncWriteExt;
+
+    while let Some(chunk) = res.chunk().await.transpose() {
+        match chunk {
+            Ok(bytes) => {
+                if existing_size == 0 {
+                    hasher.update(&bytes);
+                }
+                if let Err(e) = file.write_all(&bytes).await {
+                    error!("Failed to write to file for {}: {}", id, e);
+                    stream_error = true;
+                    break;
+                }
+                downloaded += bytes.len() as u64;
+                bytes_since_last_ui_update += bytes.len() as u64;
+
+                if last_ui_update.elapsed().as_millis() >= update_interval_ms
+                    || bytes_since_last_ui_update >= update_bytes_threshold
+                {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (downloaded.saturating_sub(existing_size)) as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+
+                    {
+                        let mut dl = state
+                            .active_downloads
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if let Some(status) = dl.get_mut(&id) {
+                            status.bytes_transferred = downloaded;
+                            status.current_speed_bps = speed;
+                            status.state = "Downloading...".to_string();
+                        }
+                    }
+
+                    last_ui_update = std::time::Instant::now();
+                    bytes_since_last_ui_update = 0;
+                }
+
+                if last_meta_save.elapsed().as_secs() > 5 {
+                    let _ = tokio::fs::write(
+                        &meta_file_path,
+                        serde_json::json!({
+                            "downloaded_bytes": downloaded,
+                            "expected_hash": expected_hash
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                    last_meta_save = std::time::Instant::now();
+                }
+            }
+            Err(e) => {
+                error!("Error while streaming {}: {}", id, e);
+                stream_error = true;
+                break;
+            }
+        }
+    }
+
+    // Explicitly drop the file handle so Windows allows us to rename/delete it
+    drop(file);
+
+    if !stream_error {
+        let final_hash_opt = if existing_size == 0 {
+            Some(hex::encode(hasher.finalize()))
+        } else {
+            {
+                let mut dl = state
+                    .active_downloads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(status) = dl.get_mut(&id) {
+                    status.state = "Verifying...".to_string();
+                }
+            }
+
+            let tmp_file_path_clone = tmp_file_path.clone();
+            let hash_result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+                let mut h = Sha256::new();
+                use std::io::Read;
+                let mut f = std::fs::File::open(&tmp_file_path_clone)?;
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                loop {
+                    let n = f.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    h.update(&buf[..n]);
+                }
+                Ok(hex::encode(h.finalize()))
+            })
+            .await;
+
+            match hash_result {
+                Ok(Ok(hash)) => Some(hash),
+                Ok(Err(e)) => {
+                    error!("Failed to read file for verification {}: {}", id, e);
+                    None
+                }
+                Err(e) => {
+                    error!("Hashing task panicked or was cancelled for {}: {}", id, e);
+                    None
+                }
+            }
+        };
+
+        if let Some(final_hash) = final_hash_opt {
+            if let Some(ref expected) = expected_hash {
+                if &final_hash != expected {
+                    warn!(
+                        "Checksum mismatch for {}. Expected {}, got {}. Saving anyway; CDN ETags may differ from raw SHA256.",
+                        id, expected, final_hash
+                    );
+                } else {
+                    info!("Checksum validated successfully for {}.", id);
+                }
+            } else {
+                info!(
+                    "No SHA-256 ETag found for {}. Saving. Computed: {}",
+                    id, final_hash
+                );
+            }
+        }
+    }
+
+    if stream_error {
+        info!(
+            "Network interrupted. Kept partial temp file for {} to resume later.",
+            id
+        );
+    } else {
+        if let Err(e) = tokio::fs::rename(&tmp_file_path, &file_path).await {
+            error!("Failed to rename temp file to final file for {}: {}", id, e);
+        } else {
+            let _ = tokio::fs::remove_file(&meta_file_path).await;
+            info!("Finished downloading {}", id);
+            {
+                let mut status = lock_status(&state.engine_status);
+                status.downloaded_models.insert(id.clone());
+            }
+        }
+    }
+}
+
+// Delete a downloaded model from disk
+pub(crate) async fn delete_model(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            "Admin access required for deleting models",
+        )
+            .into_response();
+    }
+
+    let download_task = {
+        let mut tasks = state
+            .download_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tasks.remove(&id)
+    };
+
+    if let Some(task) = download_task {
+        task.abort();
+        let _ = task.await; // Wait for the task to finish cancelling
+        info!("Aborted active download task for model {}", id);
+
+        let mut dl = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        dl.remove(&id);
+    } else {
+        let downloads = state
+            .active_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if downloads.contains_key(&id) {
+            return (
+                StatusCode::CONFLICT,
+                "Cannot delete a model while it is downloading.",
+            )
+                .into_response();
+        }
+    }
+
+    {
+        let status = lock_status(&state.engine_status);
+        if status.models_vram.iter().any(|m| m.id == id) {
+            return (StatusCode::CONFLICT, "Cannot delete a model while it is loaded in memory. Please load a different model first to free the VRAM.").into_response();
+        }
+    }
+
+    let registry = get_model_registry().await;
+    let model = match registry.into_iter().find(|m| m.id == id) {
+        Some(m) => m,
+        None => return (StatusCode::NOT_FOUND, "Model not found").into_response(),
+    };
+
+    let downloads_dir = &state.config.downloads_directory;
+    let file_path = format!("{}/{}", downloads_dir, model.filename);
+    let tmp_file_path = format!("{}.tmp", file_path);
+    let meta_file_path = format!("{}.meta", file_path);
+    let mut deleted = false;
+
+    if tokio::fs::remove_file(&file_path).await.is_ok() {
+        deleted = true;
+    }
+    if tokio::fs::remove_file(&tmp_file_path).await.is_ok() {
+        deleted = true;
+    }
+    if tokio::fs::remove_file(&meta_file_path).await.is_ok() {
+        deleted = true;
+    }
+
+    if deleted {
+        {
+            let mut status = lock_status(&state.engine_status);
+            status.model_health.remove(&id);
+            status.downloaded_models.remove(&id);
+        }
+        info!("Deleted model {} from disk", id);
+    }
+    (StatusCode::OK, "Model deleted").into_response()
 }
 
 // The Automated Benchmark Trigger
@@ -425,7 +1001,7 @@ pub(crate) async fn trigger_benchmark(
         for size in sorted_sizes {
             let filename = format!("benchmark_prompts/prompt_{}.txt", size);
 
-            if !std::path::Path::new(&filename).exists() {
+            if !tokio::fs::try_exists(&filename).await.unwrap_or(false) {
                 let mut should_save = false;
                 let mut final_content = String::new();
 
@@ -1361,12 +1937,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Boot up the GPU Orchestrator in the background
     let batcher_gpu_idx = config.gpu_device_index;
+    let downloads_dir = config.downloads_directory.clone();
     tokio::spawn(async move {
         run_batcher_loop(
             rx,
             status_for_batcher,
             telemetry_for_batcher,
             batcher_gpu_idx,
+            downloads_dir,
         )
         .await;
     });
@@ -1400,8 +1978,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Eagerly initialize the model registry in the background
-    tokio::spawn(async {
-        manager::get_model_registry().await;
+    let engine_status_for_init = engine_status.clone();
+    let downloads_dir_for_init = config.downloads_directory.clone();
+    tokio::spawn(async move {
+        let models = manager::get_model_registry().await;
+        let cache = hf_hub::Cache::default();
+        let mut downloaded_ids = Vec::new();
+        for model in models {
+            let local_path = format!("{}/{}", downloads_dir_for_init, model.filename);
+            let is_in_hf_cache = cache
+                .repo(hf_hub::Repo::model(model.repo.clone()))
+                .get(&model.filename)
+                .is_some();
+            if tokio::fs::try_exists(&local_path).await.unwrap_or(false) || is_in_hf_cache {
+                downloaded_ids.push(model.id);
+            }
+        }
+
+        let mut status = lock_status(&engine_status_for_init);
+        for id in downloaded_ids {
+            status.downloaded_models.insert(id);
+        }
+        info!(
+            "Found {} downloaded models on disk.",
+            status.downloaded_models.len()
+        );
     });
 
     let shared_state = Arc::new(AppState {
@@ -1415,6 +2016,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_buffer: memory_buffer,
         log_reload_handle,
         current_log_level: Arc::new(Mutex::new(config.log_level_memory.clone())),
+        active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         db: db_client.clone(),
     });
 
@@ -1633,6 +2236,8 @@ mod tests {
             )))),
             log_reload_handle,
             current_log_level: Arc::new(Mutex::new("info".to_string())),
+            active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             db,
         })
     }
@@ -1959,5 +2564,79 @@ mod tests {
         )
         .await;
         assert_eq!(res1_retry, Ok(StatusCode::OK));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
+    async fn test_get_download_progress() {
+        let state = create_test_app_state().await;
+
+        // Initially empty
+        let Json(progress) = get_download_progress(State(state.clone())).await;
+        assert!(progress.is_empty());
+
+        // Insert mock progress
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert(
+                "test-model".to_string(),
+                DownloadStatus {
+                    bytes_transferred: 50,
+                    total_bytes: 100,
+                    start_time: 123456789,
+                    current_speed_bps: 10.0,
+                    state: "Downloading...".to_string(),
+                },
+            );
+        }
+
+        // Fetch again and verify
+        let Json(progress) = get_download_progress(State(state.clone())).await;
+        assert_eq!(progress.len(), 1);
+        let status = progress.get("test-model").unwrap();
+        assert_eq!(status.bytes_transferred, 50);
+        assert_eq!(status.total_bytes, 100);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
+    async fn test_trigger_download_validation() {
+        let state = create_test_app_state().await;
+        let admin_user = mock_user("admin@local", true);
+        let normal_user = mock_user("user@local", false);
+
+        // 1. Non-admin should be rejected (403)
+        let res = trigger_download(
+            State(state.clone()),
+            normal_user,
+            Path("llama-3.1-8b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // 2. Admin requesting non-existent model should fail (404)
+        let res = trigger_download(
+            State(state.clone()),
+            admin_user.clone(),
+            Path("fake-model-id".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // 3. Admin requesting an already active download should fail (409)
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("llama-3.1-8b".to_string(), DownloadStatus::default());
+        }
+        let res = trigger_download(
+            State(state.clone()),
+            admin_user.clone(),
+            Path("llama-3.1-8b".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
     }
 }

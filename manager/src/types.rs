@@ -51,6 +51,10 @@ pub struct EngineStatus {
     pub ram_process_used: u64,
     pub ram_other_processes: u64,
     pub models_vram: Vec<ModelMemory>,
+    #[serde(default)]
+    pub model_health: std::collections::HashMap<String, bool>,
+    #[serde(default)]
+    pub downloaded_models: std::collections::HashSet<String>,
 }
 
 impl EngineStatus {
@@ -202,6 +206,16 @@ pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'
     status
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct DownloadStatus {
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+    pub start_time: u64,
+    pub current_speed_bps: f64,
+    #[serde(default)]
+    pub state: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]

@@ -55,15 +55,20 @@ impl DynamicModel {
 
 pub fn load_engine(
     config: &ModelConfig,
+    downloads_dir: &str,
     device: &Device,
 ) -> Result<(DynamicModel, Tokenizer, Option<std::fs::File>), String> {
     let api = Api::new().map_err(|e| e.to_string())?;
 
     if config.filename.ends_with(".safetensors") {
         let repo = api.model(config.repo.clone());
-        let weights_path = repo
-            .get(&config.filename)
-            .map_err(|e| format!("Missing weights: {}", e))?;
+        let local_weights = format!("{}/{}", downloads_dir, config.filename);
+        let weights_path = if std::path::Path::new(&local_weights).exists() {
+            std::path::PathBuf::from(local_weights)
+        } else {
+            repo.get(&config.filename)
+                .map_err(|e| format!("Missing weights: {}", e))?
+        };
         let config_path = repo
             .get("config.json")
             .map_err(|e| format!("Missing config.json: {}", e))?;
@@ -100,10 +105,14 @@ pub fn load_engine(
         return Ok((DynamicModel::XLMRoberta(model), tokenizer, None));
     }
 
-    let weights_path = api
-        .model(config.repo.clone())
-        .get(&config.filename)
-        .map_err(|e| e.to_string())?;
+    let local_weights = format!("{}/{}", downloads_dir, config.filename);
+    let weights_path = if std::path::Path::new(&local_weights).exists() {
+        std::path::PathBuf::from(local_weights)
+    } else {
+        api.model(config.repo.clone())
+            .get(&config.filename)
+            .map_err(|e| e.to_string())?
+    };
     let tokenizer_path = api
         .model(config.tokenizer_repo.clone())
         .get("tokenizer.json")
@@ -488,6 +497,7 @@ impl InferenceBackend for CandleEngine {
     async fn load_model(
         &mut self,
         config: &ModelConfig,
+        downloads_dir: &str,
         status: Arc<Mutex<EngineStatus>>,
         _strategy: &MemoryStrategy,
         _required_ctx: usize,
@@ -505,7 +515,7 @@ impl InferenceBackend for CandleEngine {
             );
         }
 
-        let (m, t, f) = load_engine(config, &self.device)?;
+        let (m, t, f) = load_engine(config, downloads_dir, &self.device)?;
         self.model = Some(m);
         self.tokenizer = Some(t);
         self._file = f;
