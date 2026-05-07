@@ -101,6 +101,7 @@ async function loadModels() {
             container.appendChild(card);
         });
     } catch (e) {
+        if (e.name === 'TypeError' && e.message === 'Failed to fetch') return; // Ignore browser teardown aborts
         console.error('Failed to load models directory:', e);
     }
 }
@@ -129,6 +130,7 @@ async function discoverActiveDownloads() {
             }
         });
     } catch (e) {
+        if (e.name === 'TypeError' && e.message === 'Failed to fetch') return; // Ignore browser teardown aborts
         console.error("Failed to discover active downloads:", e);
     }
 }

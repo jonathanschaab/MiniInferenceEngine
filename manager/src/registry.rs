@@ -469,42 +469,45 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                                             json.get("text_config").and_then(|tc| tc.get(key)).or_else(|| json.get(key))
                                         };
 
+                                        let is_optional_key = |key: &str| -> bool {
+                                            [
+                                                "head_dim",
+                                                "num_key_value_heads",
+                                                "sliding_window",
+                                                "num_local_experts",
+                                                "num_experts_per_tok",
+                                                "dtype",
+                                                "torch_dtype",
+                                            ]
+                                            .contains(&key)
+                                        };
+
                                         let get_u64 = |key: &str| -> Option<usize> {
-                                            match get_val(key) {
-                                                Some(val) if !val.is_null() => {
-                                                    if let Some(v) = val.as_u64() {
-                                                        Some(v as usize)
-                                                    } else {
-                                                    warn!("Invalid format for '{}' in config.json for {}", key, reg.id);
-                                                        None
-                                                    }
+                                            if let Some(val) = get_val(key)
+                                                && !val.is_null()
+                                            {
+                                                if let Some(v) = val.as_u64() {
+                                                    return Some(v as usize);
                                                 }
-                                                _ => {
-                                                    if key != "head_dim" && key != "num_key_value_heads" && key != "sliding_window" && key != "num_local_experts" && key != "num_experts_per_tok" {
-                                                    warn!("Missing '{}' in config.json for {}", key, reg.id);
-                                                    }
-                                                    None
-                                                }
+                                                warn!("Invalid format for '{}' in config.json for {}", key, reg.id);
+                                            } else if !is_optional_key(key) {
+                                                warn!("Missing '{}' in config.json for {}", key, reg.id);
                                             }
+                                            None
                                         };
 
                                         let get_str = |key: &str| -> Option<String> {
-                                            match get_val(key) {
-                                                Some(val) if !val.is_null() => {
-                                                    if let Some(v) = val.as_str() {
-                                                        Some(v.to_string())
-                                                    } else {
-                                                    warn!("Invalid format for '{}' in config.json for {}", key, reg.id);
-                                                        None
-                                                    }
+                                            if let Some(val) = get_val(key)
+                                                && !val.is_null()
+                                            {
+                                                if let Some(v) = val.as_str() {
+                                                    return Some(v.to_string());
                                                 }
-                                                _ => {
-                                                    if key != "dtype" && key != "torch_dtype" {
-                                                    warn!("Missing '{}' in config.json for {}", key, reg.id);
-                                                    }
-                                                    None
-                                                }
+                                                warn!("Invalid format for '{}' in config.json for {}", key, reg.id);
+                                            } else if !is_optional_key(key) {
+                                                warn!("Missing '{}' in config.json for {}", key, reg.id);
                                             }
+                                            None
                                         };
 
                                         // 1. Resolve arch first to inform subsequent parsing rules
