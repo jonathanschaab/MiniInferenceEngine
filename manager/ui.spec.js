@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
  * Intercepts browser requests and serves the raw HTML/JS/CSS files from the disk.
  */
 async function mockStaticAssets(page) {
-    const basePath = __dirname;
+    const basePath = path.join(__dirname, 'web');
 
     // Mock HTML routes
     const routes = {

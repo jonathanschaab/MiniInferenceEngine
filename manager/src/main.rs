@@ -236,23 +236,25 @@ pub(crate) async fn serve_ui(
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
-    Ok(Html(include_str!("../index.html")))
+    Ok(Html(include_str!("../web/index.html")))
 }
 
 // Send the model roster to the Javascript dropdowns
 pub(crate) async fn get_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelConfig>> {
     let mut models = get_model_registry().await;
-    let (downloaded_ids, cached_ids) = {
+    let (downloaded_ids, cached_ids, corrupted_ids) = {
         let status = lock_status(&state.engine_status);
         (
             status.downloaded_models.clone(),
             status.cached_models.clone(),
+            status.corrupted_models.clone(),
         )
     };
 
     for model in &mut models {
         model.is_downloaded = downloaded_ids.contains(&model.id);
         model.is_in_hf_cache = cached_ids.contains(&model.id);
+        model.is_corrupted = corrupted_ids.contains(&model.id);
     }
 
     Json(models)
@@ -860,6 +862,10 @@ async fn perform_model_download(
                     target_path.display(),
                     filename
                 );
+                {
+                    let mut status = lock_status(&state.engine_status);
+                    status.corrupted_models.insert(id.clone());
+                }
             } else {
                 info!("Finished downloading {}", id);
                 {
@@ -976,6 +982,7 @@ pub(crate) async fn delete_model(
         status.model_health.remove(&id);
         status.downloaded_models.remove(&id);
         status.cached_models.remove(&id);
+        status.corrupted_models.remove(&id);
     }
     info!("Deleted/cleared model {} from disk and state", id);
 
@@ -1476,7 +1483,7 @@ pub(crate) async fn serve_stats_ui(
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
-    Ok(Html(include_str!("../stats.html")))
+    Ok(Html(include_str!("../web/stats.html")))
 }
 
 pub(crate) async fn serve_settings_ui(
@@ -1485,7 +1492,7 @@ pub(crate) async fn serve_settings_ui(
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
-    Ok(Html(include_str!("../settings.html")))
+    Ok(Html(include_str!("../web/settings.html")))
 }
 
 pub(crate) async fn serve_models_ui(
@@ -1494,7 +1501,7 @@ pub(crate) async fn serve_models_ui(
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
-    Ok(Html(include_str!("../models.html")))
+    Ok(Html(include_str!("../web/models.html")))
 }
 
 pub(crate) async fn serve_memory_ui(
@@ -1503,7 +1510,7 @@ pub(crate) async fn serve_memory_ui(
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
-    Ok(Html(include_str!("../memory.html")))
+    Ok(Html(include_str!("../web/memory.html")))
 }
 
 pub(crate) async fn serve_console_ui(
@@ -1517,13 +1524,13 @@ pub(crate) async fn serve_console_ui(
     if !state.config.admin_emails.contains(&email) {
         return Err(Redirect::to("/"));
     }
-    Ok(Html(include_str!("../console.html")))
+    Ok(Html(include_str!("../web/console.html")))
 }
 
 pub(crate) async fn serve_console_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../console.js"),
+        include_str!("../web/console.js"),
     )
 }
 
@@ -1954,49 +1961,49 @@ pub(crate) async fn get_console_loglevel(
 pub(crate) async fn serve_chat_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../chat.js"),
+        include_str!("../web/chat.js"),
     )
 }
 
 pub(crate) async fn serve_stats_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../stats.js"),
+        include_str!("../web/stats.js"),
     )
 }
 
 pub(crate) async fn serve_models_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../models.js"),
+        include_str!("../web/models.js"),
     )
 }
 
 pub(crate) async fn serve_settings_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../settings.js"),
+        include_str!("../web/settings.js"),
     )
 }
 
 pub(crate) async fn serve_memory_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../memory.js"),
+        include_str!("../web/memory.js"),
     )
 }
 
 pub(crate) async fn serve_common_js() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../common.js"),
+        include_str!("../web/common.js"),
     )
 }
 
 pub(crate) async fn serve_common_css() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css")],
-        include_str!("../common.css"),
+        include_str!("../web/common.css"),
     )
 }
 
@@ -2193,32 +2200,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let models_clone = models.clone();
             let downloads_dir = downloads_dir_for_init.clone();
-            let (downloaded_ids, cached_ids) = tokio::task::spawn_blocking(move || {
-                let cache = hf_hub::Cache::default();
-                let mut d_ids = std::collections::HashSet::new();
-                let mut c_ids = std::collections::HashSet::new();
-                for model in &models_clone {
-                    let local_path = std::path::Path::new(&downloads_dir).join(&model.filename);
-                    let is_in_hf_cache = cache
-                        .repo(hf_hub::Repo::model(model.repo.clone()))
-                        .get(&model.filename)
-                        .is_some();
-                    if is_in_hf_cache {
-                        c_ids.insert(model.id.clone());
+            let (downloaded_ids, cached_ids, corrupted_ids) =
+                tokio::task::spawn_blocking(move || {
+                    let cache = hf_hub::Cache::default();
+                    let mut d_ids = std::collections::HashSet::new();
+                    let mut c_ids = std::collections::HashSet::new();
+                    let mut err_ids = std::collections::HashSet::new();
+                    for model in &models_clone {
+                        let local_path = std::path::Path::new(&downloads_dir).join(&model.filename);
+                        let corrupted_path = {
+                            let mut p = local_path.clone().into_os_string();
+                            p.push(".corrupted");
+                            std::path::PathBuf::from(p)
+                        };
+                        let is_in_hf_cache = cache
+                            .repo(hf_hub::Repo::model(model.repo.clone()))
+                            .get(&model.filename)
+                            .is_some();
+                        if is_in_hf_cache {
+                            c_ids.insert(model.id.clone());
+                        }
+                        if local_path.exists() || is_in_hf_cache {
+                            d_ids.insert(model.id.clone());
+                        }
+                        if corrupted_path.exists() {
+                            err_ids.insert(model.id.clone());
+                        }
                     }
-                    if local_path.exists() || is_in_hf_cache {
-                        d_ids.insert(model.id.clone());
-                    }
-                }
-                (d_ids, c_ids)
-            })
-            .await
-            .unwrap_or_default();
+                    (d_ids, c_ids, err_ids)
+                })
+                .await
+                .unwrap_or_default();
 
             let mut status = lock_status(&engine_status_for_init);
             if first_run {
                 status.downloaded_models = downloaded_ids.clone();
                 status.cached_models = cached_ids.clone();
+                status.corrupted_models = corrupted_ids.clone();
                 info!(
                     "Found {} downloaded models on disk.",
                     status.downloaded_models.len()
@@ -2226,6 +2244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 first_run = false;
             } else if status.downloaded_models != downloaded_ids
                 || status.cached_models != cached_ids
+                || status.corrupted_models != corrupted_ids
             {
                 info!(
                     "Disk state changed. Found {} downloaded models on disk.",
@@ -2233,6 +2252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 status.downloaded_models = downloaded_ids;
                 status.cached_models = cached_ids;
+                status.corrupted_models = corrupted_ids;
             }
         }
     });

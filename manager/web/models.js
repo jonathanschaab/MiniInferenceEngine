@@ -47,8 +47,10 @@ async function loadModels() {
                 healthBadge = `<span class="badge" style="background: #f38ba8; color: #11111b; margin-left: 10px;" title="Last run failed">❌ Failed</span>`;
             }
 
+            const corruptedBadge = model.is_corrupted ? `<span class="badge" style="background: #f38ba8; color: #11111b; margin-left: 10px;" title="A corrupted download file was detected. Please delete to clear it.">⚠️ Corrupted</span>` : '';
+
             let adminDeleteBtn = '';
-            if (isAdmin && model.is_downloaded) {
+            if (isAdmin) {
                 adminDeleteBtn = `<button class="btn-delete btn-cancel" style="padding: 5px 10px; font-size: 0.85rem;">🗑️ Delete</button>`;
             }
 
@@ -56,7 +58,7 @@ async function loadModels() {
 
             const downloadBtnHtml = model.is_downloaded
                 ? `<div style="display: flex; gap: 8px; align-items: center;">${adminDeleteBtn}<span class="badge badge-json" style="padding: 5px 10px;">Ready</span>${cacheBadge}</div>`
-                : `<button class="btn-download">Download Model</button>`;
+                : `<div style="display: flex; gap: 8px; align-items: center;">${adminDeleteBtn}<button class="btn-download">Download Model</button></div>`;
 
             const moeHtml = (model.num_local_experts != null && model.num_experts_per_tok != null)
                 ? `<div class="setting-item setting-moe"><span>MoE Routing</span> <span>${model.num_experts_per_tok} / ${model.num_local_experts} Active ${getBadge(model.provenance.num_local_experts)}</span></div>`
@@ -65,7 +67,7 @@ async function loadModels() {
             const cardHtml = `
                 <div class="model-header">
                     <div>
-                        <h2 style="margin:0; color: ${model.is_downloaded ? '#fab387' : '#6c7086'}; display: flex; align-items: center;">${model.name} ${healthBadge}</h2>
+                        <h2 style="margin:0; color: ${model.is_downloaded ? '#fab387' : '#6c7086'}; display: flex; align-items: center;">${model.name} ${healthBadge}${corruptedBadge}</h2>
                         <p style="margin: 5px 0 0 0; color: #a6adc8; font-size: 0.9rem;">ID: ${model.id} | Repo: <a href="https://huggingface.co/${model.repo}" target="_blank" style="color: #89b4fa;">${model.repo}</a></p>
                     </div>
                     <div style="text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">

@@ -137,6 +137,8 @@ pub struct ModelConfig {
     pub is_downloaded: bool,
     #[serde(default)]
     pub is_in_hf_cache: bool,
+    #[serde(default)]
+    pub is_corrupted: bool,
 }
 
 impl ModelConfig {
@@ -688,6 +690,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                         provenance,
                         is_downloaded: false, // This will be populated at runtime by the orchestrator
                         is_in_hf_cache: false, // This will be populated at runtime by the API
+                        is_corrupted: false, // This will be populated at runtime by the API
                     }
                 }));
             }
@@ -750,6 +753,7 @@ mod tests {
             provenance: HashMap::new(),
             is_downloaded: false,
             is_in_hf_cache: false,
+            is_corrupted: false,
         }
     }
 
