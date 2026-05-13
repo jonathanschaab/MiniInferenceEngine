@@ -135,6 +135,8 @@ pub struct ModelConfig {
     pub provenance: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub is_downloaded: bool,
+    #[serde(default)]
+    pub is_in_hf_cache: bool,
 }
 
 impl ModelConfig {
@@ -680,6 +682,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                         size_on_disk_gb: size_on_disk_gb.unwrap_or(fallback_size_gb),
                         provenance,
                         is_downloaded: false, // This will be populated at runtime by the orchestrator
+                        is_in_hf_cache: false, // This will be populated at runtime by the API
                     }
                 }));
             }
@@ -741,6 +744,7 @@ mod tests {
             is_default_compressor: false,
             provenance: HashMap::new(),
             is_downloaded: false,
+            is_in_hf_cache: false,
         }
     }
 

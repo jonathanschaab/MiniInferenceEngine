@@ -283,9 +283,10 @@ impl LlamaCppEngine {
                         let res = (|| -> Result<(usize, f32), String> {
                             let api = Api::new().map_err(|e| e.to_string())?;
                             let repo = api.model(config.repo.clone());
-                            let local_weights = format!("{}/{}", downloads_dir, config.filename);
-                            let weights_path = if std::path::Path::new(&local_weights).exists() {
-                                std::path::PathBuf::from(local_weights)
+                            let local_weights =
+                                std::path::Path::new(&downloads_dir).join(&config.filename);
+                            let weights_path = if local_weights.exists() {
+                                local_weights
                             } else {
                                 repo.get(&config.filename)
                                     .map_err(|e| format!("Missing weights: {}", e))?

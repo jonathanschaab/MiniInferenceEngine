@@ -62,9 +62,9 @@ pub fn load_engine(
 
     if config.filename.ends_with(".safetensors") {
         let repo = api.model(config.repo.clone());
-        let local_weights = format!("{}/{}", downloads_dir, config.filename);
-        let weights_path = if std::path::Path::new(&local_weights).exists() {
-            std::path::PathBuf::from(local_weights)
+        let local_weights = std::path::Path::new(downloads_dir).join(&config.filename);
+        let weights_path = if local_weights.exists() {
+            local_weights
         } else {
             repo.get(&config.filename)
                 .map_err(|e| format!("Missing weights: {}", e))?
@@ -105,9 +105,9 @@ pub fn load_engine(
         return Ok((DynamicModel::XLMRoberta(model), tokenizer, None));
     }
 
-    let local_weights = format!("{}/{}", downloads_dir, config.filename);
-    let weights_path = if std::path::Path::new(&local_weights).exists() {
-        std::path::PathBuf::from(local_weights)
+    let local_weights = std::path::Path::new(downloads_dir).join(&config.filename);
+    let weights_path = if local_weights.exists() {
+        local_weights
     } else {
         api.model(config.repo.clone())
             .get(&config.filename)

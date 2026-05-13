@@ -241,9 +241,31 @@ pub(crate) async fn serve_ui(
 
 // Send the model roster to the Javascript dropdowns
 pub(crate) async fn get_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelConfig>> {
-    let mut models = get_model_registry().await;
-    let status = lock_status(&state.engine_status);
-    let downloaded_ids = &status.downloaded_models;
+    let mut models_from_registry = get_model_registry().await;
+    let downloaded_ids = {
+        let status = lock_status(&state.engine_status);
+        status.downloaded_models.clone()
+    };
+
+    // This is a blocking operation, so move it to a blocking thread.
+    let models_res = tokio::task::spawn_blocking(move || {
+        let cache = hf_hub::Cache::default();
+        for model in &mut models_from_registry {
+            let repo = model.repo.clone();
+            let filename = model.filename.clone();
+            model.is_in_hf_cache = cache
+                .repo(hf_hub::Repo::model(repo))
+                .get(&filename)
+                .is_some();
+        }
+        models_from_registry
+    })
+    .await;
+
+    let mut models = match models_res {
+        Ok(m) => m,
+        Err(_) => get_model_registry().await, // Fallback on join error
+    };
 
     for model in &mut models {
         model.is_downloaded = downloaded_ids.contains(&model.id);
@@ -345,8 +367,12 @@ pub(crate) async fn trigger_download(
         return (StatusCode::CONFLICT, "Model is already downloaded").into_response();
     }
 
-    let file_path = format!("{}/{}", state.config.downloads_directory, model.filename);
-    let corrupted_path = format!("{}.corrupted", file_path);
+    let file_path = std::path::Path::new(&state.config.downloads_directory).join(&model.filename);
+    let corrupted_path = {
+        let mut p = file_path.clone().into_os_string();
+        p.push(".corrupted");
+        std::path::PathBuf::from(p)
+    };
     if tokio::fs::try_exists(&corrupted_path)
         .await
         .unwrap_or(false)
@@ -477,9 +503,17 @@ async fn perform_model_download(
         error!("Failed to create downloads directory for {}: {}", id, e);
         return;
     }
-    let file_path = format!("{}/{}", downloads_dir, filename);
-    let tmp_file_path = format!("{}.tmp", file_path);
-    let meta_file_path = format!("{}.meta", file_path);
+    let file_path = std::path::Path::new(downloads_dir).join(&filename);
+    let tmp_file_path = {
+        let mut p = file_path.clone().into_os_string();
+        p.push(".tmp");
+        std::path::PathBuf::from(p)
+    };
+    let meta_file_path = {
+        let mut p = file_path.clone().into_os_string();
+        p.push(".meta");
+        std::path::PathBuf::from(p)
+    };
 
     let mut existing_size = 0;
     let mut expected_hash = None;
@@ -599,7 +633,7 @@ async fn perform_model_download(
             .strip_prefix("W/")
             .unwrap_or(etag_str)
             .trim_matches('"');
-        if clean_etag.len() == 64 {
+        if clean_etag.len() == 64 && clean_etag.chars().all(|c| c.is_ascii_hexdigit()) {
             expected_hash = Some(clean_etag.to_string());
         }
     }
@@ -824,7 +858,9 @@ async fn perform_model_download(
         );
     } else {
         let target_path = if hash_mismatch {
-            format!("{}.corrupted", file_path)
+            let mut p = file_path.clone().into_os_string();
+            p.push(".corrupted");
+            std::path::PathBuf::from(p)
         } else {
             file_path.clone()
         };
@@ -836,7 +872,9 @@ async fn perform_model_download(
             if hash_mismatch {
                 error!(
                     "Download finished but checksum failed for {}. Saved as {}. Please verify the file and rename it manually to {} if it is valid.",
-                    id, target_path, filename
+                    id,
+                    target_path.display(),
+                    filename
                 );
             } else {
                 info!("Finished downloading {}", id);
@@ -909,10 +947,22 @@ pub(crate) async fn delete_model(
     };
 
     let downloads_dir = &state.config.downloads_directory;
-    let file_path = format!("{}/{}", downloads_dir, model.filename);
-    let tmp_file_path = format!("{}.tmp", file_path);
-    let meta_file_path = format!("{}.meta", file_path);
-    let corrupted_path = format!("{}.corrupted", file_path);
+    let file_path = std::path::Path::new(downloads_dir).join(&model.filename);
+    let tmp_file_path = {
+        let mut p = file_path.clone().into_os_string();
+        p.push(".tmp");
+        std::path::PathBuf::from(p)
+    };
+    let meta_file_path = {
+        let mut p = file_path.clone().into_os_string();
+        p.push(".meta");
+        std::path::PathBuf::from(p)
+    };
+    let corrupted_path = {
+        let mut p = file_path.clone().into_os_string();
+        p.push(".corrupted");
+        std::path::PathBuf::from(p)
+    };
 
     let _ = tokio::fs::remove_file(&file_path).await;
     let _ = tokio::fs::remove_file(&tmp_file_path).await;
@@ -940,6 +990,36 @@ pub(crate) async fn delete_model(
     info!("Deleted/cleared model {} from disk and state", id);
 
     (StatusCode::OK, "Model deleted").into_response()
+}
+
+#[derive(Serialize)]
+pub struct CacheStatusResponse {
+    is_in_hf_cache: bool,
+}
+
+pub(crate) async fn get_model_cache_status(
+    Path(id): Path<String>,
+) -> Result<Json<CacheStatusResponse>, StatusCode> {
+    let registry = get_model_registry().await;
+    let model = match registry.iter().find(|m| m.id == id) {
+        Some(m) => m,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    let repo = model.repo.clone();
+    let filename = model.filename.clone();
+
+    let is_in_hf_cache = tokio::task::spawn_blocking(move || {
+        let cache = hf_hub::Cache::default();
+        cache
+            .repo(hf_hub::Repo::model(repo))
+            .get(&filename)
+            .is_some()
+    })
+    .await
+    .unwrap_or(false);
+
+    Ok(Json(CacheStatusResponse { is_in_hf_cache }))
 }
 
 // The Automated Benchmark Trigger
@@ -1098,7 +1178,8 @@ pub(crate) async fn trigger_benchmark(
         sorted_sizes.sort();
 
         for size in sorted_sizes {
-            let filename = format!("benchmark_prompts/prompt_{}.txt", size);
+            let filename =
+                std::path::Path::new("benchmark_prompts").join(format!("prompt_{}.txt", size));
 
             if !tokio::fs::try_exists(&filename).await.unwrap_or(false) {
                 let mut should_save = false;
@@ -1276,7 +1357,8 @@ pub(crate) async fn trigger_benchmark(
             }
 
             for size in test_sizes {
-                let filename = format!("benchmark_prompts/prompt_{}.txt", size);
+                let filename =
+                    std::path::Path::new("benchmark_prompts").join(format!("prompt_{}.txt", size));
                 let exact_prompt = tokio::fs::read_to_string(&filename)
                     .await
                     .unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
@@ -1292,7 +1374,9 @@ pub(crate) async fn trigger_benchmark(
 
                     info!(
                         "📊 Benchmarking Generative {} using file {} on Backend {}...",
-                        model.name, filename, target_b
+                        model.name,
+                        filename.display(),
+                        target_b
                     );
 
                     let (response_tx, mut response_rx) = mpsc::unbounded_channel();
@@ -1333,7 +1417,8 @@ pub(crate) async fn trigger_benchmark(
             }
 
             for size in test_sizes {
-                let filename = format!("benchmark_prompts/prompt_{}.txt", size);
+                let filename =
+                    std::path::Path::new("benchmark_prompts").join(format!("prompt_{}.txt", size));
                 let exact_prompt = tokio::fs::read_to_string(&filename)
                     .await
                     .unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
@@ -1349,7 +1434,9 @@ pub(crate) async fn trigger_benchmark(
 
                     info!(
                         "📊 Benchmarking Compressor {} using file {} on Backend {}...",
-                        comp_model.name, filename, target_b
+                        comp_model.name,
+                        filename.display(),
+                        target_b
                     );
 
                     let (response_tx, mut response_rx) = mpsc::unbounded_channel();
@@ -2117,7 +2204,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut downloaded_ids = std::collections::HashSet::new();
 
             for model in &models {
-                let local_path = format!("{}/{}", downloads_dir_for_init, model.filename);
+                let local_path =
+                    std::path::Path::new(&downloads_dir_for_init).join(&model.filename);
                 let is_in_hf_cache = cache
                     .repo(hf_hub::Repo::model(model.repo.clone()))
                     .get(&model.filename)

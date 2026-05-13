@@ -52,8 +52,10 @@ async function loadModels() {
                 adminDeleteBtn = `<button class="btn-delete btn-cancel" style="padding: 5px 10px; font-size: 0.85rem;">🗑️ Delete</button>`;
             }
 
+            const cacheBadge = model.is_in_hf_cache ? `<span class="badge" style="background: #cba6f7; color: #11111b;" title="This model is also present in the global Hugging Face cache.">HF Cache</span>` : '';
+
             const downloadBtnHtml = model.is_downloaded
-                ? `<div style="display: flex; gap: 8px; align-items: center;">${adminDeleteBtn}<span class="badge badge-json" style="padding: 5px 10px;">Ready</span></div>`
+                ? `<div style="display: flex; gap: 8px; align-items: center;">${adminDeleteBtn}<span class="badge badge-json" style="padding: 5px 10px;">Ready</span>${cacheBadge}</div>`
                 : `<button class="btn-download">Download Model</button>`;
 
             const moeHtml = (model.num_local_experts != null && model.num_experts_per_tok != null)
@@ -238,7 +240,24 @@ async function startDownload(modelId) {
 };
 
 async function deleteModel(modelId) {
-    if (!confirm(`Are you sure you want to permanently delete the weights for ${modelId} from disk?`)) return;
+    let warning = `Are you sure you want to permanently delete the weights for ${modelId} from disk?`;
+
+    try {
+        const res = await fetchWithAuth(`/api/models/${modelId}/cache_status`);
+        if (res.ok) {
+            const status = await res.json();
+            if (status.is_in_hf_cache) {
+                warning += `\n\nWARNING: This will also remove the model from the global Hugging Face cache, which will affect any other applications on this system using these exact weights.`;
+            }
+        }
+    } catch (e) {
+        // Fail safe: if we can't check, show the full warning
+        warning += `\n\nWARNING: This will also remove the model from the global Hugging Face cache, which will affect any other applications on this system using these exact weights.`;
+        console.warn("Could not check HF cache status, showing full delete warning.", e);
+    }
+
+    if (!confirm(warning)) return;
+
     try {
         const res = await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
         if (res.ok) {
