@@ -134,7 +134,6 @@ pub struct ModelConfig {
     pub is_default_compressor: bool,
     pub provenance: std::collections::HashMap<String, String>,
     #[serde(default)]
-    #[serde(skip_serializing)]
     pub is_downloaded: bool,
 }
 

@@ -843,26 +843,18 @@ pub(crate) async fn delete_model(
     let file_path = format!("{}/{}", downloads_dir, model.filename);
     let tmp_file_path = format!("{}.tmp", file_path);
     let meta_file_path = format!("{}.meta", file_path);
-    let mut deleted = false;
 
-    if tokio::fs::remove_file(&file_path).await.is_ok() {
-        deleted = true;
-    }
-    if tokio::fs::remove_file(&tmp_file_path).await.is_ok() {
-        deleted = true;
-    }
-    if tokio::fs::remove_file(&meta_file_path).await.is_ok() {
-        deleted = true;
-    }
+    let _ = tokio::fs::remove_file(&file_path).await;
+    let _ = tokio::fs::remove_file(&tmp_file_path).await;
+    let _ = tokio::fs::remove_file(&meta_file_path).await;
 
-    if deleted {
-        {
-            let mut status = lock_status(&state.engine_status);
-            status.model_health.remove(&id);
-            status.downloaded_models.remove(&id);
-        }
-        info!("Deleted model {} from disk", id);
+    {
+        let mut status = lock_status(&state.engine_status);
+        status.model_health.remove(&id);
+        status.downloaded_models.remove(&id);
     }
+    info!("Deleted/cleared model {} from disk and state", id);
+
     (StatusCode::OK, "Model deleted").into_response()
 }
 
@@ -1888,6 +1880,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Background Temp File Cleanup Task
+    let downloads_dir_for_cleanup = config.downloads_directory.clone();
+    tokio::spawn(async move {
+        // Sweep the downloads directory every 12 hours
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 3600));
+        loop {
+            interval.tick().await;
+            if let Ok(mut entries) = tokio::fs::read_dir(&downloads_dir_for_cleanup).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if let Some(ext) = path.extension()
+                        && (ext == "tmp" || ext == "meta")
+                        && let Ok(metadata) = entry.metadata().await
+                        && let Ok(modified) = metadata.modified()
+                        && let Ok(age) = modified.elapsed()
+                        && age.as_secs() > 3 * 24 * 3600
+                    {
+                        // If the temporary file hasn't been touched in > 3 days, delete it
+                        let _ = tokio::fs::remove_file(&path).await;
+                        info!("Cleaned up abandoned download temp file: {:?}", path);
+                    }
+                }
+            }
+        }
+    });
+
     // Background VRAM Tracker
     let status_for_nvml = engine_status.clone();
     let vram_tracker_gpu_idx = config.gpu_device_index;
@@ -2004,28 +2022,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine_status_for_init = engine_status.clone();
     let downloads_dir_for_init = config.downloads_directory.clone();
     tokio::spawn(async move {
-        let models = manager::get_model_registry().await;
-        let cache = hf_hub::Cache::default();
-        let mut downloaded_ids = Vec::new();
-        for model in models {
-            let local_path = format!("{}/{}", downloads_dir_for_init, model.filename);
-            let is_in_hf_cache = cache
-                .repo(hf_hub::Repo::model(model.repo.clone()))
-                .get(&model.filename)
-                .is_some();
-            if tokio::fs::try_exists(&local_path).await.unwrap_or(false) || is_in_hf_cache {
-                downloaded_ids.push(model.id);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut first_run = true;
+        loop {
+            interval.tick().await;
+            let models = manager::get_model_registry().await;
+            let cache = hf_hub::Cache::default();
+            let mut downloaded_ids = std::collections::HashSet::new();
+
+            for model in models {
+                let local_path = format!("{}/{}", downloads_dir_for_init, model.filename);
+                let is_in_hf_cache = cache
+                    .repo(hf_hub::Repo::model(model.repo.clone()))
+                    .get(&model.filename)
+                    .is_some();
+                if tokio::fs::try_exists(&local_path).await.unwrap_or(false) || is_in_hf_cache {
+                    downloaded_ids.insert(model.id);
+                }
+            }
+
+            let mut status = lock_status(&engine_status_for_init);
+            if first_run {
+                status.downloaded_models = downloaded_ids.clone();
+                info!(
+                    "Found {} downloaded models on disk.",
+                    status.downloaded_models.len()
+                );
+                first_run = false;
+            } else if status.downloaded_models != downloaded_ids {
+                info!(
+                    "Disk state changed. Found {} downloaded models on disk.",
+                    downloaded_ids.len()
+                );
+                status.downloaded_models = downloaded_ids;
             }
         }
-
-        let mut status = lock_status(&engine_status_for_init);
-        for id in downloaded_ids {
-            status.downloaded_models.insert(id);
-        }
-        info!(
-            "Found {} downloaded models on disk.",
-            status.downloaded_models.len()
-        );
     });
 
     let shared_state = Arc::new(AppState {
