@@ -441,7 +441,8 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
                     bytes_transferred: 52428800, // 50 MB
                     total_bytes: 104857600,      // 100 MB
                     current_speed_bps: 10485760, // 10 MB/s
-                    start_time: Math.floor(Date.now() / 1000) - 5
+                    start_time: Math.floor(Date.now() / 1000) - 5,
+                    state: 'Downloading...'
                 };
                 await route.fulfill({ status: 202, body: '' });
             } else {
@@ -492,7 +493,7 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         // Mock the download POST request
         await page.route('**/api/models/mock-model-1/download', async route => {
             if (route.request().method() === 'POST') {
-                downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 1000000, start_time: 0 };
+                downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 1000000, start_time: 0, state: 'Downloading...' };
                 await route.fulfill({ status: 202, body: '' });
             } else {
                 route.fallback();
@@ -550,7 +551,7 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
 
         await page.route('**/api/models/*/download', async route => {
             if (route.request().method() === 'POST') {
-                downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 10, start_time: Math.floor(Date.now() / 1000) };
+                downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 10, start_time: Math.floor(Date.now() / 1000), state: 'Downloading...' };
                 await route.fulfill({ status: 202, body: '' });
             } else {
                 route.fallback();

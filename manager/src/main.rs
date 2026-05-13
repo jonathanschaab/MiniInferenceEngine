@@ -458,14 +458,31 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
     let mut existing_size = 0;
     let mut expected_hash = None;
 
-    if let Ok(meta_str) = tokio::fs::read_to_string(&meta_file_path).await
-        && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str)
-    {
-        if let Some(bytes) = meta.get("downloaded_bytes").and_then(|v| v.as_u64()) {
+    if let Ok(meta_str) = tokio::fs::read_to_string(&meta_file_path).await {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str)
+            && let Some(bytes) = meta.get("downloaded_bytes").and_then(|v| v.as_u64())
+        {
             existing_size = bytes;
-        }
-        if let Some(hash) = meta.get("expected_hash").and_then(|v| v.as_str()) {
-            expected_hash = Some(hash.to_string());
+            if let Some(hash) = meta.get("expected_hash").and_then(|v| v.as_str()) {
+                expected_hash = Some(hash.to_string());
+            }
+        } else {
+            warn!(
+                "Corrupted or invalid metadata file found for {}. Discarding and restarting download.",
+                id
+            );
+            {
+                let mut dl = state
+                    .active_downloads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(status) = dl.get_mut(&id) {
+                    status.state = "Corrupted metadata. Restarting...".to_string();
+                }
+            }
+            let _ = tokio::fs::remove_file(&meta_file_path).await;
+            let _ = tokio::fs::remove_file(&tmp_file_path).await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
     }
 
@@ -474,8 +491,14 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
             .write(true)
             .open(&tmp_file_path)
             .await
+            && let Ok(metadata) = file.metadata().await
         {
-            let _ = file.set_len(existing_size).await;
+            let actual_size = metadata.len();
+            if actual_size < existing_size {
+                existing_size = actual_size;
+            } else if actual_size > existing_size {
+                let _ = file.set_len(existing_size).await;
+            }
         } else {
             existing_size = 0;
         }

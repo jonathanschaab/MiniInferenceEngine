@@ -179,8 +179,8 @@ async function startDownload(modelId) {
             
             if (bar) bar.style.width = `${pct}%`;
             if (stats) {
-                if (status.state === 'Verifying...') {
-                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | Verifying...`;
+                if (status.state !== 'Downloading...') {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | ${status.state}`;
                 } else {
                     stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
                 }
