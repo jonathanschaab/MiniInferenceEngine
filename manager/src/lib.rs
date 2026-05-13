@@ -222,6 +222,8 @@ pub async fn run_batcher_loop(
 
     info!("ORCHESTRATOR ONLINE: Waiting for requests...");
 
+    let registry = get_model_registry().await;
+
     'main: while let Some(request) = receiver.recv().await {
         info!("Processing new chat request...");
 
@@ -238,11 +240,7 @@ pub async fn run_batcher_loop(
 
         let requested_max_tokens = request.parameters.max_tokens.unwrap_or(500);
         let ctx_buffer = request.parameters.context_buffer.unwrap_or(0);
-        let mut config_for_prompt = match get_model_registry()
-            .await
-            .iter()
-            .find(|c| c.id == request.chat_model_id)
-        {
+        let mut config_for_prompt = match registry.iter().find(|c| c.id == request.chat_model_id) {
             Some(c) => c.clone(),
             None => {
                 let _ = request.responder.send(StreamEvent::Error(
@@ -633,8 +631,7 @@ pub async fn run_batcher_loop(
                 s.set_model_status(&active_model_id, "Idle");
             }
 
-            let comp_config = match get_model_registry()
-                .await
+            let comp_config = match registry
                 .iter()
                 .find(|c| c.id == request.compressor_model_id)
             {

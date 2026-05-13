@@ -345,6 +345,15 @@ pub(crate) async fn trigger_download(
         return (StatusCode::CONFLICT, "Model is already downloaded").into_response();
     }
 
+    let file_path = format!("{}/{}", state.config.downloads_directory, model.filename);
+    let corrupted_path = format!("{}.corrupted", file_path);
+    if tokio::fs::try_exists(&corrupted_path)
+        .await
+        .unwrap_or(false)
+    {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "A corrupted download for this model already exists on disk. Please contact an admin to verify it or delete the model to try again.").into_response();
+    }
+
     {
         let mut downloads = state
             .active_downloads
@@ -733,6 +742,8 @@ async fn perform_model_download(
     // Explicitly drop the file handle so Windows allows us to rename/delete it
     drop(file);
 
+    let mut hash_mismatch = false;
+
     if !stream_error {
         let final_hash_opt = if existing_size == 0 {
             Some(hex::encode(hasher.finalize()))
@@ -780,10 +791,11 @@ async fn perform_model_download(
         if let Some(final_hash) = final_hash_opt {
             if let Some(ref expected) = expected_hash {
                 if &final_hash != expected {
-                    warn!(
-                        "Checksum mismatch for {}. Expected {}, got {}. Saving anyway; CDN ETags may differ from raw SHA256.",
+                    error!(
+                        "Checksum mismatch for {}. Expected {}, got {}. Marking as corrupted.",
                         id, expected, final_hash
                     );
+                    hash_mismatch = true;
                 } else {
                     info!("Checksum validated successfully for {}.", id);
                 }
@@ -811,14 +823,27 @@ async fn perform_model_download(
             id
         );
     } else {
-        if let Err(e) = tokio::fs::rename(&tmp_file_path, &file_path).await {
+        let target_path = if hash_mismatch {
+            format!("{}.corrupted", file_path)
+        } else {
+            file_path.clone()
+        };
+
+        if let Err(e) = tokio::fs::rename(&tmp_file_path, &target_path).await {
             error!("Failed to rename temp file to final file for {}: {}", id, e);
         } else {
             let _ = tokio::fs::remove_file(&meta_file_path).await;
-            info!("Finished downloading {}", id);
-            {
-                let mut status = lock_status(&state.engine_status);
-                status.downloaded_models.insert(id.clone());
+            if hash_mismatch {
+                error!(
+                    "Download finished but checksum failed for {}. Saved as {}. Please verify the file and rename it manually to {} if it is valid.",
+                    id, target_path, filename
+                );
+            } else {
+                info!("Finished downloading {}", id);
+                {
+                    let mut status = lock_status(&state.engine_status);
+                    status.downloaded_models.insert(id.clone());
+                }
             }
         }
     }
@@ -887,10 +912,12 @@ pub(crate) async fn delete_model(
     let file_path = format!("{}/{}", downloads_dir, model.filename);
     let tmp_file_path = format!("{}.tmp", file_path);
     let meta_file_path = format!("{}.meta", file_path);
+    let corrupted_path = format!("{}.corrupted", file_path);
 
     let _ = tokio::fs::remove_file(&file_path).await;
     let _ = tokio::fs::remove_file(&tmp_file_path).await;
     let _ = tokio::fs::remove_file(&meta_file_path).await;
+    let _ = tokio::fs::remove_file(&corrupted_path).await;
 
     // Also attempt to remove the model from the Hugging Face cache to prevent it from reappearing
     let cache = hf_hub::Cache::default();
@@ -2083,20 +2110,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut first_run = true;
+        let cache = hf_hub::Cache::default();
+        let models = manager::get_model_registry().await;
         loop {
             interval.tick().await;
-            let models = manager::get_model_registry().await;
-            let cache = hf_hub::Cache::default();
             let mut downloaded_ids = std::collections::HashSet::new();
 
-            for model in models {
+            for model in &models {
                 let local_path = format!("{}/{}", downloads_dir_for_init, model.filename);
                 let is_in_hf_cache = cache
                     .repo(hf_hub::Repo::model(model.repo.clone()))
                     .get(&model.filename)
                     .is_some();
                 if tokio::fs::try_exists(&local_path).await.unwrap_or(false) || is_in_hf_cache {
-                    downloaded_ids.insert(model.id);
+                    downloaded_ids.insert(model.id.clone());
                 }
             }
 
