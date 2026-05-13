@@ -210,7 +210,6 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
         if api_opt.is_none() {
             warn!("Failed to init HF API. Offline mode fallback active.");
         }
-        let cache = hf_hub::Cache::default();
 
         let registrations = vec![
             ModelRegistration {
@@ -408,7 +407,6 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
 
         for reg in registrations {
             let api_opt = api_opt.clone();
-            let cache = cache.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut provenance = std::collections::HashMap::new();
@@ -446,11 +444,18 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                     check_override(num_experts_per_tok.is_some(), "num_experts_per_tok");
                     check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
 
-                let cached_meta = if let Some(gguf_path) = cache.repo(hf_hub::Repo::model(reg.repo.to_string())).get(reg.filename) {
-                    tokio::fs::metadata(&gguf_path).await.ok()
-                } else {
-                    None
-                };
+                let repo = reg.repo;
+                let filename = reg.filename;
+                let cached_meta = tokio::task::spawn_blocking(move || {
+                    let cache = hf_hub::Cache::default();
+                    if let Some(gguf_path) = cache.repo(hf_hub::Repo::model(repo.to_string())).get(filename) {
+                        std::fs::metadata(&gguf_path).ok()
+                    } else {
+                        None
+                    }
+                })
+                .await
+                .unwrap_or(None);
 
                 if let None = size_on_disk_gb
                     && let Some(meta) = cached_meta

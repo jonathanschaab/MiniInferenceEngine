@@ -970,11 +970,16 @@ pub(crate) async fn delete_model(
     let _ = tokio::fs::remove_file(&corrupted_path).await;
 
     // Also attempt to remove the model from the Hugging Face cache to prevent it from reappearing
-    let cache = hf_hub::Cache::default();
-    if let Some(cached_path) = cache
-        .repo(hf_hub::Repo::model(model.repo.clone()))
-        .get(&model.filename)
-    {
+    let repo = model.repo.clone();
+    let filename = model.filename.clone();
+    let cached_path_res = tokio::task::spawn_blocking(move || {
+        let cache = hf_hub::Cache::default();
+        cache.repo(hf_hub::Repo::model(repo)).get(&filename)
+    })
+    .await
+    .unwrap_or(None);
+
+    if let Some(cached_path) = cached_path_res {
         // Resolve symlinks to delete the actual blob taking up space
         if let Ok(real_path) = tokio::fs::canonicalize(&cached_path).await {
             let _ = tokio::fs::remove_file(real_path).await;
@@ -2197,23 +2202,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         let mut first_run = true;
-        let cache = hf_hub::Cache::default();
         let models = manager::get_model_registry().await;
         loop {
             interval.tick().await;
-            let mut downloaded_ids = std::collections::HashSet::new();
 
-            for model in &models {
-                let local_path =
-                    std::path::Path::new(&downloads_dir_for_init).join(&model.filename);
-                let is_in_hf_cache = cache
-                    .repo(hf_hub::Repo::model(model.repo.clone()))
-                    .get(&model.filename)
-                    .is_some();
-                if tokio::fs::try_exists(&local_path).await.unwrap_or(false) || is_in_hf_cache {
-                    downloaded_ids.insert(model.id.clone());
+            let models_clone = models.clone();
+            let downloads_dir = downloads_dir_for_init.clone();
+            let downloaded_ids = tokio::task::spawn_blocking(move || {
+                let cache = hf_hub::Cache::default();
+                let mut ids = std::collections::HashSet::new();
+                for model in &models_clone {
+                    let local_path = std::path::Path::new(&downloads_dir).join(&model.filename);
+                    let is_in_hf_cache = cache
+                        .repo(hf_hub::Repo::model(model.repo.clone()))
+                        .get(&model.filename)
+                        .is_some();
+                    if local_path.exists() || is_in_hf_cache {
+                        ids.insert(model.id.clone());
+                    }
                 }
-            }
+                ids
+            })
+            .await
+            .unwrap_or_default();
 
             let mut status = lock_status(&engine_status_for_init);
             if first_run {
