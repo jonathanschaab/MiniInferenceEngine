@@ -79,6 +79,8 @@ pub struct AppConfig {
     pub log_file_name: String,
     #[serde(default = "default_downloads_directory")]
     pub downloads_directory: String,
+    #[serde(default = "default_hf_base_url")]
+    pub hf_base_url: String,
     #[serde(default)]
     pub database: DatabaseConfig,
 }
@@ -114,6 +116,9 @@ fn default_telemetry_retention_days() -> u64 {
 fn default_downloads_directory() -> String {
     "downloads".to_string()
 }
+fn default_hf_base_url() -> String {
+    "https://huggingface.co".to_string()
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -134,6 +139,7 @@ impl Default for AppConfig {
             log_level_memory: default_log_level_memory(),
             log_file_name: default_log_file_name(),
             downloads_directory: default_downloads_directory(),
+            hf_base_url: default_hf_base_url(),
             database: DatabaseConfig::default(),
         }
     }
@@ -221,6 +227,7 @@ pub struct AppState {
     pub active_downloads: Arc<Mutex<std::collections::HashMap<String, DownloadStatus>>>,
     pub download_tasks: Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
+    pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 pub(crate) async fn serve_ui(
@@ -365,9 +372,10 @@ pub(crate) async fn trigger_download(
     let id_clone = id.clone();
     let repo = model.repo.clone();
     let filename = model.filename.clone();
+    let shutdown_rx = state.shutdown_tx.subscribe();
 
     let task = tokio::spawn(async move {
-        perform_model_download(state_clone, id_clone, repo, filename).await;
+        perform_model_download(state_clone, id_clone, repo, filename, shutdown_rx).await;
     });
 
     state
@@ -437,13 +445,22 @@ impl Drop for DownloadCleanupGuard {
     }
 }
 
-async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, filename: String) {
+async fn perform_model_download(
+    state: Arc<AppState>,
+    id: String,
+    repo: String,
+    filename: String,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) {
     let _guard = DownloadCleanupGuard {
         state: state.clone(),
         id: id.clone(),
     };
 
-    let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, filename);
+    let url = format!(
+        "{}/{}/resolve/main/{}",
+        state.config.hf_base_url, repo, filename
+    );
     let client = &state.reqwest_client;
 
     let downloads_dir = &state.config.downloads_directory;
@@ -634,9 +651,19 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
 
     use tokio::io::AsyncWriteExt;
 
-    while let Some(chunk) = res.chunk().await.transpose() {
-        match chunk {
-            Ok(bytes) => {
+    loop {
+        tokio::select! {
+            chunk_res = res.chunk() => {
+                let bytes = match chunk_res {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!("Error while streaming {}: {}", id, e);
+                        stream_error = true;
+                        break;
+                    }
+                };
+
                 if existing_size == 0 {
                     hasher.update(&bytes);
                 }
@@ -687,10 +714,18 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
                     last_meta_save = std::time::Instant::now();
                 }
             }
-            Err(e) => {
-                error!("Error while streaming {}: {}", id, e);
-                stream_error = true;
-                break;
+            _ = shutdown_rx.recv() => {
+                info!("Shutdown signal received. Flushing metadata for {}...", id);
+                let _ = tokio::fs::write(
+                    &meta_file_path,
+                    serde_json::json!({
+                        "downloaded_bytes": downloaded,
+                        "expected_hash": expected_hash
+                    })
+                    .to_string(),
+                )
+                .await;
+                return;
             }
         }
     }
@@ -762,6 +797,15 @@ async fn perform_model_download(state: Arc<AppState>, id: String, repo: String, 
     }
 
     if stream_error {
+        let _ = tokio::fs::write(
+            &meta_file_path,
+            serde_json::json!({
+                "downloaded_bytes": downloaded,
+                "expected_hash": expected_hash
+            })
+            .to_string(),
+        )
+        .await;
         info!(
             "Network interrupted. Kept partial temp file for {} to resume later.",
             id
@@ -847,6 +891,19 @@ pub(crate) async fn delete_model(
     let _ = tokio::fs::remove_file(&file_path).await;
     let _ = tokio::fs::remove_file(&tmp_file_path).await;
     let _ = tokio::fs::remove_file(&meta_file_path).await;
+
+    // Also attempt to remove the model from the Hugging Face cache to prevent it from reappearing
+    let cache = hf_hub::Cache::default();
+    if let Some(cached_path) = cache
+        .repo(hf_hub::Repo::model(model.repo.clone()))
+        .get(&model.filename)
+    {
+        // Resolve symlinks to delete the actual blob taking up space
+        if let Ok(real_path) = tokio::fs::canonicalize(&cached_path).await {
+            let _ = tokio::fs::remove_file(real_path).await;
+        }
+        let _ = tokio::fs::remove_file(cached_path).await;
+    }
 
     {
         let mut status = lock_status(&state.engine_status);
@@ -1863,6 +1920,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_client = setup::init_db(&config).await?;
 
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(16);
+
     // Background Telemetry Cleanup Task
     let db_for_cleanup = db_client.clone();
     let retention_days = config.telemetry_retention_days;
@@ -2073,6 +2132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
         download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         db: db_client.clone(),
+        shutdown_tx: shutdown_tx.clone(),
     });
 
     // Setup Session Layer
@@ -2104,7 +2164,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (force_tx, force_rx) = tokio::sync::oneshot::channel();
 
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(force_tx));
+    let server =
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(force_tx, shutdown_tx));
 
     tokio::select! {
         res = server => { res?; }
@@ -2114,7 +2175,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn shutdown_signal(force_tx: tokio::sync::oneshot::Sender<()>) {
+async fn shutdown_signal(
+    force_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -2137,6 +2201,7 @@ async fn shutdown_signal(force_tx: tokio::sync::oneshot::Sender<()>) {
         _ = terminate => {},
     }
     info!("Received termination signal, starting graceful shutdown...");
+    let _ = shutdown_tx.send(());
 
     // Force shutdown if graceful shutdown takes longer than 30 seconds, or if a second signal is received
     tokio::spawn(async move {
@@ -2262,6 +2327,8 @@ mod tests {
         let (_, log_reload_handle) =
             tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
 
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(16);
+
         Arc::new(AppState {
             queue_tx,
             engine_status: Arc::new(Mutex::new(EngineStatus::default())),
@@ -2293,6 +2360,7 @@ mod tests {
             active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
             download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             db,
+            shutdown_tx,
         })
     }
 
@@ -2692,5 +2760,127 @@ mod tests {
         .await
         .into_response();
         assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_signal_flushes_download_metadata() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        // 1. Create a mock server that slowly streams data
+        let mock_app = Router::new().route(
+            "/{*path}",
+            get(|| async {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move {
+                    for _ in 0..100 {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        if tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 1024],
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "102400")
+                    .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+                    .unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        // 2. Setup isolated AppState configured to point to our mock server
+        let mut config = AppConfig::default();
+        config.hf_base_url = format!("http://127.0.0.1:{}", port);
+        config.downloads_directory = "test_downloads_shutdown".to_string();
+        let _ = tokio::fs::create_dir_all(&config.downloads_directory).await;
+
+        let (queue_tx, _) = mpsc::channel(1);
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+        let (_, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
+
+        let oauth_client = oauth2::basic::BasicClient::new(
+            oauth2::ClientId::new("dummy".to_string()),
+            None,
+            oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+            None,
+        );
+
+        let state = Arc::new(AppState {
+            queue_tx,
+            engine_status: Arc::new(Mutex::new(EngineStatus::default())),
+            telemetry: Arc::new(Mutex::new(TelemetryStore::default())),
+            auth_store: Arc::new(Mutex::new(AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client,
+            config: Arc::new(config),
+            log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle,
+            current_log_level: Arc::new(Mutex::new("info".to_string())),
+            active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            db,
+            shutdown_tx: shutdown_tx.clone(),
+        });
+
+        // 3. Spawn the model downloader
+        let state_clone = state.clone();
+        let task = tokio::spawn(async move {
+            perform_model_download(
+                state_clone,
+                "test-model".to_string(),
+                "test/repo".to_string(),
+                "model.safetensors".to_string(),
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        // Let it connect and download a chunk or two
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // 4. Fire shutdown signal!
+        let _ = shutdown_tx.send(());
+
+        // Wait for cancellation to forcibly exit the task
+        let _ = task.await;
+
+        // 5. Verify the metadata file was saved right before exiting
+        let meta_path = "test_downloads_shutdown/model.safetensors.meta";
+        let meta_content = tokio::fs::read_to_string(meta_path)
+            .await
+            .expect("Meta file should exist after graceful abort");
+
+        let meta_json: serde_json::Value = serde_json::from_str(&meta_content).unwrap();
+        let downloaded = meta_json["downloaded_bytes"].as_u64().unwrap();
+
+        assert!(
+            downloaded > 0,
+            "Should have downloaded at least some bytes before shutting down"
+        );
+        assert!(
+            downloaded < 100 * 1024,
+            "Should have aborted before reaching the full file size"
+        );
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all("test_downloads_shutdown").await;
     }
 }

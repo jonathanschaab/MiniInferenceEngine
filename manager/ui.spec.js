@@ -115,11 +115,16 @@ async function mockEngineApis(page) {
 }
 
 test.describe('Mini Inference Engine - UI Functionality', () => {
-    test.beforeEach(async ({ page }) => {
+    test.beforeEach(async ({ page }, testInfo) => {
         // Route browser console logs and uncaught errors directly to the terminal
         page.on('pageerror', err => console.log(`[Browser Exception]: ${err.message}`));
         page.on('console', msg => {
             if (msg.type() === 'error' || msg.type() === 'warning') {
+                // Ignore expected intentional errors from network interruption tests
+                if (testInfo.title === 'Models Directory recovers from network interruptions during download' && msg.text().includes('interrupted, retrying in 5s')) {
+                    return;
+                }
+
                 console.log(`[Browser Console]: ${msg.text()}`);
             }
         });

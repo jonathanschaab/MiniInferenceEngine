@@ -42,6 +42,8 @@ function getGenerationParameters() {
 function downloadModel(modelId, callbacks = {}) {
     let isStopped = false;
     let stopReason = null;
+    let retryCount = 0;
+    const MAX_RETRIES = 5;
 
     const cancel = async () => {
         isStopped = true;
@@ -79,10 +81,22 @@ function downloadModel(modelId, callbacks = {}) {
                 if (!activeDls[modelId]) {
                     try {
                         await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'POST' });
+                        retryCount = 0;
                     } catch (e) {
                         if (e.message === 'Unauthorized') throw e;
                         if (!e.message.includes('409')) {
-                            if (callbacks.onStatusText) callbacks.onStatusText(`Failed to start. Retrying in 5s...`);
+                            // Immediately abort on permanent 4xx errors (excluding 409 Conflict and 429 Too Many Requests)
+                            const isPermanent = e.message.match(/HTTP error 4(?!09|29)\d\d/);
+                            if (isPermanent) {
+                                if (callbacks.onStatusText) callbacks.onStatusText('Download Failed (Permanent Error).');
+                                throw e;
+                            }
+                            retryCount++;
+                            if (retryCount > MAX_RETRIES) {
+                                if (callbacks.onStatusText) callbacks.onStatusText('Download Failed (Max Retries).');
+                                throw new Error(`Max retries reached: ${e.message}`);
+                            }
+                            if (callbacks.onStatusText) callbacks.onStatusText(`Failed to start. Retrying in 5s... (${retryCount}/${MAX_RETRIES})`);
                             await sleep(5000);
                             continue;
                         }
@@ -95,6 +109,7 @@ function downloadModel(modelId, callbacks = {}) {
                     const status = downloads[modelId];
                     
                     if (status) {
+                        retryCount = 0;
                         const pct = status.total_bytes > 0 ? (status.bytes_transferred / status.total_bytes) * 100 : 0;
                         const speedMB = (status.current_speed_bps / 1024 / 1024).toFixed(1);
                         const transMB = (status.bytes_transferred / 1024 / 1024).toFixed(1);
@@ -136,8 +151,21 @@ function downloadModel(modelId, callbacks = {}) {
                 if (isStopped) {
                     break;
                 }
-                if (callbacks.onStatusText) callbacks.onStatusText('Download Interrupted. Retrying in 5s...');
-                console.error(`Download ${modelId} interrupted, retrying in 5s...`, e);
+                if (e.message === 'Unauthorized') throw e;
+                
+                const isPermanent = e.message.match(/HTTP error 4(?!09|29)\d\d/);
+                if (isPermanent) {
+                    if (callbacks.onStatusText) callbacks.onStatusText('Download Failed (Permanent Error).');
+                    throw e;
+                }
+                retryCount++;
+                if (retryCount > MAX_RETRIES) {
+                    if (callbacks.onStatusText) callbacks.onStatusText('Download Failed (Max Retries).');
+                    console.error(`Download ${modelId} failed after max retries:`, e);
+                    throw new Error(`Max retries reached: ${e.message}`);
+                }
+                if (callbacks.onStatusText) callbacks.onStatusText(`Download Interrupted. Retrying in 5s... (${retryCount}/${MAX_RETRIES})`);
+                console.error(`Download ${modelId} interrupted, retrying in 5s... (${retryCount}/${MAX_RETRIES})`, e);
                 await sleep(5000);
             }
         }
