@@ -241,34 +241,18 @@ pub(crate) async fn serve_ui(
 
 // Send the model roster to the Javascript dropdowns
 pub(crate) async fn get_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelConfig>> {
-    let mut models_from_registry = get_model_registry().await;
-    let downloaded_ids = {
+    let mut models = get_model_registry().await;
+    let (downloaded_ids, cached_ids) = {
         let status = lock_status(&state.engine_status);
-        status.downloaded_models.clone()
-    };
-
-    // This is a blocking operation, so move it to a blocking thread.
-    let models_res = tokio::task::spawn_blocking(move || {
-        let cache = hf_hub::Cache::default();
-        for model in &mut models_from_registry {
-            let repo = model.repo.clone();
-            let filename = model.filename.clone();
-            model.is_in_hf_cache = cache
-                .repo(hf_hub::Repo::model(repo))
-                .get(&filename)
-                .is_some();
-        }
-        models_from_registry
-    })
-    .await;
-
-    let mut models = match models_res {
-        Ok(m) => m,
-        Err(_) => get_model_registry().await, // Fallback on join error
+        (
+            status.downloaded_models.clone(),
+            status.cached_models.clone(),
+        )
     };
 
     for model in &mut models {
         model.is_downloaded = downloaded_ids.contains(&model.id);
+        model.is_in_hf_cache = cached_ids.contains(&model.id);
     }
 
     Json(models)
@@ -991,6 +975,7 @@ pub(crate) async fn delete_model(
         let mut status = lock_status(&state.engine_status);
         status.model_health.remove(&id);
         status.downloaded_models.remove(&id);
+        status.cached_models.remove(&id);
     }
     info!("Deleted/cleared model {} from disk and state", id);
 
@@ -2208,20 +2193,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let models_clone = models.clone();
             let downloads_dir = downloads_dir_for_init.clone();
-            let downloaded_ids = tokio::task::spawn_blocking(move || {
+            let (downloaded_ids, cached_ids) = tokio::task::spawn_blocking(move || {
                 let cache = hf_hub::Cache::default();
-                let mut ids = std::collections::HashSet::new();
+                let mut d_ids = std::collections::HashSet::new();
+                let mut c_ids = std::collections::HashSet::new();
                 for model in &models_clone {
                     let local_path = std::path::Path::new(&downloads_dir).join(&model.filename);
                     let is_in_hf_cache = cache
                         .repo(hf_hub::Repo::model(model.repo.clone()))
                         .get(&model.filename)
                         .is_some();
+                    if is_in_hf_cache {
+                        c_ids.insert(model.id.clone());
+                    }
                     if local_path.exists() || is_in_hf_cache {
-                        ids.insert(model.id.clone());
+                        d_ids.insert(model.id.clone());
                     }
                 }
-                ids
+                (d_ids, c_ids)
             })
             .await
             .unwrap_or_default();
@@ -2229,17 +2218,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut status = lock_status(&engine_status_for_init);
             if first_run {
                 status.downloaded_models = downloaded_ids.clone();
+                status.cached_models = cached_ids.clone();
                 info!(
                     "Found {} downloaded models on disk.",
                     status.downloaded_models.len()
                 );
                 first_run = false;
-            } else if status.downloaded_models != downloaded_ids {
+            } else if status.downloaded_models != downloaded_ids
+                || status.cached_models != cached_ids
+            {
                 info!(
                     "Disk state changed. Found {} downloaded models on disk.",
                     downloaded_ids.len()
                 );
                 status.downloaded_models = downloaded_ids;
+                status.cached_models = cached_ids;
             }
         }
     });

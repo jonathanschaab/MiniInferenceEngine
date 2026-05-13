@@ -55,6 +55,8 @@ pub struct EngineStatus {
     pub model_health: std::collections::HashMap<String, bool>,
     #[serde(default)]
     pub downloaded_models: std::collections::HashSet<String>,
+    #[serde(default)]
+    pub cached_models: std::collections::HashSet<String>,
 }
 
 impl EngineStatus {
