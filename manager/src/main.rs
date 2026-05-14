@@ -1784,26 +1784,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let _ = watcher.watch(path, notify::RecursiveMode::Recursive);
 
-        let hf_cache_path = hf_hub::Cache::default().path().to_path_buf();
-        if let Ok(true) = tokio::fs::try_exists(&hf_cache_path).await {
-            let _ = watcher.watch(&hf_cache_path, notify::RecursiveMode::Recursive);
+        let mut models = manager::get_model_registry().await;
+        let cache = hf_hub::Cache::default();
+
+        for model in &models {
+            let repo_path = cache.repo(hf_hub::Repo::model(model.repo.clone())).path();
+            if let Ok(true) = tokio::fs::try_exists(&repo_path).await {
+                let _ = watcher.watch(&repo_path, notify::RecursiveMode::Recursive);
+            }
         }
 
         let mut debounce_timer = tokio::time::interval(std::time::Duration::from_millis(1000));
         debounce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
+        let mut watch_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+        watch_refresh_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         let mut pending_update = true;
         let mut first_run = true;
-        let models = manager::get_model_registry().await;
 
         loop {
             tokio::select! {
-                    Some(_) = rx.recv() => {
-                        pending_update = true;
-                    }
-                    _ = debounce_timer.tick() => {
-                        if !pending_update && !first_run {
-                            continue;
+                Some(_) = rx.recv() => {
+                    pending_update = true;
+                }
+                _ = watch_refresh_timer.tick() => {
+                    models = manager::get_model_registry().await;
+                    for model in &models {
+                        let repo_path = cache.repo(hf_hub::Repo::model(model.repo.clone())).path();
+                        if let Ok(true) = tokio::fs::try_exists(&repo_path).await {
+                            // notify handles duplicates gracefully, so this is safe to call repeatedly
+                            let _ = watcher.watch(&repo_path, notify::RecursiveMode::Recursive);
                         }
+                    }
+                    // Force a state update in case we missed a directory creation event
+                    pending_update = true;
+                }
+                _ = debounce_timer.tick() => {
+                    if !pending_update && !first_run {
+                        continue;
+                    }
                         pending_update = false;
 
                         let models_clone = models.clone();
@@ -2551,9 +2571,11 @@ mod tests {
         });
 
         // 2. Setup isolated AppState configured to point to our mock server
-        let mut config = AppConfig::default();
-        config.hf_base_url = format!("http://127.0.0.1:{}", port);
-        config.downloads_directory = "test_downloads_shutdown".to_string();
+        let config = AppConfig {
+            hf_base_url: format!("http://127.0.0.1:{}", port),
+            downloads_directory: "test_downloads_shutdown".to_string(),
+            ..Default::default()
+        };
         let _ = tokio::fs::create_dir_all(&config.downloads_directory).await;
 
         let (queue_tx, _) = mpsc::channel(1);

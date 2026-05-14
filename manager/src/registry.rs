@@ -406,9 +406,11 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
         ];
 
         let mut handles = Vec::new();
+        let hf_cache = hf_hub::Cache::default();
 
         for reg in registrations {
             let api_opt = api_opt.clone();
+            let hf_cache = hf_cache.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut provenance = std::collections::HashMap::new();
@@ -448,7 +450,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
 
                 let repo = reg.repo;
                 let filename = reg.filename;
-                let cached_meta = if let Some(gguf_path) = hf_hub::Cache::default().repo(hf_hub::Repo::model(repo.to_string())).get(filename) {
+                let cached_meta = if let Some(gguf_path) = hf_cache.repo(hf_hub::Repo::model(repo.to_string())).get(filename) {
                     tokio::fs::metadata(&gguf_path).await.ok()
                 } else {
                     None
