@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use hf_hub::api::sync::Api;
 use nvml_wrapper::Nvml;
 use tokenizers::Tokenizer;
 use tracing::{error, info, warn};
@@ -264,12 +263,16 @@ pub async fn run_batcher_loop(
                     let api = hf_hub::api::tokio::Api::new().map_err(|e| e.to_string())?;
                     let path = api
                         .model(repo)
-                        .get("tokenizer.json").await
+                        .get("tokenizer.json")
+                        .await
                         .map_err(|e| e.to_string())?;
                     tokio::task::spawn_blocking(move || {
                         Tokenizer::from_file(path).map_err(|e| e.to_string())
-                    }).await.unwrap_or_else(|e| Err(e.to_string()))
-                }.await;
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+                }
+                .await;
 
                 match tok_res {
                     Ok(tok) => {

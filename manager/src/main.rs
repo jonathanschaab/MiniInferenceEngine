@@ -8,10 +8,8 @@ use axum::{
     http::header,
     response::{Html, IntoResponse, Redirect},
 };
-use hf_hub::api::sync::Api;
 use oauth2::basic::BasicClient;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use sysinfo::System;
 use tokenizers::Tokenizer;
@@ -162,8 +160,8 @@ impl AppConfig {
     }
 }
 
-pub mod downloader;
 pub mod auth;
+pub mod downloader;
 pub mod setup;
 
 // --- SHARED MEMORY LOG WRITER ---
@@ -421,7 +419,8 @@ pub(crate) async fn trigger_download(
     let shutdown_rx = state.shutdown_tx.subscribe();
 
     let task = tokio::spawn(async move {
-        downloader::perform_model_download(state_clone, id_clone, repo, filename, shutdown_rx).await;
+        downloader::perform_model_download(state_clone, id_clone, repo, filename, shutdown_rx)
+            .await;
     });
 
     state
@@ -705,32 +704,33 @@ pub(crate) async fn trigger_benchmark(
         info!("🌱 Verifying benchmark prompt files...");
 
         let tokenizer_result = async {
-            let api = hf_hub::api::tokio::Api::new().map_err(|e| format!("API Init Error: {}", e))?;
+            let api =
+                hf_hub::api::tokio::Api::new().map_err(|e| format!("API Init Error: {}", e))?;
             let path = api
                 .model("Qwen/Qwen2.5-1.5B-Instruct".to_string())
-                .get("tokenizer.json").await
+                .get("tokenizer.json")
+                .await
                 .map_err(|e| format!("Tokenizer Download Error: {}", e))?;
 
             tokio::task::spawn_blocking(move || {
                 Tokenizer::from_file(path).map_err(|e| format!("Tokenizer Parse Error: {}", e))
-            }).await.unwrap_or_else(|e| Err(format!("Thread execution failed: {}", e)))
-        }.await;
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Thread execution failed: {}", e)))
+        }
+        .await;
 
         let mut qwen_tokenizer = None;
 
         match tokenizer_result {
-            Ok(Ok(tokenizer)) => {
+            Ok(tokenizer) => {
                 qwen_tokenizer = Some(tokenizer);
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 warn!(
                     "Tokenizer initialization failed: {}. Falling back to padding.",
                     e
                 );
-            }
-            Err(e) => {
-                // If the spawn_blocking task actually panics, it is caught here as a JoinError
-                error!("Thread execution failed: {}. Falling back to padding.", e);
             }
         }
 
@@ -1762,7 +1762,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.oauth_client_secret_path,
         &config.oauth_auth_url,
         &config.oauth_token_url,
-    ).await?;
+    )
+    .await?;
 
     // Eagerly initialize the model registry in the background
     let engine_status_for_init = engine_status.clone();
@@ -2097,6 +2098,7 @@ mod tests {
                 "https://accounts.google.com/o/oauth2/v2/auth",
                 "https://oauth2.googleapis.com/token",
             )
+            .await
             .unwrap(), // Dummy client
             config: Arc::new(AppConfig::default()),
             log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
@@ -2591,7 +2593,7 @@ mod tests {
         // 3. Spawn the model downloader
         let state_clone = state.clone();
         let task = tokio::spawn(async move {
-            perform_model_download(
+            downloader::perform_model_download(
                 state_clone,
                 "test-model".to_string(),
                 "test/repo".to_string(),

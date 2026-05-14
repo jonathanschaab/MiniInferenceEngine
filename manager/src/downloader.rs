@@ -62,7 +62,8 @@ pub async fn perform_model_download(
         std::path::PathBuf::from(p)
     };
 
-    let (mut existing_size, mut expected_hash) = check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path).await;
+    let (mut existing_size, mut expected_hash) =
+        check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path).await;
 
     update_status_connecting(&state, &id, existing_size);
 
@@ -72,13 +73,27 @@ pub async fn perform_model_download(
         None => return,
     };
 
-    if verify_and_update_etag(&state, &url, &id, &mut res, &mut existing_size, &mut expected_hash, &mut hasher).await.is_err() {
+    if verify_and_update_etag(
+        &state,
+        &url,
+        &id,
+        &mut res,
+        &mut existing_size,
+        &mut expected_hash,
+        &mut hasher,
+    )
+    .await
+    .is_err()
+    {
         return;
     }
 
     let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     if !is_partial && existing_size > 0 {
-        info!("Server did not return partial content, restarting download for {}", id);
+        info!(
+            "Server did not return partial content, restarting download for {}",
+            id
+        );
         existing_size = 0;
         hasher = Sha256::new();
     }
@@ -109,37 +124,57 @@ pub async fn perform_model_download(
         existing_size,
         &meta_file_path,
         &expected_hash,
-        &mut shutdown_rx
-    ).await;
+        &mut shutdown_rx,
+    )
+    .await;
 
     if stream_error {
         save_metadata(&meta_file_path, downloaded, &expected_hash).await;
-        info!("Network interrupted. Kept partial temp file for {} to resume later.", id);
+        info!(
+            "Network interrupted. Kept partial temp file for {} to resume later.",
+            id
+        );
         return;
     }
 
     drop(file);
 
-    let final_hash_opt = verify_download_hash(&state, &id, &tmp_file_path, existing_size == 0, hasher).await;
-    
+    let final_hash_opt =
+        verify_download_hash(&state, &id, &tmp_file_path, existing_size == 0, hasher).await;
+
     let hash_mismatch = if let Some(final_hash) = final_hash_opt {
         if let Some(ref expected) = expected_hash {
             if &final_hash != expected {
-                error!("Checksum mismatch for {}. Expected {}, got {}. Marking as corrupted.", id, expected, final_hash);
+                error!(
+                    "Checksum mismatch for {}. Expected {}, got {}. Marking as corrupted.",
+                    id, expected, final_hash
+                );
                 true
             } else {
                 info!("Checksum validated successfully for {}.", id);
                 false
             }
         } else {
-            info!("No SHA-256 ETag found for {}. Saving. Computed: {}", id, final_hash);
+            info!(
+                "No SHA-256 ETag found for {}. Saving. Computed: {}",
+                id, final_hash
+            );
             false
         }
     } else {
         false
     };
 
-    finalize_download(&state, &id, &filename, &file_path, &tmp_file_path, &meta_file_path, hash_mismatch).await;
+    finalize_download(
+        &state,
+        &id,
+        &filename,
+        &file_path,
+        &tmp_file_path,
+        &meta_file_path,
+        hash_mismatch,
+    )
+    .await;
 }
 
 async fn check_existing_metadata(
@@ -160,9 +195,15 @@ async fn check_existing_metadata(
                 expected_hash = Some(hash.to_string());
             }
         } else {
-            warn!("Corrupted or invalid metadata file found for {}. Discarding and restarting download.", id);
+            warn!(
+                "Corrupted or invalid metadata file found for {}. Discarding and restarting download.",
+                id
+            );
             {
-                let mut dl = state.active_downloads.lock().unwrap_or_else(|e| e.into_inner());
+                let mut dl = state
+                    .active_downloads
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(status) = dl.get_mut(id) {
                     status.state = "Corrupted metadata. Restarting...".to_string();
                 }
@@ -174,7 +215,10 @@ async fn check_existing_metadata(
     }
 
     if existing_size > 0 {
-        if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(tmp_file_path).await
+        if let Ok(file) = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp_file_path)
+            .await
             && let Ok(metadata) = file.metadata().await
         {
             let actual_size = metadata.len();
@@ -192,7 +236,10 @@ async fn check_existing_metadata(
 }
 
 fn update_status_connecting(state: &Arc<AppState>, id: &str, existing_size: u64) {
-    let mut dl = state.active_downloads.lock().unwrap_or_else(|e| e.into_inner());
+    let mut dl = state
+        .active_downloads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(status) = dl.get_mut(id) {
         status.bytes_transferred = existing_size;
         status.state = "Connecting...".to_string();
@@ -255,16 +302,30 @@ async fn verify_and_update_etag(
     hasher: &mut Sha256,
 ) -> Result<(), ()> {
     let mut new_etag = None;
-    if let Some(etag) = res.headers().get("X-Linked-Etag").or_else(|| res.headers().get("ETag")) {
+    if let Some(etag) = res
+        .headers()
+        .get("X-Linked-Etag")
+        .or_else(|| res.headers().get("ETag"))
+    {
         let etag_str = etag.to_str().unwrap_or("").trim_matches('"');
-        let clean_etag = etag_str.strip_prefix("W/").unwrap_or(etag_str).trim_matches('"');
+        let clean_etag = etag_str
+            .strip_prefix("W/")
+            .unwrap_or(etag_str)
+            .trim_matches('"');
         if clean_etag.len() == 64 && clean_etag.chars().all(|c| c.is_ascii_hexdigit()) {
             new_etag = Some(clean_etag.to_string());
         }
     }
 
-    if *existing_size > 0 && expected_hash.is_some() && new_etag.is_some() && *expected_hash != new_etag {
-        warn!("ETag mismatch for {} (expected {:?}, got {:?}). Restarting download.", id, expected_hash, new_etag);
+    if *existing_size > 0
+        && expected_hash.is_some()
+        && new_etag.is_some()
+        && *expected_hash != new_etag
+    {
+        warn!(
+            "ETag mismatch for {} (expected {:?}, got {:?}). Restarting download.",
+            id, expected_hash, new_etag
+        );
         *existing_size = 0;
         *hasher = Sha256::new();
         *expected_hash = new_etag.clone();
@@ -273,7 +334,11 @@ async fn verify_and_update_etag(
             if r.status().is_success() {
                 *res = r;
             } else {
-                error!("Download failed for {} on restart with status: {}", id, r.status());
+                error!(
+                    "Download failed for {} on restart with status: {}",
+                    id,
+                    r.status()
+                );
                 return Err(());
             }
         } else {
@@ -294,11 +359,15 @@ async fn save_metadata(meta_file_path: &Path, downloaded: u64, expected_hash: &O
             "expected_hash": expected_hash
         })
         .to_string(),
-    ).await;
+    )
+    .await;
 }
 
 fn update_status_downloading(state: &Arc<AppState>, id: &str, existing_size: u64, total_size: u64) {
-    let mut dl = state.active_downloads.lock().unwrap_or_else(|e| e.into_inner());
+    let mut dl = state
+        .active_downloads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(status) = dl.get_mut(id) {
         status.total_bytes = total_size;
         status.bytes_transferred = existing_size;
@@ -306,9 +375,17 @@ fn update_status_downloading(state: &Arc<AppState>, id: &str, existing_size: u64
     }
 }
 
-async fn open_temp_file(tmp_file_path: &Path, is_partial: bool, existing_size: u64) -> Option<tokio::fs::File> {
+async fn open_temp_file(
+    tmp_file_path: &Path,
+    is_partial: bool,
+    existing_size: u64,
+) -> Option<tokio::fs::File> {
     if is_partial && existing_size > 0 {
-        tokio::fs::OpenOptions::new().append(true).open(tmp_file_path).await.ok()
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp_file_path)
+            .await
+            .ok()
     } else {
         tokio::fs::File::create(tmp_file_path).await.ok()
     }
@@ -410,7 +487,10 @@ async fn verify_download_hash(
         Some(hex::encode(hasher.finalize()))
     } else {
         {
-            let mut dl = state.active_downloads.lock().unwrap_or_else(|e| e.into_inner());
+            let mut dl = state
+                .active_downloads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(status) = dl.get_mut(id) {
                 status.state = "Verifying...".to_string();
             }
@@ -466,14 +546,20 @@ async fn finalize_download(
 
     let mut success = false;
     if let Err(e) = tokio::fs::rename(tmp_file_path, &target_path).await {
-        warn!("Failed to rename temp file for {} ({}). Falling back to copy...", id, e);
+        warn!(
+            "Failed to rename temp file for {} ({}). Falling back to copy...",
+            id, e
+        );
         match tokio::fs::copy(tmp_file_path, &target_path).await {
             Ok(_) => {
                 let _ = tokio::fs::remove_file(tmp_file_path).await;
                 success = true;
             }
             Err(copy_err) => {
-                error!("Failed to copy temp file to final file for {}: {}", id, copy_err);
+                error!(
+                    "Failed to copy temp file to final file for {}: {}",
+                    id, copy_err
+                );
             }
         }
     } else {

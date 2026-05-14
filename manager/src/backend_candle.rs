@@ -66,18 +66,22 @@ pub async fn load_engine(
         let weights_path = if let Ok(true) = tokio::fs::try_exists(&local_weights).await {
             local_weights
         } else {
-            repo.get(&config.filename).await
+            repo.get(&config.filename)
+                .await
                 .map_err(|e| format!("Missing weights: {}", e))?
         };
         let config_path = repo
-            .get("config.json").await
+            .get("config.json")
+            .await
             .map_err(|e| format!("Missing config.json: {}", e))?;
         let tokenizer_path = api
             .model(config.tokenizer_repo.clone())
-            .get("tokenizer.json").await
+            .get("tokenizer.json")
+            .await
             .map_err(|e| format!("Missing tokenizer: {}", e))?;
 
-        let config_str = tokio::fs::read_to_string(config_path).await
+        let config_str = tokio::fs::read_to_string(config_path)
+            .await
             .map_err(|e| format!("Failed to read config: {}", e))?;
         let conf: BertConfig =
             serde_json::from_str(&config_str).map_err(|e| format!("Bad config JSON: {}", e))?;
@@ -100,12 +104,16 @@ pub async fn load_engine(
             };
             ExtractiveCompressor::load(vb, &conf)
                 .map_err(|e| format!("Extractive load failed: {}", e))
-        }).await.map_err(|e| format!("Task failed: {}", e))??;
+        })
+        .await
+        .map_err(|e| format!("Task failed: {}", e))??;
 
         let tokenizer = tokio::task::spawn_blocking(move || {
             Tokenizer::from_file(tokenizer_path)
                 .map_err(|e| format!("Tokenizer load failed: {}", e))
-        }).await.map_err(|e| format!("Task failed: {}", e))??;
+        })
+        .await
+        .map_err(|e| format!("Task failed: {}", e))??;
 
         return Ok((DynamicModel::XLMRoberta(model), tokenizer, None));
     }
@@ -115,12 +123,14 @@ pub async fn load_engine(
         local_weights
     } else {
         api.model(config.repo.clone())
-            .get(&config.filename).await
+            .get(&config.filename)
+            .await
             .map_err(|e| e.to_string())?
     };
     let tokenizer_path = api
         .model(config.tokenizer_repo.clone())
-        .get("tokenizer.json").await
+        .get("tokenizer.json")
+        .await
         .map_err(|e| e.to_string())?;
 
     let config_arch = config.arch;
@@ -128,8 +138,8 @@ pub async fn load_engine(
     let device_clone = device.clone();
     let (model, file) = tokio::task::spawn_blocking(move || {
         let mut file = std::fs::File::open(&weights_path).map_err(|e| e.to_string())?;
-        let gguf_content =
-            candle_core::quantized::gguf_file::Content::read(&mut file).map_err(|e| e.to_string())?;
+        let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .map_err(|e| e.to_string())?;
 
         let model = match config_arch {
             ModelArch::Llama => DynamicModel::Llama(
@@ -148,11 +158,15 @@ pub async fn load_engine(
             }
         };
         Ok((model, file))
-    }).await.map_err(|e| format!("Task failed: {}", e))??;
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
 
     let tokenizer = tokio::task::spawn_blocking(move || {
         Tokenizer::from_file(tokenizer_path).map_err(|e| e.to_string())
-    }).await.map_err(|e| format!("Task failed: {}", e))??;
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
 
     Ok((model, tokenizer, Some(file)))
 }
