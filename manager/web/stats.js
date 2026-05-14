@@ -62,6 +62,7 @@ function updateBenchmarkCompatibility() {
         
         cb.disabled = !supported;
         cb.parentElement.style.opacity = supported ? "1" : "0.5";
+        cb.parentElement.title = supported ? "" : "This model is disabled because it is not supported by any of the currently selected backends.";
         
         const warningSpan = cb.parentElement.querySelector('.incompatible-warning');
         if (warningSpan) {

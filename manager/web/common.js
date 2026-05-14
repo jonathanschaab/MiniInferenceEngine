@@ -128,9 +128,8 @@ function downloadModel(modelId, callbacks = {}) {
                         
                         await sleep(1000);
                     } else {
-                        const verifyRes = await fetchWithAuth('/api/models');
-                        const verifyModels = await verifyRes.json();
-                        const verifyModel = verifyModels.find(m => m.id === modelId);
+                        const verifyRes = await fetchWithAuth(`/api/models/${modelId}`);
+                        const verifyModel = await verifyRes.json();
                         
                         if (verifyModel && verifyModel.is_downloaded) {
                             if (callbacks.onStatusText) callbacks.onStatusText('Download Complete!');

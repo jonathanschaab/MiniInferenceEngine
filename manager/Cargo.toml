@@ -37,6 +37,7 @@ toml = "0.8"
 surrealdb = { version = "2.6.1", features = ["kv-mem"] }
 tower-sessions-surrealdb-store = "0.7.0"
 native-tls = { version = "0.2", optional = true }
+notify = "8.2.0"
 
 [features]
 default = ["backend-candle"]

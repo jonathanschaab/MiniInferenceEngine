@@ -68,13 +68,17 @@ async function mockEngineApis(page) {
     });
 
     await page.route('**/api/models', route => {
-        route.fulfill({
-            status: 200,
-            json: [
-                { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: true },
-                { id: 'mock-comp-1', name: 'Mock Compressor', roles: ['ContextCompressor'], supported_backends: ['Candle'], arch: 'XLMRoberta', parameters_billions: 0.5, size_on_disk_gb: 1.0, max_context_len: 1024, provenance: {}, is_downloaded: true }
-            ]
-        });
+        if (route.request().method() === 'GET') {
+            route.fulfill({
+                status: 200,
+                json: [
+                    { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: true },
+                    { id: 'mock-comp-1', name: 'Mock Compressor', roles: ['ContextCompressor'], supported_backends: ['Candle'], arch: 'XLMRoberta', parameters_billions: 0.5, size_on_disk_gb: 1.0, max_context_len: 1024, provenance: {}, is_downloaded: true }
+                ]
+            });
+        } else {
+            route.fallback();
+        }
     });
 
     const handleSessionsRoute = route => {
@@ -435,6 +439,17 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
                 route.fallback();
             }
         });
+        
+        await page.route('**/api/models/*', async route => {
+            if (route.request().method() === 'GET') {
+                const id = route.request().url().split('/').pop();
+                const model = modelState.find(m => m.id === id);
+                if (model) await route.fulfill({ status: 200, json: model });
+                else await route.fulfill({ status: 404 });
+            } else {
+                route.fallback();
+            }
+        });
 
         await page.route('**/api/models/download/progress', async route => {
             await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(downloadState) });
@@ -493,6 +508,17 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
                 status: 200,
                 json: modelState
             });
+        });
+
+        await page.route('**/api/models/*', async route => {
+            if (route.request().method() === 'GET') {
+                const id = route.request().url().split('/').pop();
+                const model = modelState.find(m => m.id === id);
+                if (model) await route.fulfill({ status: 200, json: model });
+                else await route.fulfill({ status: 404 });
+            } else {
+                route.fallback();
+            }
         });
 
         // Mock the download POST request
@@ -584,6 +610,19 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
                 status: 200,
                 json: [{ id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: isDownloaded }]
             });
+        });
+
+        await page.route('**/api/models/*', async route => {
+            if (route.request().method() === 'GET') {
+                const id = route.request().url().split('/').pop();
+                if (id === 'mock-model-1') {
+                    await route.fulfill({ status: 200, json: { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: isDownloaded } });
+                } else {
+                    await route.fulfill({ status: 404 });
+                }
+            } else {
+                route.fallback();
+            }
         });
 
         let postCount = 0;
