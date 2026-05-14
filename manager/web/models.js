@@ -244,20 +244,6 @@ async function startDownload(modelId) {
 async function deleteModel(modelId) {
     let warning = `Are you sure you want to permanently delete the weights for ${modelId} from disk?`;
 
-    try {
-        const res = await fetchWithAuth(`/api/models/${modelId}/cache_status`);
-        if (res.ok) {
-            const status = await res.json();
-            if (status.is_in_hf_cache) {
-                warning += `\n\nWARNING: This will also remove the model from the global Hugging Face cache, which will affect any other applications on this system using these exact weights.`;
-            }
-        }
-    } catch (e) {
-        // Fail safe: if we can't check, show the full warning
-        warning += `\n\nWARNING: This will also remove the model from the global Hugging Face cache, which will affect any other applications on this system using these exact weights.`;
-        console.warn("Could not check HF cache status, showing full delete warning.", e);
-    }
-
     if (!confirm(warning)) return;
 
     try {

@@ -878,9 +878,29 @@ async fn perform_model_download(
             file_path.clone()
         };
 
+        let mut success = false;
         if let Err(e) = tokio::fs::rename(&tmp_file_path, &target_path).await {
-            error!("Failed to rename temp file to final file for {}: {}", id, e);
+            warn!(
+                "Failed to rename temp file for {} ({}). Falling back to copy...",
+                id, e
+            );
+            match tokio::fs::copy(&tmp_file_path, &target_path).await {
+                Ok(_) => {
+                    let _ = tokio::fs::remove_file(&tmp_file_path).await;
+                    success = true;
+                }
+                Err(copy_err) => {
+                    error!(
+                        "Failed to copy temp file to final file for {}: {}",
+                        id, copy_err
+                    );
+                }
+            }
         } else {
+            success = true;
+        }
+
+        if success {
             let _ = tokio::fs::remove_file(&meta_file_path).await;
             if hash_mismatch {
                 error!(
@@ -986,29 +1006,10 @@ pub(crate) async fn delete_model(
     let _ = tokio::fs::remove_file(&meta_file_path).await;
     let _ = tokio::fs::remove_file(&corrupted_path).await;
 
-    // Also attempt to remove the model from the Hugging Face cache to prevent it from reappearing
-    let repo = model.repo.clone();
-    let filename = model.filename.clone();
-    let cached_path_res = tokio::task::spawn_blocking(move || {
-        let cache = hf_hub::Cache::default();
-        cache.repo(hf_hub::Repo::model(repo)).get(&filename)
-    })
-    .await
-    .unwrap_or(None);
-
-    if let Some(cached_path) = cached_path_res {
-        // Resolve symlinks to delete the actual blob taking up space
-        if let Ok(real_path) = tokio::fs::canonicalize(&cached_path).await {
-            let _ = tokio::fs::remove_file(real_path).await;
-        }
-        let _ = tokio::fs::remove_file(cached_path).await;
-    }
-
     {
         let mut status = lock_status(&state.engine_status);
         status.model_health.remove(&id);
         status.downloaded_models.remove(&id);
-        status.cached_models.remove(&id);
         status.corrupted_models.remove(&id);
     }
     info!("Deleted/cleared model {} from disk and state", id);
