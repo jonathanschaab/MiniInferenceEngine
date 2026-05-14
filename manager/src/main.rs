@@ -150,11 +150,11 @@ impl AppConfig {
         } else if let Ok(data) = tokio::fs::read_to_string("config.json").await {
             // Fallback for backwards compatibility, but save as TOML going forward
             let config: Self = serde_json::from_str(&data).unwrap_or_default();
-            let _ = tokio::fs::write("config.toml", toml::to_string_pretty(&config).unwrap()).await;
+            let _ = tokio::fs::write("config.toml", toml::to_string_pretty(&config).expect("Failed to serialize configuration to TOML")).await;
             config
         } else {
             let config = Self::default();
-            let _ = tokio::fs::write("config.toml", toml::to_string_pretty(&config).unwrap()).await;
+            let _ = tokio::fs::write("config.toml", toml::to_string_pretty(&config).expect("Failed to serialize default configuration to TOML")).await;
             config
         }
     }
@@ -1637,7 +1637,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let path = entry.path();
                     if let Some(ext) = path.extension()
-                        && (ext == "tmp" || ext == "meta" || ext == "corrupted")
+                        && (ext == "tmp" || ext == "meta" || ext == "corrupted" || ext == "copy_tmp")
                         && let Ok(metadata) = entry.metadata().await
                         && let Ok(modified) = metadata.modified()
                         && let Ok(age) = modified.elapsed()

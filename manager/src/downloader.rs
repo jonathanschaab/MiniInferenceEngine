@@ -472,13 +472,29 @@ async fn finalize_download(
     let mut success = false;
     if let Err(e) = tokio::fs::rename(tmp_file_path, &target_path).await {
         warn!("Failed to rename temp file for {} ({}). Falling back to copy...", id, e);
-        match tokio::fs::copy(tmp_file_path, &target_path).await {
+        
+        let mut copy_tmp_path = target_path.to_path_buf().into_os_string();
+        copy_tmp_path.push(".copy_tmp");
+        let copy_tmp_path = PathBuf::from(copy_tmp_path);
+
+        match tokio::fs::copy(tmp_file_path, &copy_tmp_path).await {
             Ok(_) => {
-                let _ = tokio::fs::remove_file(tmp_file_path).await;
-                success = true;
+                // Ensure data is physically on the destination disk before the atomic rename
+                if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(&copy_tmp_path).await {
+                    let _ = file.sync_all().await;
+                }
+
+                if let Err(rename_err) = tokio::fs::rename(&copy_tmp_path, &target_path).await {
+                    error!("Failed to rename copied temp file for {}: {}", id, rename_err);
+                    let _ = tokio::fs::remove_file(&copy_tmp_path).await;
+                } else {
+                    let _ = tokio::fs::remove_file(tmp_file_path).await;
+                    success = true;
+                }
             }
             Err(copy_err) => {
                 error!("Failed to copy temp file to final file for {}: {}", id, copy_err);
+                let _ = tokio::fs::remove_file(&copy_tmp_path).await;
             }
         }
     } else {
