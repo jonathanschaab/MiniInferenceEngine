@@ -146,17 +146,17 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn load() -> Self {
-        if let Ok(data) = std::fs::read_to_string("config.toml") {
+    pub async fn load() -> Self {
+        if let Ok(data) = tokio::fs::read_to_string("config.toml").await {
             toml::from_str(&data).unwrap_or_default()
-        } else if let Ok(data) = std::fs::read_to_string("config.json") {
+        } else if let Ok(data) = tokio::fs::read_to_string("config.json").await {
             // Fallback for backwards compatibility, but save as TOML going forward
             let config: Self = serde_json::from_str(&data).unwrap_or_default();
-            let _ = std::fs::write("config.toml", toml::to_string_pretty(&config).unwrap());
+            let _ = tokio::fs::write("config.toml", toml::to_string_pretty(&config).unwrap()).await;
             config
         } else {
             let config = Self::default();
-            let _ = std::fs::write("config.toml", toml::to_string_pretty(&config).unwrap());
+            let _ = tokio::fs::write("config.toml", toml::to_string_pretty(&config).unwrap()).await;
             config
         }
     }
@@ -386,10 +386,7 @@ pub(crate) async fn trigger_download(
         p.push(".corrupted");
         std::path::PathBuf::from(p)
     };
-    if tokio::fs::try_exists(&corrupted_path)
-        .await
-        .unwrap_or(false)
-    {
+    if let Ok(true) = tokio::fs::try_exists(&corrupted_path).await {
         return (StatusCode::UNPROCESSABLE_ENTITY, "A corrupted download for this model already exists on disk. Please contact an admin to verify it or delete the model to try again.").into_response();
     }
 
@@ -507,7 +504,7 @@ async fn perform_model_download(
 
     let url = format!(
         "{}/{}/resolve/main/{}",
-        state.config.hf_base_url, repo, filename
+        state.config.hf_base_url.trim_end_matches('/'), repo, filename
     );
     let client = &state.reqwest_client;
 
@@ -626,16 +623,7 @@ async fn perform_model_download(
         }
     };
 
-    let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-    if !is_partial && existing_size > 0 {
-        info!(
-            "Server did not return partial content, restarting download for {}",
-            id
-        );
-        existing_size = 0;
-        hasher = Sha256::new();
-    }
-
+        let mut new_etag = None;
     if let Some(etag) = res
         .headers()
         .get("X-Linked-Etag")
@@ -647,9 +635,45 @@ async fn perform_model_download(
             .unwrap_or(etag_str)
             .trim_matches('"');
         if clean_etag.len() == 64 && clean_etag.chars().all(|c| c.is_ascii_hexdigit()) {
-            expected_hash = Some(clean_etag.to_string());
+                new_etag = Some(clean_etag.to_string());
         }
     }
+
+        if existing_size > 0 && expected_hash.is_some() && new_etag.is_some() && expected_hash != new_etag {
+            warn!(
+                "ETag mismatch for {} (expected {:?}, got {:?}). Restarting download.",
+                id, expected_hash, new_etag
+            );
+            existing_size = 0;
+            hasher = Sha256::new();
+            expected_hash = new_etag;
+
+            res = match client.get(&url).send().await {
+                Ok(r) => {
+                    if !r.status().is_success() {
+                        error!("Download failed for {} on restart with status: {}", id, r.status());
+                        return;
+                    }
+                    r
+                }
+                Err(e) => {
+                    error!("Download failed for {} on restart: {}", id, e);
+                    return;
+                }
+            };
+        } else if new_etag.is_some() {
+            expected_hash = new_etag;
+        }
+
+        let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        if !is_partial && existing_size > 0 {
+            info!(
+                "Server did not return partial content, restarting download for {}",
+                id
+            );
+            existing_size = 0;
+            hasher = Sha256::new();
+        }
 
     let total_size = if is_partial {
         existing_size + res.content_length().unwrap_or(0)
@@ -1157,16 +1181,17 @@ pub(crate) async fn trigger_benchmark(
         // --- GENERATE REALISTIC PROMPTS ---
         info!("🌱 Verifying benchmark prompt files...");
 
-        let tokenizer_result = tokio::task::spawn_blocking(|| {
-            let api = Api::new().map_err(|e| format!("API Init Error: {}", e))?;
+        let tokenizer_result = async {
+            let api = hf_hub::api::tokio::Api::new().map_err(|e| format!("API Init Error: {}", e))?;
             let path = api
                 .model("Qwen/Qwen2.5-1.5B-Instruct".to_string())
-                .get("tokenizer.json")
+                .get("tokenizer.json").await
                 .map_err(|e| format!("Tokenizer Download Error: {}", e))?;
 
-            Tokenizer::from_file(path).map_err(|e| format!("Tokenizer Parse Error: {}", e))
-        })
-        .await;
+            tokio::task::spawn_blocking(move || {
+                Tokenizer::from_file(path).map_err(|e| format!("Tokenizer Parse Error: {}", e))
+            }).await.unwrap_or_else(|e| Err(format!("Thread execution failed: {}", e)))
+        }.await;
 
         let mut qwen_tokenizer = None;
 
@@ -2047,7 +2072,7 @@ pub(crate) async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<T
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load();
+    let config = AppConfig::load().await;
 
     let (memory_buffer, log_reload_handle, _file_guard) = setup::init_logging(&config);
 
@@ -2214,7 +2239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.oauth_client_secret_path,
         &config.oauth_auth_url,
         &config.oauth_token_url,
-    )?;
+    ).await?;
 
     // Eagerly initialize the model registry in the background
     let engine_status_for_init = engine_status.clone();
@@ -2230,13 +2255,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Failed to create file watcher");
 
         let path = std::path::Path::new(&downloads_dir_for_init);
-        if !path.exists() {
-            let _ = std::fs::create_dir_all(path);
+        if let Ok(false) | Err(_) = tokio::fs::try_exists(path).await {
+            let _ = tokio::fs::create_dir_all(path).await;
         }
         let _ = watcher.watch(path, notify::RecursiveMode::Recursive);
 
         let hf_cache_path = hf_hub::Cache::default().path().to_path_buf();
-        if hf_cache_path.exists() {
+        if let Ok(true) = tokio::fs::try_exists(&hf_cache_path).await {
             let _ = watcher.watch(&hf_cache_path, notify::RecursiveMode::Recursive);
         }
 

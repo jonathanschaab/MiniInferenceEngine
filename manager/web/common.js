@@ -119,7 +119,13 @@ function downloadModel(modelId, callbacks = {}) {
                         if (status.current_speed_bps > 0 && status.total_bytes > 0) {
                             const bytesLeft = status.total_bytes - status.bytes_transferred;
                             const secsLeft = bytesLeft / status.current_speed_bps;
-                            etaStr = secsLeft > 60 ? `${Math.floor(secsLeft/60)}m ${Math.round(secsLeft%60)}s` : `${Math.round(secsLeft)}s`;
+                            if (secsLeft >= 3600) {
+                                etaStr = `${Math.floor(secsLeft / 3600)}h ${Math.floor((secsLeft % 3600) / 60)}m ${Math.round(secsLeft % 60)}s`;
+                            } else if (secsLeft >= 60) {
+                                etaStr = `${Math.floor(secsLeft / 60)}m ${Math.round(secsLeft % 60)}s`;
+                            } else {
+                                etaStr = `${Math.round(secsLeft)}s`;
+                            }
                         }
                         
                         if (callbacks.onProgress) {

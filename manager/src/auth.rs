@@ -14,7 +14,7 @@ use oauth2::{
 use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use surrealdb::{Surreal, engine::any::Any};
 use tokio::sync::mpsc::UnboundedSender;
 use tower_sessions::Session;
@@ -154,14 +154,14 @@ struct GoogleClientSecretWeb {
 
 // --- OAUTH2 CLIENT SETUP ---
 
-pub fn build_oauth_client(
+pub async fn build_oauth_client(
     redirect_uri: &str,
     secret_path: &str,
     auth_url: &str,
     token_url: &str,
 ) -> Result<BasicClient, String> {
     // 1. Read the JSON file from the disk
-    let file_content = match fs::read_to_string(secret_path) {
+    let file_content = match tokio::fs::read_to_string(secret_path).await {
         Ok(c) => c,
         Err(e) => {
             let msg = format!(

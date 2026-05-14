@@ -448,18 +448,13 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
 
                 let repo = reg.repo;
                 let filename = reg.filename;
-                let cached_meta = tokio::task::spawn_blocking(move || {
-                    let cache = hf_hub::Cache::default();
-                    if let Some(gguf_path) = cache.repo(hf_hub::Repo::model(repo.to_string())).get(filename) {
-                        std::fs::metadata(&gguf_path).ok()
-                    } else {
-                        None
-                    }
-                })
-                .await
-                .unwrap_or(None);
+                let cached_meta = if let Some(gguf_path) = hf_hub::Cache::default().repo(hf_hub::Repo::model(repo.to_string())).get(filename) {
+                    tokio::fs::metadata(&gguf_path).await.ok()
+                } else {
+                    None
+                };
 
-                if let None = size_on_disk_gb
+                if size_on_disk_gb.is_none()
                     && let Some(meta) = cached_meta
                 {
                     size_on_disk_gb = Some(meta.len() as f32 / 1024.0 / 1024.0 / 1024.0);

@@ -20,7 +20,7 @@ use crate::{
 pub async fn init_db(
     config: &AppConfig,
 ) -> Result<surrealdb::Surreal<surrealdb::engine::any::Any>, Box<dyn std::error::Error>> {
-    let jwt = match std::fs::read_to_string(&config.database.jwt_file_path) {
+    let jwt = match tokio::fs::read_to_string(&config.database.jwt_file_path).await {
         Ok(content) => content,
         Err(e) => {
             let msg = format!(

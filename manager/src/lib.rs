@@ -260,18 +260,19 @@ pub async fn run_batcher_loop(
             Some(tok) => tok.clone(),
             None => {
                 let repo = config_for_prompt.tokenizer_repo.clone();
-                let tok_res = tokio::task::spawn_blocking(move || {
-                    let api = Api::new().map_err(|e| e.to_string())?;
+                let tok_res = async move {
+                    let api = hf_hub::api::tokio::Api::new().map_err(|e| e.to_string())?;
                     let path = api
                         .model(repo)
-                        .get("tokenizer.json")
+                        .get("tokenizer.json").await
                         .map_err(|e| e.to_string())?;
-                    Tokenizer::from_file(path).map_err(|e| e.to_string())
-                })
-                .await;
+                    tokio::task::spawn_blocking(move || {
+                        Tokenizer::from_file(path).map_err(|e| e.to_string())
+                    }).await.unwrap_or_else(|e| Err(e.to_string()))
+                }.await;
 
                 match tok_res {
-                    Ok(Ok(tok)) => {
+                    Ok(tok) => {
                         if tokenizer_cache.len() >= 5 {
                             // Simple eviction to prevent memory leak
                             tokenizer_cache.clear();
