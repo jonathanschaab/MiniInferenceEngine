@@ -27,6 +27,7 @@ export default [
         fetchWithAuth: 'readonly',
         getGenerationParameters: 'readonly',
         injectNavbar: 'readonly',
+        SharedDownloadProgress: 'readonly',
         
         // Globals from chat.js
         initializeUI: 'readonly',

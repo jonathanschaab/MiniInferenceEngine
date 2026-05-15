@@ -160,8 +160,9 @@ pub async fn build_oauth_client(
     auth_url: &str,
     token_url: &str,
 ) -> Result<BasicClient, String> {
+    let abs_secret_path = manager::types::resolve_absolute_path(secret_path);
     // 1. Read the JSON file from the disk
-    let file_content = match tokio::fs::read_to_string(secret_path).await {
+    let file_content = match tokio::fs::read_to_string(&abs_secret_path).await {
         Ok(c) => c,
         Err(e) => {
             let msg = format!(

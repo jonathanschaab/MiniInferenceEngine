@@ -720,4 +720,35 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         await page.locator('#clear-all-btn').click();
         expect(clearAllCalled).toBe(true);
     });
+
+    test('SharedDownloadProgress prevents redundant API requests', async ({ page }) => {
+        let apiCallCount = 0;
+        
+        // Override the default mock to count calls and add an artificial delay to ensure promises overlap
+        await page.route('**/api/models/download/progress', async route => {
+            apiCallCount++;
+            await new Promise(resolve => setTimeout(resolve, 50));
+            await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+        });
+
+        // Use the chat page, which does not aggressively poll on load by default
+        await page.goto('/');
+        apiCallCount = 0; // Reset in case any immediate load checks occurred
+
+        // Fire 5 simultaneous requests from the UI
+        await page.evaluate(async () => {
+            const promises = Array.from({ length: 5 }).map(() => SharedDownloadProgress.get());
+            await Promise.all(promises);
+        });
+
+        // The poller should have coalesced all 5 requests into exactly 1 network call
+        expect(apiCallCount).toBe(1);
+
+        // Wait for the 500ms cache TTL to expire
+        await page.waitForTimeout(600);
+
+        // Fire another request; it should bypass the expired cache
+        await page.evaluate(async () => await SharedDownloadProgress.get());
+        expect(apiCallCount).toBe(2);
+    });
 });

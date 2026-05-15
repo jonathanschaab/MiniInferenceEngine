@@ -30,6 +30,38 @@ function getGenerationParameters() {
 }
 
 /**
+ * Shared download progress poller to prevent redundant API calls
+ * when multiple models are downloading or multiple pages are tracking.
+ */
+const SharedDownloadProgress = {
+    lastFetchTime: 0,
+    cache: null,
+    fetchPromise: null,
+    async get() {
+        const now = Date.now();
+        if (this.fetchPromise) return this.fetchPromise;
+        if (now - this.lastFetchTime < 500 && this.cache) {
+            return this.cache;
+        }
+        this.fetchPromise = (async () => {
+            try {
+                const res = await fetchWithAuth('/api/models/download/progress');
+                this.cache = await res.json();
+                this.lastFetchTime = Date.now();
+                return this.cache;
+            } finally {
+                this.fetchPromise = null;
+            }
+        })();
+        return this.fetchPromise;
+    },
+    clearCache() {
+        this.cache = null;
+        this.lastFetchTime = 0;
+    }
+};
+
+/**
  * Shared utility to handle model downloads with progress polling and cancellation.
  * @param {string} modelId - The ID of the model to download.
  * @param {Object} callbacks - Functions to handle UI updates.
@@ -50,6 +82,7 @@ function downloadModel(modelId, callbacks = {}) {
         stopReason = "Canceled";
         try {
             await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
+            SharedDownloadProgress.clearCache();
         } catch (e) {
             console.error("Failed to send cancel request to server:", e);
         }
@@ -60,6 +93,7 @@ function downloadModel(modelId, callbacks = {}) {
         stopReason = "Paused";
         try {
             await fetchWithAuth(`/api/models/${modelId}/pause`, { method: 'POST' });
+            SharedDownloadProgress.clearCache();
         } catch (e) {
             console.error("Failed to send pause request to server:", e);
         }
@@ -75,12 +109,12 @@ function downloadModel(modelId, callbacks = {}) {
     const promise = (async () => {
         while (!isStopped) {
             try {
-                const progCheck = await fetchWithAuth('/api/models/download/progress');
-                const activeDls = await progCheck.json();
+                const activeDls = await SharedDownloadProgress.get();
                 
                 if (!activeDls[modelId]) {
                     try {
                         await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'POST' });
+                        SharedDownloadProgress.clearCache();
                         retryCount = 0;
                     } catch (e) {
                         if (e.message === 'Unauthorized') throw e;
@@ -104,8 +138,7 @@ function downloadModel(modelId, callbacks = {}) {
                 }
 
                 while (!isStopped) {
-                    const progRes = await fetchWithAuth('/api/models/download/progress');
-                    const downloads = await progRes.json();
+                    const downloads = await SharedDownloadProgress.get();
                     const status = downloads[modelId];
                     
                     if (status) {

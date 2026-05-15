@@ -120,9 +120,7 @@ const activeDownloads = new Map();
  */
 async function discoverActiveDownloads() {
     try {
-        const res = await fetchWithAuth('/api/models/download/progress');
-        if (!res.ok) return;
-        const downloads = await res.json();
+        const downloads = await SharedDownloadProgress.get();
         
         const activeIds = Object.keys(downloads);
 
@@ -258,6 +256,7 @@ async function deleteModel(modelId) {
 
     try {
         await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
+        SharedDownloadProgress.clearCache();
         loadModels();
     } catch (e) {
         if (e.message && e.message.includes('409')) {

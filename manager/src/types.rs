@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Clone, Debug)]
@@ -336,6 +337,18 @@ pub struct UserRequest {
     pub target_backend: Option<String>,
 }
 
+/// Resolves a given path to an absolute path.
+/// If the path is already absolute, it returns it as is.
+/// Otherwise, it joins it with the current working directory.
+pub fn resolve_absolute_path<P: AsRef<Path>>(path: P) -> PathBuf {
+    let p = path.as_ref();
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,5 +531,16 @@ mod tests {
         // With active_count == 0, the baseline recalculates: 3500 used - 1000 static weights = 2500
         status.update_nvml(10000, 3500, 6500);
         assert_eq!(status.baseline_other_vram, 2500);
+    }
+
+    #[test]
+    fn test_resolve_absolute_path() {
+        let relative = Path::new("downloads");
+        let absolute = resolve_absolute_path(relative);
+        assert!(absolute.is_absolute());
+
+        let already_absolute = std::env::current_dir().unwrap().join("test");
+        let still_absolute = resolve_absolute_path(&already_absolute);
+        assert_eq!(already_absolute, still_absolute);
     }
 }

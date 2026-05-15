@@ -14,9 +14,7 @@ async function checkAdmin() {
 
 async function loadQueue() {
     try {
-        const res = await fetchWithAuth('/api/models/download/progress');
-        if (!res.ok) return;
-        const downloads = await res.json();
+        const downloads = await SharedDownloadProgress.get();
         
         const tbody = document.getElementById('queue-tbody');
         const keys = Object.keys(downloads);
@@ -66,16 +64,16 @@ async function loadQueue() {
 
 window.cancelDownload = async function(id) {
     if (!confirm(`Are you sure you want to cancel the download for ${id}?`)) return;
-    try { await fetchWithAuth(`/api/models/${id}/download`, { method: 'DELETE' }); loadQueue(); } catch (e) { console.error("Failed to cancel download:", e); alert("Failed to cancel download."); }
+    try { await fetchWithAuth(`/api/models/${id}/download`, { method: 'DELETE' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to cancel download:", e); alert("Failed to cancel download."); }
 };
 
 window.pauseDownload = async function(id) {
-    try { await fetchWithAuth(`/api/models/${id}/pause`, { method: 'POST' }); loadQueue(); } catch (e) { console.error("Failed to pause download:", e); alert("Failed to pause download."); }
+    try { await fetchWithAuth(`/api/models/${id}/pause`, { method: 'POST' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to pause download:", e); alert("Failed to pause download."); }
 };
 
 window.clearAllDownloads = async function() {
     if (!confirm("Are you sure you want to cancel ALL active and queued downloads?")) return;
-    try { await fetchWithAuth('/api/downloads', { method: 'DELETE' }); loadQueue(); } catch (e) { console.error("Failed to clear downloads:", e); alert("Failed to clear downloads."); }
+    try { await fetchWithAuth('/api/downloads', { method: 'DELETE' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to clear downloads:", e); alert("Failed to clear downloads."); }
 };
 
 document.addEventListener('DOMContentLoaded', async () => {
