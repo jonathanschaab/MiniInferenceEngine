@@ -64,9 +64,20 @@ pub async fn perform_model_download(
 
     let (mut existing_size, mut expected_hash) = check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path).await;
 
+    let mut hasher = Sha256::new();
+    if existing_size > 0 {
+        {
+            let mut dl = state.active_downloads.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(status) = dl.get_mut(&id) {
+                status.state = "Verifying existing data...".to_string();
+            }
+        }
+        
+        hasher = restore_hasher_state(&tmp_file_path, existing_size).await;
+    }
+
     update_status_connecting(&state, &id, existing_size);
 
-    let mut hasher = Sha256::new();
     let mut res = match initiate_request(&state, &url, &id, &mut existing_size, &mut hasher).await {
         Some(r) => r,
         None => return,
@@ -120,20 +131,15 @@ pub async fn perform_model_download(
 
     drop(file);
 
-    let final_hash_opt = verify_download_hash(&state, &id, &tmp_file_path, existing_size == 0, hasher).await;
+    let final_hash = hex::encode(hasher.finalize());
     
-    let hash_mismatch = if let Some(final_hash) = final_hash_opt {
-        if let Some(ref expected) = expected_hash {
-            if expected.len() == 64 && expected.chars().all(|c| c.is_ascii_hexdigit()) {
-                if &final_hash != expected {
-                    error!("Checksum mismatch for {}. Expected {}, got {}. Marking as corrupted.", id, expected, final_hash);
-                    true
-                } else {
-                    info!("Checksum validated successfully for {}.", id);
-                    false
-                }
+    let hash_mismatch = if let Some(ref expected) = expected_hash {
+        if expected.len() == 64 && expected.chars().all(|c| c.is_ascii_hexdigit()) {
+            if &final_hash != expected {
+                error!("Checksum mismatch for {}. Expected {}, got {}. Marking as corrupted.", id, expected, final_hash);
+                true
             } else {
-                info!("No SHA-256 ETag found for {}. Saving. Computed: {}", id, final_hash);
+                info!("Checksum validated successfully for {}.", id);
                 false
             }
         } else {
@@ -141,10 +147,36 @@ pub async fn perform_model_download(
             false
         }
     } else {
+        info!("No SHA-256 ETag found for {}. Saving. Computed: {}", id, final_hash);
         false
     };
 
     finalize_download(&state, &id, &filename, &file_path, &tmp_file_path, &meta_file_path, hash_mismatch).await;
+}
+
+async fn restore_hasher_state(tmp_file_path: &Path, existing_size: u64) -> Sha256 {
+    let tmp_file_path_clone = tmp_file_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut h = Sha256::new();
+        if let Ok(mut f) = std::fs::File::open(&tmp_file_path_clone) {
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            let mut remaining = existing_size;
+            while remaining > 0 {
+                let to_read = (buf.len() as u64).min(remaining) as usize;
+                if let Ok(n) = f.read(&mut buf[..to_read]) {
+                    if n == 0 { break; }
+                    h.update(&buf[..n]);
+                    remaining -= n as u64;
+                } else {
+                    break;
+                }
+            }
+        }
+        h
+    })
+    .await
+    .unwrap_or_else(|_| Sha256::new())
 }
 
 async fn check_existing_metadata(
@@ -247,6 +279,37 @@ async fn initiate_request(
             error!("Download failed for {}: {}", id, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_restore_hasher_state() {
+        let test_dir = std::env::temp_dir().join("minio_test_hasher");
+        let _ = tokio::fs::create_dir_all(&test_dir).await;
+        let test_file = test_dir.join("test_file.bin");
+        
+        // Write a "partially downloaded" file
+        let part1 = b"Hello, ";
+        let part2 = b"World!";
+        tokio::fs::write(&test_file, [part1, part2].concat()).await.unwrap();
+
+        // 1. Hash the entire combined data directly to get the expected baseline
+        let mut expected_hasher = Sha256::new();
+        expected_hasher.update([part1, part2].concat());
+        let expected_hash = hex::encode(expected_hasher.finalize());
+
+        // 2. Restore the hasher state from the disk up to the size of part1
+        let mut resumed_hasher = restore_hasher_state(&test_file, part1.len() as u64).await;
+        // 3. Manually push in the incoming stream chunk (part2)
+        resumed_hasher.update(part2);
+        let resumed_hash = hex::encode(resumed_hasher.finalize());
+
+        assert_eq!(expected_hash, resumed_hash, "Resumed hash should match the full continuous hash");
+        let _ = tokio::fs::remove_dir_all(&test_dir).await;
     }
 }
 
@@ -354,9 +417,7 @@ async fn process_download_stream(
                     }
                 };
 
-                if existing_size == 0 {
-                    hasher.update(&bytes);
-                }
+                hasher.update(&bytes);
                 if let Err(e) = file.write_all(&bytes).await {
                     error!("Failed to write to file for {}: {}", id, e);
                     stream_error = true;
@@ -402,54 +463,6 @@ async fn process_download_stream(
     }
 
     (stream_error, downloaded)
-}
-
-async fn verify_download_hash(
-    state: &Arc<AppState>,
-    id: &str,
-    tmp_file_path: &Path,
-    was_hashed_in_stream: bool,
-    hasher: Sha256,
-) -> Option<String> {
-    if was_hashed_in_stream {
-        Some(hex::encode(hasher.finalize()))
-    } else {
-        {
-            let mut dl = state.active_downloads.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(status) = dl.get_mut(id) {
-                status.state = "Verifying...".to_string();
-            }
-        }
-
-        let tmp_file_path_clone = tmp_file_path.to_path_buf();
-        let hash_result = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-            let mut h = Sha256::new();
-            use std::io::Read;
-            let mut f = std::fs::File::open(&tmp_file_path_clone)?;
-            let mut buf = vec![0u8; 4 * 1024 * 1024];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                h.update(&buf[..n]);
-            }
-            Ok(hex::encode(h.finalize()))
-        })
-        .await;
-
-        match hash_result {
-            Ok(Ok(hash)) => Some(hash),
-            Ok(Err(e)) => {
-                error!("Failed to read file for verification {}: {}", id, e);
-                None
-            }
-            Err(e) => {
-                error!("Hashing task panicked or was cancelled for {}: {}", id, e);
-                None
-            }
-        }
-    }
 }
 
 async fn finalize_download(
