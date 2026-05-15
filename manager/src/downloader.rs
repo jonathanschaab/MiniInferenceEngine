@@ -468,6 +468,7 @@ async fn open_temp_file(
 ) -> std::io::Result<tokio::fs::File> {
     if is_partial && existing_size > 0 {
         tokio::fs::OpenOptions::new()
+            .create(true)
             .append(true)
             .open(tmp_file_path)
             .await

@@ -1675,8 +1675,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let active_downloads = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
     // Background Temp File Cleanup Task
     let downloads_dir_for_cleanup = config.downloads_directory.clone();
+    let active_downloads_for_cleanup = active_downloads.clone();
     tokio::spawn(async move {
         // Sweep the downloads directory every 12 hours
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 3600));
@@ -1684,6 +1687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interval.tick().await;
             match tokio::fs::read_dir(&downloads_dir_for_cleanup).await {
                 Ok(mut entries) => {
+                    let registry = manager::get_model_registry().await;
                     while let Ok(Some(entry)) = entries.next_entry().await {
                         let path = entry.path();
                         if let Some(ext) = path.extension()
@@ -1696,9 +1700,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             && let Ok(age) = modified.elapsed()
                             && age.as_secs() > 3 * 24 * 3600
                         {
-                            // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
-                            let _ = tokio::fs::remove_file(&path).await;
-                            info!("Cleaned up abandoned file: {:?}", path);
+                            let mut is_active = false;
+                            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                                let active_keys: Vec<String> = {
+                                    let active = active_downloads_for_cleanup
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    active.keys().cloned().collect()
+                                };
+                                for model in &registry {
+                                    if active_keys.contains(&model.id)
+                                        && file_name.starts_with(&model.filename)
+                                    {
+                                        is_active = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !is_active {
+                                // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
+                                let _ = tokio::fs::remove_file(&path).await;
+                                info!("Cleaned up abandoned file: {:?}", path);
+                            }
                         }
                     }
                 }
@@ -1853,7 +1877,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = w.watch(path, notify::RecursiveMode::Recursive);
         }
 
-        let mut models = manager::get_model_registry().await;
+        let models = manager::get_model_registry().await;
         let cache = hf_hub::Cache::default();
 
         for model in &models {
@@ -1887,7 +1911,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 _ = watch_refresh_timer.tick() => {
-                    models = manager::get_model_registry().await;
                     for model in &models {
                         let repo_path = cache.path().join(format!("models--{}", model.repo.replace('/', "--")));
                         if let Ok(true) = tokio::fs::try_exists(&repo_path).await {
@@ -2032,7 +2055,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_buffer: memory_buffer,
         log_reload_handle,
         current_log_level: Arc::new(Mutex::new(config.log_level_memory.clone())),
-        active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        active_downloads,
         download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         download_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
         db: db_client.clone(),
