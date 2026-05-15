@@ -99,20 +99,24 @@ async function submitBenchmark() {
     closeModal();
 
     // Fire the updated POST request
-    const res = await fetchWithAuth('/api/stats/collect', { 
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ 
-        models: selectedModels,
-        target_backends: selectedBackends,
-        parameters: parameters
-    })
-    });
-
-    if (res.status === 409) {
-        alert("A benchmark is already running in the background!");
-    } else {
+    try {
+        await fetchWithAuth('/api/stats/collect', { 
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                models: selectedModels,
+                target_backends: selectedBackends,
+                parameters: parameters
+            })
+        });
         checkStatus(); // Instantly lock the UI
+    } catch (e) {
+        if (e.message && e.message.includes('409')) {
+            alert("A benchmark is already running in the background!");
+        } else {
+            console.error("Failed to start benchmark:", e);
+            alert("Failed to start benchmark. Check console for details.");
+        }
     }
 }
 

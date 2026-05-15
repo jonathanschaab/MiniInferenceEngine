@@ -65,6 +65,12 @@ pub async fn perform_model_download(
     let (mut existing_size, mut expected_hash) =
         check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path).await;
 
+    // Wait in the queue for an available download slot
+    let _permit = match state.download_semaphore.acquire().await {
+        Ok(p) => p,
+        Err(_) => return, // Semaphore closed, safely shutting down
+    };
+
     let mut hasher = Sha256::new();
     if existing_size > 0 {
         {
@@ -122,9 +128,9 @@ pub async fn perform_model_download(
     update_status_downloading(&state, &id, existing_size, total_size);
 
     let mut file = match open_temp_file(&tmp_file_path, is_partial, existing_size).await {
-        Some(f) => f,
-        None => {
-            error!("Failed to open/create file for {}: Unknown error", id);
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to open/create file for {}: {}", id, e);
             return;
         }
     };
@@ -195,28 +201,30 @@ pub async fn perform_model_download(
 }
 
 async fn restore_hasher_state(tmp_file_path: &Path, existing_size: u64) -> Sha256 {
-    let mut h = Sha256::new();
-    if let Ok(mut f) = tokio::fs::File::open(tmp_file_path).await {
-        use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; 4 * 1024 * 1024];
-        let mut remaining = existing_size;
-        while remaining > 0 {
-            let to_read = (buf.len() as u64).min(remaining) as usize;
-            if let Ok(n) = f.read(&mut buf[..to_read]).await {
-                if n == 0 {
+    let path = tmp_file_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut h = Sha256::new();
+        if let Ok(mut f) = std::fs::File::open(&path) {
+            use std::io::Read;
+            let mut buf = vec![0u8; 4 * 1024 * 1024];
+            let mut remaining = existing_size;
+            while remaining > 0 {
+                let to_read = (buf.len() as u64).min(remaining) as usize;
+                if let Ok(n) = f.read(&mut buf[..to_read]) {
+                    if n == 0 {
+                        break;
+                    }
+                    h.update(&buf[..n]);
+                    remaining -= n as u64;
+                } else {
                     break;
                 }
-                tokio::task::block_in_place(|| {
-                    h.update(&buf[..n]);
-                });
-                remaining -= n as u64;
-                tokio::task::yield_now().await;
-            } else {
-                break;
             }
         }
-    }
-    h
+        h
+    })
+    .await
+    .unwrap_or_else(|_| Sha256::new())
 }
 
 async fn check_existing_metadata(
@@ -457,15 +465,14 @@ async fn open_temp_file(
     tmp_file_path: &Path,
     is_partial: bool,
     existing_size: u64,
-) -> Option<tokio::fs::File> {
+) -> std::io::Result<tokio::fs::File> {
     if is_partial && existing_size > 0 {
         tokio::fs::OpenOptions::new()
             .append(true)
             .open(tmp_file_path)
             .await
-            .ok()
     } else {
-        tokio::fs::File::create(tmp_file_path).await.ok()
+        tokio::fs::File::create(tmp_file_path).await
     }
 }
 

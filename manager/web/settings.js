@@ -44,20 +44,20 @@ async function submitNewKey() {
     
     if (!name) { alert("A name is required for the API Key."); return; }
     
-    const res = await fetchWithAuth('/api/settings/keys', { 
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name, description: desc ? desc : null })
-    });
-
-    if (res.ok) {
+    try {
+        const res = await fetchWithAuth('/api/settings/keys', { 
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name, description: desc ? desc : null })
+        });
         const plaintextKey = await res.json();
         closeKeyModal();
         // Show the plaintext key to the user EXACTLY once
         window.prompt("Keep this safe! You will never see it again. Copy it now:", plaintextKey);
         loadKeys();
-    } else {
-        alert("Failed to create API key.");
+    } catch (e) {
+        console.error("Failed to create API key:", e);
+        alert("Failed to create API key. Check console for details.");
     }
 }
 
@@ -91,8 +91,13 @@ function showDeleteKeyModal() {
 async function deleteKey(hash) {
     const confirmed = await showDeleteKeyModal();
     if (confirmed) {
-        await fetchWithAuth(`/api/settings/keys/${hash}`, { method: 'DELETE' });
-        loadKeys();
+        try {
+            await fetchWithAuth(`/api/settings/keys/${hash}`, { method: 'DELETE' });
+            loadKeys();
+        } catch (e) {
+            console.error("Failed to revoke API key:", e);
+            alert("Failed to revoke API key. Check console for details.");
+        }
     }
 }
 

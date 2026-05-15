@@ -598,7 +598,9 @@ async function startChatDownload(modelId, modelName) {
             const stats = document.getElementById(`dl-stats-${modelId}`);
             if (bar) bar.style.width = `${pct}%`;
             if (stats) {
-                if (status.state !== 'Downloading...') {
+                if (status.state === 'Queued...') {
+                    stats.innerHTML = `<span style="color:#f9e2af;">Queued...</span> <a href="/queue" style="color:#89b4fa; text-decoration:none; margin-left: 5px;">(View Queue)</a>`;
+                } else if (status.state !== 'Downloading...') {
                     stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | ${status.state}`;
                 } else {
                     stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
@@ -607,7 +609,13 @@ async function startChatDownload(modelId, modelName) {
         },
         onStatusText: (text) => {
             const stats = document.getElementById(`dl-stats-${modelId}`);
-            if (stats) stats.innerText = text;
+            if (stats) {
+                if (text === 'Queued...') {
+                    stats.innerHTML = `<span style="color:#f9e2af;">Queued...</span> <a href="/queue" style="color:#89b4fa; text-decoration:none; margin-left: 5px;">(View Queue)</a>`;
+                } else {
+                    stats.innerText = text;
+                }
+            }
         },
         onComplete: () => {
             const bar = document.getElementById(`dl-bar-${modelId}`);

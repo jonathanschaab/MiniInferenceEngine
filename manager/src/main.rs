@@ -65,6 +65,8 @@ pub struct AppConfig {
     pub secure_cookies: bool,
     #[serde(default)]
     pub gpu_device_index: u32,
+    #[serde(default = "default_max_concurrent_downloads")]
+    pub max_concurrent_downloads: usize,
     #[serde(default = "default_telemetry_retention_days")]
     pub telemetry_retention_days: u64,
     #[serde(default = "default_log_level_console")]
@@ -107,6 +109,9 @@ fn default_oauth_token_url() -> String {
 fn default_oauth_userinfo_url() -> String {
     "https://www.googleapis.com/oauth2/v2/userinfo".to_string()
 }
+fn default_max_concurrent_downloads() -> usize {
+    2
+}
 fn default_telemetry_retention_days() -> u64 {
     30
 }
@@ -131,6 +136,7 @@ impl Default for AppConfig {
             user_emails: vec![],
             secure_cookies: true,
             gpu_device_index: 0,
+            max_concurrent_downloads: default_max_concurrent_downloads(),
             telemetry_retention_days: default_telemetry_retention_days(),
             log_level_console: default_log_level_console(),
             log_level_file: default_log_level_file(),
@@ -239,6 +245,7 @@ pub struct AppState {
     pub current_log_level: Arc<Mutex<String>>,
     pub active_downloads: Arc<Mutex<std::collections::HashMap<String, DownloadStatus>>>,
     pub download_tasks: Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub download_semaphore: Arc<tokio::sync::Semaphore>,
     pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -250,6 +257,22 @@ pub(crate) async fn serve_ui(
         return Err(Redirect::to("/auth/login"));
     }
     Ok(Html(include_str!("../web/index.html")))
+}
+
+pub(crate) async fn serve_queue_ui(
+    session: tower_sessions::Session,
+) -> Result<Html<&'static str>, Redirect> {
+    if require_session(session).await.is_err() {
+        return Err(Redirect::to("/auth/login"));
+    }
+    Ok(Html(include_str!("../web/queue.html")))
+}
+
+pub(crate) async fn serve_queue_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../web/queue.js"),
+    )
 }
 
 // Send the model roster to the Javascript dropdowns
@@ -427,7 +450,7 @@ pub(crate) async fn trigger_download(
                     .unwrap_or_default()
                     .as_secs(),
                 current_speed_bps: 0.0,
-                state: "Connecting...".to_string(),
+                state: "Queued...".to_string(),
             },
         );
     }
@@ -488,6 +511,34 @@ pub(crate) async fn pause_download(
     } else {
         (StatusCode::NOT_FOUND, "No active download to pause").into_response()
     }
+}
+
+// Cancel and clear all active and queued downloads
+pub(crate) async fn cancel_all_downloads(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+) -> impl IntoResponse {
+    if !user.is_admin {
+        return (
+            StatusCode::FORBIDDEN,
+            "Admin access required for cancelling downloads",
+        )
+            .into_response();
+    }
+
+    let tasks_to_abort: Vec<_> = {
+        let mut tasks = state
+            .download_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tasks.drain().map(|(_, task)| task).collect()
+    };
+
+    for task in tasks_to_abort {
+        task.abort();
+    }
+
+    (StatusCode::OK, "All downloads cancelled").into_response()
 }
 
 // Delete a downloaded model from disk
@@ -1623,23 +1674,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 3600));
         loop {
             interval.tick().await;
-            if let Ok(mut entries) = tokio::fs::read_dir(&downloads_dir_for_cleanup).await {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if let Some(ext) = path.extension()
-                        && (ext == "tmp"
-                            || ext == "meta"
-                            || ext == "corrupted"
-                            || ext == "copy_tmp")
-                        && let Ok(metadata) = entry.metadata().await
-                        && let Ok(modified) = metadata.modified()
-                        && let Ok(age) = modified.elapsed()
-                        && age.as_secs() > 3 * 24 * 3600
-                    {
-                        // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
-                        let _ = tokio::fs::remove_file(&path).await;
-                        info!("Cleaned up abandoned file: {:?}", path);
+            match tokio::fs::read_dir(&downloads_dir_for_cleanup).await {
+                Ok(mut entries) => {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let path = entry.path();
+                        if let Some(ext) = path.extension()
+                            && (ext == "tmp"
+                                || ext == "meta"
+                                || ext == "corrupted"
+                                || ext == "copy_tmp")
+                            && let Ok(metadata) = entry.metadata().await
+                            && let Ok(modified) = metadata.modified()
+                            && let Ok(age) = modified.elapsed()
+                            && age.as_secs() > 3 * 24 * 3600
+                        {
+                            // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
+                            let _ = tokio::fs::remove_file(&path).await;
+                            info!("Cleaned up abandoned file: {:?}", path);
+                        }
                     }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    error!("Failed to read downloads directory for cleanup: {}", e);
                 }
             }
         }
@@ -1969,6 +2026,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         current_log_level: Arc::new(Mutex::new(config.log_level_memory.clone())),
         active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
         download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        download_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
         db: db_client.clone(),
         shutdown_tx: shutdown_tx.clone(),
     });
@@ -2198,6 +2256,7 @@ mod tests {
             current_log_level: Arc::new(Mutex::new("info".to_string())),
             active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
             download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             db,
             shutdown_tx,
         })
@@ -2602,6 +2661,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancel_all_downloads() {
+        let state = create_test_app_state().await;
+        let admin_user = mock_user("admin@local", true);
+        let normal_user = mock_user("user@local", false);
+
+        // 1. Non-admin should be rejected (403)
+        let res = cancel_all_downloads(State(state.clone()), normal_user)
+            .await
+            .into_response();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // 2. Insert dummy tasks into the queue/active state
+        let task1 = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        let task2 = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        {
+            let mut tasks = state.download_tasks.lock().unwrap();
+            tasks.insert("model1".to_string(), task1);
+            tasks.insert("model2".to_string(), task2);
+        }
+
+        // 3. Admin request should successfully cancel and drain all tasks
+        let res = cancel_all_downloads(State(state.clone()), admin_user)
+            .await
+            .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let tasks = state.download_tasks.lock().unwrap();
+        assert!(
+            tasks.is_empty(),
+            "All download tasks should be removed from the map"
+        );
+    }
+
+    #[tokio::test]
     async fn test_shutdown_signal_flushes_download_metadata() {
         use axum::Router;
         use axum::routing::get;
@@ -2677,6 +2774,7 @@ mod tests {
             current_log_level: Arc::new(Mutex::new("info".to_string())),
             active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
             download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             db,
             shutdown_tx: shutdown_tx.clone(),
         });

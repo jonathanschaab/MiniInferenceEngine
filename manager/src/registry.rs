@@ -156,7 +156,7 @@ impl ModelConfig {
         (2 * self.num_layers * self.head_dim * self.n_head_kv) * bytes_per_element
     }
 
-    pub fn estimate_compute_margin_bytes(&self) -> u64 {
+    pub fn estimate_compute_margin_bytes(&self, ubatch_size: usize) -> u64 {
         if self.arch == ModelArch::XLMRoberta {
             return 250 * 1024 * 1024; // Static margin for encoder-only models
         }
@@ -165,13 +165,10 @@ impl ModelConfig {
         let active_experts = self.num_experts_per_tok.unwrap_or(1);
         let ffn_size = self.intermediate_size * active_experts;
 
-        // Typical maximum physical batch size (ubatch) for prefill
-        let batch_size = 512;
-
-        // 1. FFN and Hidden States (scales with batch size)
-        let activation_memory = (self.n_embd + ffn_size) * batch_size * bytes_per_element;
-        // 2. Attention Matrix (scales with batch size * context length * n_head)
-        let attention_memory = batch_size * self.n_head * self.max_context_len * bytes_per_element;
+        // 1. FFN and Hidden States (scales with physical batch size)
+        let activation_memory = (self.n_embd + ffn_size) * ubatch_size * bytes_per_element;
+        // 2. Attention Matrix (scales with physical batch size * context length * n_head)
+        let attention_memory = ubatch_size * self.n_head * self.max_context_len * bytes_per_element;
         // 3. Static Overhead (Graph nodes, CUDA context, etc.) - safely baseline around 250MB
         let static_overhead = 250 * 1024 * 1024;
 

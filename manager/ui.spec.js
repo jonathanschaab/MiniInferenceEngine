@@ -21,6 +21,7 @@ async function mockStaticAssets(page) {
         '/settings': 'settings.html',
         '/stats': 'stats.html',
         '/console': 'console.html',
+        '/queue': 'queue.html',
     };
 
     for (const [routePath, file] of Object.entries(routes)) {
@@ -657,5 +658,66 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         delete downloadState['mock-model-1']; // Simulate Finish
         isDownloaded = true;
         await expect(card.locator('.badge-json', { hasText: 'Ready' })).toBeVisible();
+    });
+
+    test('Queue UI displays downloads and supports admin actions', async ({ page }) => {
+        let deleteCalled = false;
+        let pauseCalled = false;
+        let clearAllCalled = false;
+
+        // Override default progress mock for this test to simulate a queue
+        await page.route('**/api/models/download/progress', async route => {
+            await route.fulfill({
+                status: 200,
+                json: {
+                    'mock-model-1': { bytes_transferred: 5242880, total_bytes: 10485760, current_speed_bps: 1048576, start_time: 0, state: 'Downloading...' },
+                    'mock-model-2': { bytes_transferred: 0, total_bytes: 0, current_speed_bps: 0, start_time: 0, state: 'Queued...' }
+                }
+            });
+        });
+
+        await page.route('**/api/models/mock-model-2/download', async route => {
+            if (route.request().method() === 'DELETE') {
+                deleteCalled = true;
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        await page.route('**/api/models/mock-model-1/pause', async route => {
+            if (route.request().method() === 'POST') {
+                pauseCalled = true;
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'DELETE') {
+                clearAllCalled = true;
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        // Automatically accept any confirm() dialogs (Clear All / Cancel)
+        page.on('dialog', dialog => dialog.accept());
+
+        await page.goto('/queue');
+
+        const tbody = page.locator('#queue-tbody');
+        await expect(tbody).toContainText('mock-model-1');
+        await expect(tbody).toContainText('mock-model-2');
+        await expect(tbody).toContainText('Downloading...');
+        await expect(tbody).toContainText('Queued...');
+
+        // Test individual Cancel
+        await page.locator('tr', { hasText: 'mock-model-2' }).locator('button', { hasText: 'Cancel' }).click();
+        expect(deleteCalled).toBe(true);
+
+        // Test individual Pause
+        await page.locator('tr', { hasText: 'mock-model-1' }).locator('button', { hasText: 'Pause' }).click();
+        expect(pauseCalled).toBe(true);
+
+        // Test Clear All
+        await page.locator('#clear-all-btn').click();
+        expect(clearAllCalled).toBe(true);
     });
 });

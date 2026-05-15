@@ -183,10 +183,12 @@ async function startDownload(modelId) {
             
             if (bar) bar.style.width = `${pct}%`;
             if (stats) {
-                if (status.state !== 'Downloading...') {
-                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | ${status.state}`;
+                if (status.state === 'Queued...') {
+                    stats.innerHTML = `<span style="color:#f9e2af;">Queued...</span> <a href="/queue" style="color:#89b4fa; text-decoration:none; margin-left: 5px;">(View Queue)</a>`;
+                } else if (status.state !== 'Downloading...') {
+                    stats.innerHTML = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | ${DOMPurify.sanitize(status.state)}`;
                 } else {
-                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
+                    stats.innerHTML = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
                 }
             }
         },
@@ -194,7 +196,13 @@ async function startDownload(modelId) {
             const card = document.getElementById(`model-card-${modelId}`);
             if (!card) return;
             const stats = card.querySelector('.download-stats');
-            if (stats) stats.innerText = text;
+            if (stats) {
+                if (text === 'Queued...') {
+                    stats.innerHTML = `<span style="color:#f9e2af;">Queued...</span> <a href="/queue" style="color:#89b4fa; text-decoration:none; margin-left: 5px;">(View Queue)</a>`;
+                } else {
+                    stats.innerText = text;
+                }
+            }
         },
         onComplete: () => {
             const card = document.getElementById(`model-card-${modelId}`);
@@ -247,16 +255,15 @@ async function deleteModel(modelId) {
     if (!confirm(warning)) return;
 
     try {
-        const res = await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
-        if (res.ok) {
-            loadModels();
-        } else {
-            const text = await res.text();
-            alert(`Failed to delete model: ${text}`);
-        }
+        await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
+        loadModels();
     } catch (e) {
-        console.error("Error deleting model:", e);
-        alert("Error deleting model. Check console.");
+        if (e.message && e.message.includes('409')) {
+            alert("Cannot delete a model while it is downloading or loaded in VRAM.");
+        } else {
+            console.error("Error deleting model:", e);
+            alert("Error deleting model. Check console.");
+        }
     }
 };
 

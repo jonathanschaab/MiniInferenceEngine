@@ -203,6 +203,7 @@ function injectNavbar() {
     navDiv.innerHTML = `
         <button onclick="window.location.href='/'" style="background: #89b4fa; height: 30px; padding: 0 10px;">💬 Chat</button>
         <button onclick="window.location.href='/models'" style="background: #fab387; height: 30px; padding: 0 10px;">🤖 Models</button>
+        <button onclick="window.location.href='/queue'" style="background: #94e2d5; height: 30px; padding: 0 10px;">⬇️ Queue</button>
         <button onclick="window.location.href='/memory'" style="background: #f9e2af; height: 30px; padding: 0 10px;">💾 Memory</button>
         <button onclick="window.location.href='/stats'" style="background: #cba6f7; height: 30px; padding: 0 10px;">📊 Stats</button>
         <button id="nav-console-btn" onclick="window.location.href='/console'" style="background: #89dceb; height: 30px; padding: 0 10px; display: none;">🖥️ Console</button>

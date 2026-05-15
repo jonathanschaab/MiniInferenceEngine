@@ -575,7 +575,8 @@ pub async fn run_batcher_loop(
             // This rough heuristic is only for the Candle backend's dynamic memory check.
             // Llama.cpp calculates this precisely during its static allocation.
             let bytes_per_token = config.estimate_kv_bytes_per_token();
-            let compute_margin = config.estimate_compute_margin_bytes();
+            // Candle backend uses a hardcoded prefill_chunk_size of 256
+            let compute_margin = config.estimate_compute_margin_bytes(256);
             let safe_free_vram = free_vram.saturating_sub(compute_margin);
             let absolute_max_tokens =
                 (safe_free_vram as usize / bytes_per_token).min(active_max_context);

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Download Queue</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
+    <link rel="stylesheet" href="/css/common.css">
+</head>
+<body>
+    <header>
+        <h1>Download Queue</h1>
+    </header>
+
+    <div style="background: #181825; padding: 10px 20px; border-bottom: 1px solid #313244; display: flex; gap: 15px; align-items: center; justify-content: space-between;">
+        <div></div>
+        <div style="display: flex; gap: 15px; align-items: center;">
+            <button id="clear-all-btn" onclick="clearAllDownloads()" style="background: #f38ba8; height: 30px; padding: 0 10px; display: none;">🗑️ Clear All Downloads</button>
+        </div>
+    </div>
+
+    <div style="padding: 20px; max-width: 1400px; margin: 0 auto;">
+        <table>
+            <thead>
+                <tr>
+                    <th>Model ID</th>
+                    <th>Status</th>
+                    <th>Progress</th>
+                    <th>Speed</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="queue-tbody"></tbody>
+        </table>
+    </div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/queue.js"></script>
+</body>
+</html>

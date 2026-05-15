@@ -297,7 +297,8 @@ impl LlamaCppEngine {
 
                             let bytes_per_token = config.estimate_kv_bytes_per_token();
 
-                            let compute_margin: u64 = config.estimate_compute_margin_bytes();
+                            // Llama.cpp defaults to a physical batch size (n_ubatch) of 512.
+                            let compute_margin: u64 = config.estimate_compute_margin_bytes(512);
                             let mut final_ctx_len =
                                 required_ctx.max(2048).min(config.max_context_len);
                             let mut n_gpu_layers = config.num_layers as u32;

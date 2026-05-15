@@ -60,6 +60,11 @@ export default [
         switchTab: 'readonly',
         updateDashboard: 'readonly',
         
+        // Globals from queue.js
+        cancelDownload: 'readonly',
+        pauseDownload: 'readonly',
+        clearAllDownloads: 'readonly',
+
         // Globals from settings.js and models.js
         openKeyModal: 'readonly',
         closeKeyModal: 'readonly',
