@@ -1688,6 +1688,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match tokio::fs::read_dir(&downloads_dir_for_cleanup).await {
                 Ok(mut entries) => {
                     let registry = manager::get_model_registry().await;
+                    let active_keys: std::collections::HashSet<String> = {
+                        let active = active_downloads_for_cleanup
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        active.keys().cloned().collect()
+                    };
                     while let Ok(Some(entry)) = entries.next_entry().await {
                         let path = entry.path();
                         if let Some(ext) = path.extension()
@@ -1702,12 +1708,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             let mut is_active = false;
                             if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                                let active_keys: Vec<String> = {
-                                    let active = active_downloads_for_cleanup
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
-                                    active.keys().cloned().collect()
-                                };
                                 for model in &registry {
                                     if active_keys.contains(&model.id)
                                         && file_name.starts_with(&model.filename)
