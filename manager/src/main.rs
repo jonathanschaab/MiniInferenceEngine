@@ -1770,10 +1770,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let downloads_dir_for_init = config.downloads_directory.clone();
     tokio::spawn(async move {
         use notify::Watcher;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<std::path::PathBuf>>();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if res.is_ok() {
-                let _ = tx.send(());
+            if let Ok(event) = res {
+                let _ = tx.send(event.paths);
             }
         })
         .expect("Failed to create file watcher");
@@ -1802,11 +1802,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut pending_update = true;
         let mut first_run = true;
+        let mut pending_paths = std::collections::HashSet::new();
 
         loop {
             tokio::select! {
-                Some(_) = rx.recv() => {
-                    pending_update = true;
+                Some(paths) = rx.recv() => {
+                    if !pending_update {
+                        pending_paths.extend(paths);
+                    }
                 }
                 _ = watch_refresh_timer.tick() => {
                     models = manager::get_model_registry().await;
@@ -1819,22 +1822,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // Force a state update in case we missed a directory creation event
                     pending_update = true;
+                    pending_paths.clear();
                 }
                 _ = debounce_timer.tick() => {
-                    if !pending_update && !first_run {
+                    if !pending_update && pending_paths.is_empty() && !first_run {
                         continue;
                     }
-                        pending_update = false;
 
-                        let models_clone = models.clone();
-                        let downloads_dir = downloads_dir_for_init.clone();
-                        let (downloaded_ids, cached_ids, corrupted_ids) =
-                    tokio::task::spawn_blocking(move || {
+                    let is_full_update = pending_update || first_run;
+                    let paths_to_check = if is_full_update {
+                        pending_paths.clear();
+                        Vec::new()
+                    } else {
+                        pending_paths.drain().collect::<Vec<_>>()
+                    };
+                    pending_update = false;
+
+                    let models_clone = models.clone();
+                    let downloads_dir = downloads_dir_for_init.clone();
+                    
+                    let updates = tokio::task::spawn_blocking(move || {
                         let cache = hf_hub::Cache::default();
-                        let mut d_ids = std::collections::HashSet::new();
-                        let mut c_ids = std::collections::HashSet::new();
-                        let mut err_ids = std::collections::HashSet::new();
-                        for model in &models_clone {
+                        
+                        let models_to_check = if is_full_update {
+                            models_clone
+                        } else {
+                            models_clone.into_iter().filter(|m| {
+                                let local_path = std::path::Path::new(&downloads_dir).join(&m.filename);
+                                let corrupted_path = {
+                                    let mut p = local_path.clone().into_os_string();
+                                    p.push(".corrupted");
+                                    std::path::PathBuf::from(p)
+                                };
+                                let repo_path = cache.repo(hf_hub::Repo::model(m.repo.clone())).path();
+                                
+                                paths_to_check.iter().any(|p| {
+                                    p == &local_path || p == &corrupted_path || p.starts_with(&repo_path)
+                                })
+                            }).collect::<Vec<_>>()
+                        };
+
+                        let mut results = Vec::new();
+                        for model in models_to_check {
                             let local_path = std::path::Path::new(&downloads_dir).join(&model.filename);
                             let corrupted_path = {
                                 let mut p = local_path.clone().into_os_string();
@@ -1845,43 +1874,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .repo(hf_hub::Repo::model(model.repo.clone()))
                                 .get(&model.filename)
                                 .is_some();
-                            if is_in_hf_cache {
-                                c_ids.insert(model.id.clone());
-                            }
-                            if local_path.exists() || is_in_hf_cache {
-                                d_ids.insert(model.id.clone());
-                            }
-                            if corrupted_path.exists() {
-                                err_ids.insert(model.id.clone());
-                            }
+                            
+                            let is_cached = is_in_hf_cache;
+                            let is_downloaded = local_path.exists() || is_in_hf_cache;
+                            let is_corrupted = corrupted_path.exists();
+                            
+                            results.push((model.id, is_downloaded, is_cached, is_corrupted));
                         }
-                        (d_ids, c_ids, err_ids)
+                        results
                     })
                     .await
                     .unwrap_or_default();
 
-                let mut status = lock_status(&engine_status_for_init);
-                if first_run {
-                    status.downloaded_models = downloaded_ids.clone();
-                    status.cached_models = cached_ids.clone();
-                    status.corrupted_models = corrupted_ids.clone();
-                    info!(
-                        "Found {} downloaded models on disk.",
-                        status.downloaded_models.len()
-                    );
-                    first_run = false;
-                } else if status.downloaded_models != downloaded_ids
-                    || status.cached_models != cached_ids
-                    || status.corrupted_models != corrupted_ids
-                {
-                    info!(
-                        "Disk state changed. Found {} downloaded models on disk.",
-                        downloaded_ids.len()
-                    );
-                    status.downloaded_models = downloaded_ids;
-                    status.cached_models = cached_ids;
-                    status.corrupted_models = corrupted_ids;
-                }
+                    let mut status = lock_status(&engine_status_for_init);
+                    if is_full_update {
+                        let mut d_ids = std::collections::HashSet::new();
+                        let mut c_ids = std::collections::HashSet::new();
+                        let mut err_ids = std::collections::HashSet::new();
+                        
+                        for (id, d, c, err) in updates {
+                            if d { d_ids.insert(id.clone()); }
+                            if c { c_ids.insert(id.clone()); }
+                            if err { err_ids.insert(id); }
+                        }
+                        
+                        if first_run {
+                            status.downloaded_models = d_ids;
+                            status.cached_models = c_ids;
+                            status.corrupted_models = err_ids;
+                            info!(
+                                "Found {} downloaded models on disk.",
+                                status.downloaded_models.len()
+                            );
+                            first_run = false;
+                        } else if status.downloaded_models != d_ids
+                            || status.cached_models != c_ids
+                            || status.corrupted_models != err_ids
+                        {
+                            info!(
+                                "Disk state changed. Found {} downloaded models on disk.",
+                                d_ids.len()
+                            );
+                            status.downloaded_models = d_ids;
+                            status.cached_models = c_ids;
+                            status.corrupted_models = err_ids;
+                        }
+                    } else {
+                        let mut changed = false;
+                        for (id, d, c, err) in updates {
+                            if d { if status.downloaded_models.insert(id.clone()) { changed = true; } }
+                            else { if status.downloaded_models.remove(&id) { changed = true; } }
+                            
+                            if c { if status.cached_models.insert(id.clone()) { changed = true; } }
+                            else { if status.cached_models.remove(&id) { changed = true; } }
+                            
+                            if err { if status.corrupted_models.insert(id.clone()) { changed = true; } }
+                            else { if status.corrupted_models.remove(&id) { changed = true; } }
+                        }
+                        
+                        if changed {
+                            info!(
+                                "Disk state incrementally updated. Found {} downloaded models on disk.",
+                                status.downloaded_models.len()
+                            );
+                        }
+                    }
                 }
             }
         }
