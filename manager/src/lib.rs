@@ -374,6 +374,11 @@ pub async fn run_batcher_loop(
         if needs_reload {
             info!("Swapping VRAM to {}...", request.chat_model_id);
 
+            {
+                let mut s = lock_status(&status);
+                s.loading_model_id = Some(request.chat_model_id.clone());
+            }
+
             if let Some(backend) = active_backend.take() {
                 let offload_pct = backend.get_offload_pct();
 
@@ -439,6 +444,10 @@ pub async fn run_batcher_loop(
             let mut backend = match create_backend(&target_btype, gpu_device_index) {
                 Ok(b) => b,
                 Err(e) => {
+                    {
+                        let mut s = lock_status(&status);
+                        s.loading_model_id = None;
+                    }
                     let _ = request
                         .responder
                         .send(StreamEvent::Error(format!("Server Error: {}", e)));
@@ -465,6 +474,7 @@ pub async fn run_batcher_loop(
                     set_model_health(&status, &config.id, false);
                     {
                         let mut s = lock_status(&status);
+                        s.loading_model_id = None;
                         s.log_vram(
                             "Fail",
                             "Orchestrator",
@@ -510,6 +520,7 @@ pub async fn run_batcher_loop(
             set_model_health(&status, &active_model_id, true);
             {
                 let mut current_status = lock_status(&status);
+                current_status.loading_model_id = None;
                 current_status.active_chat_model_id = Some(active_model_id.clone());
                 current_status.active_backend = Some(target_backend_name);
             }
@@ -698,6 +709,11 @@ pub async fn run_batcher_loop(
                 }
             };
 
+            {
+                let mut s = lock_status(&status);
+                s.loading_model_id = Some(request.compressor_model_id.clone());
+            }
+
             let comp_required_ctx = (token_count + requested_max_tokens).max(2048) + ctx_buffer;
             // --- RECORD COMPRESSOR LOAD TIME ---
             let comp_load_start = Instant::now();
@@ -714,6 +730,7 @@ pub async fn run_batcher_loop(
                 set_model_health(&status, &comp_config.id, false);
                 {
                     let mut s = lock_status(&status);
+                    s.loading_model_id = None;
                     s.log_vram(
                         "Fail",
                         "Orchestrator",
@@ -750,6 +767,7 @@ pub async fn run_batcher_loop(
             set_model_health(&status, &request.compressor_model_id, true);
             {
                 let mut current_status = lock_status(&status);
+                current_status.loading_model_id = None;
                 current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
             }
 

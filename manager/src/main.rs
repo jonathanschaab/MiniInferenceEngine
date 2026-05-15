@@ -398,10 +398,14 @@ pub(crate) async fn trigger_download(
         // Without this check, a re-download would be allowed, and attempting to overwrite the active memory-mapped file
         // would cause a "Text file busy" error or a segmentation fault crashing the entire engine.
         let status = lock_status(&state.engine_status);
-        if status.models_vram.iter().any(|m| m.id == id) {
+        if status.models_vram.iter().any(|m| m.id == id)
+            || status.active_chat_model_id.as_deref() == Some(&id)
+            || status.last_compressor_model_id.as_deref() == Some(&id)
+            || status.loading_model_id.as_deref() == Some(&id)
+        {
             return (
                 StatusCode::CONFLICT,
-                "Cannot download a model that is currently loaded in VRAM. Please load a different model first.",
+                "Cannot download a model that is currently loaded or being loaded in VRAM. Please load a different model first.",
             )
                 .into_response();
         }
@@ -589,8 +593,12 @@ pub(crate) async fn delete_model(
 
     {
         let status = lock_status(&state.engine_status);
-        if status.models_vram.iter().any(|m| m.id == id) {
-            return (StatusCode::CONFLICT, "Cannot delete a model while it is loaded in memory. Please load a different model first to free the VRAM.").into_response();
+        if status.models_vram.iter().any(|m| m.id == id)
+            || status.active_chat_model_id.as_deref() == Some(&id)
+            || status.last_compressor_model_id.as_deref() == Some(&id)
+            || status.loading_model_id.as_deref() == Some(&id)
+        {
+            return (StatusCode::CONFLICT, "Cannot delete a model while it is loaded or being loaded in memory. Please load a different model first to free the VRAM.").into_response();
         }
     }
 

@@ -108,8 +108,15 @@ async function updateStatus() {
     try {
         const res = await fetchWithAuth('/api/status');
         const status = await res.json();
-        if (status.active_backend) {
-            document.getElementById('engine-status-indicator').textContent = `(${status.active_backend})`;
+        const indicator = document.getElementById('engine-status-indicator');
+        if (status.loading_model_id) {
+            indicator.textContent = `(Loading...)`;
+            indicator.style.color = '#f9e2af';
+        } else if (status.active_backend) {
+            indicator.textContent = `(${status.active_backend})`;
+            indicator.style.color = '#a6e3a1';
+        } else {
+            indicator.textContent = '';
         }
     } catch (e) {
         console.warn("Failed to update engine status", e);
@@ -818,3 +825,5 @@ inputField.addEventListener('keydown', (e) => {
         sendMessage();
     }
 });
+
+setInterval(updateStatus, 2000);

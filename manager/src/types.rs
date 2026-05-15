@@ -35,6 +35,7 @@ pub struct ModelMemory {
 pub struct EngineStatus {
     pub active_chat_model_id: Option<String>,
     pub last_compressor_model_id: Option<String>,
+    pub loading_model_id: Option<String>,
     pub active_backend: Option<String>,
     pub benchmark_running: bool,
     pub vram_events: Vec<VramEvent>,

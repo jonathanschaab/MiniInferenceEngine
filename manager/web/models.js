@@ -41,7 +41,9 @@ async function loadModels() {
             const backendsStr = model.supported_backends.join(', ');
 
             let healthBadge = '';
-            if (healthMap[model.id] === true) {
+            if (model.id === engineStatus.loading_model_id) {
+                healthBadge = `<span class="badge" style="background: #f9e2af; color: #11111b; margin-left: 10px;" title="Currently loading into VRAM">⏳ Loading</span>`;
+            } else if (healthMap[model.id] === true) {
                 healthBadge = `<span class="badge" style="background: #a6e3a1; color: #11111b; margin-left: 10px;" title="Last run succeeded">✅ Passed</span>`;
             } else if (healthMap[model.id] === false) {
                 healthBadge = `<span class="badge" style="background: #f38ba8; color: #11111b; margin-left: 10px;" title="Last run failed">❌ Failed</span>`;

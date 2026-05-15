@@ -40,6 +40,15 @@ async function updateDashboard() {
         const modelsContainer = document.getElementById('loaded-models-container');
         let modelsHtml = '';
 
+        if (status.loading_model_id) {
+            modelsHtml += `
+                <div class="model-card" style="border-left-color: #f9e2af; opacity: 0.8;">
+                    <h3>${DOMPurify.sanitize(status.loading_model_id)} <span style="color:#f9e2af; font-size:0.8rem;">(Initializing)</span></h3>
+                    <div class="model-stat"><span>Status:</span> <span style="color:#f9e2af; font-weight:bold; font-style:italic;">Loading into VRAM...</span></div>
+                </div>
+            `;
+        }
+
         status.models_vram.forEach(m => {
             totalWeights += m.weights;
             totalKv += m.kv_cache;
