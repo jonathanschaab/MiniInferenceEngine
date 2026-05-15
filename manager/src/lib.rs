@@ -259,11 +259,17 @@ pub async fn run_batcher_loop(
                 let repo = config_for_prompt.tokenizer_repo.clone();
                 let tok_res = async move {
                     let cache = hf_hub::Cache::default();
-                    let path = if let Some(p) = cache.repo(hf_hub::Repo::model(repo.clone())).get("tokenizer.json") {
+                    let path = if let Some(p) = cache
+                        .repo(hf_hub::Repo::model(repo.clone()))
+                        .get("tokenizer.json")
+                    {
                         p
                     } else {
                         let api = hf_hub::api::tokio::Api::new().map_err(|e| e.to_string())?;
-                        api.model(repo).get("tokenizer.json").await.map_err(|e| e.to_string())?
+                        api.model(repo)
+                            .get("tokenizer.json")
+                            .await
+                            .map_err(|e| e.to_string())?
                     };
 
                     tokio::task::spawn_blocking(move || {

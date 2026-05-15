@@ -217,7 +217,8 @@ struct ModelRegistration {
 
 static REGISTRY: OnceCell<Arc<RwLock<Vec<ModelConfig>>>> = OnceCell::const_new();
 
-pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
+// Expose the registry so the web server can send it to the UI
+pub async fn get_model_registry() -> Vec<ModelConfig> {
     let registry_lock = REGISTRY.get_or_init(|| async {
         let lock = Arc::new(RwLock::new(Vec::new()));
 
@@ -726,13 +727,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
         lock
     }).await;
 
-    registry_lock.clone()
-}
-
-// Expose the registry so the web server can send it to the UI
-pub async fn get_model_registry() -> Vec<ModelConfig> {
-    let lock = get_registry_lock().await;
-    lock.read().await.clone()
+    registry_lock.read().await.clone()
 }
 
 #[cfg(test)]

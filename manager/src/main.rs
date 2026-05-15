@@ -150,25 +150,25 @@ impl AppConfig {
         } else if let Ok(data) = tokio::fs::read_to_string("config.json").await {
             // Fallback for backwards compatibility, but save as TOML going forward
             let config: Self = serde_json::from_str(&data).unwrap_or_default();
-                match toml::to_string_pretty(&config) {
-                    Ok(toml_str) => {
-                        if let Err(e) = tokio::fs::write("config.toml", toml_str).await {
-                            warn!("Failed to write migrated config.toml: {}", e);
-                        }
+            match toml::to_string_pretty(&config) {
+                Ok(toml_str) => {
+                    if let Err(e) = tokio::fs::write("config.toml", toml_str).await {
+                        warn!("Failed to write migrated config.toml: {}", e);
                     }
-                    Err(e) => warn!("Failed to serialize configuration to TOML: {}", e),
                 }
+                Err(e) => warn!("Failed to serialize configuration to TOML: {}", e),
+            }
             config
         } else {
             let config = Self::default();
-                match toml::to_string_pretty(&config) {
-                    Ok(toml_str) => {
-                        if let Err(e) = tokio::fs::write("config.toml", toml_str).await {
-                            warn!("Failed to write default config.toml: {}", e);
-                        }
+            match toml::to_string_pretty(&config) {
+                Ok(toml_str) => {
+                    if let Err(e) = tokio::fs::write("config.toml", toml_str).await {
+                        warn!("Failed to write default config.toml: {}", e);
                     }
-                    Err(e) => warn!("Failed to serialize default configuration to TOML: {}", e),
                 }
+                Err(e) => warn!("Failed to serialize default configuration to TOML: {}", e),
+            }
             config
         }
     }
@@ -369,7 +369,7 @@ pub(crate) async fn trigger_download(
 
     {
         // CRITICAL: This explicit VRAM check is not just for user experience; it prevents fatal OS-level errors.
-        // Because the inference backends use memory-mapped files (mmap) for the model weights, 
+        // Because the inference backends use memory-mapped files (mmap) for the model weights,
         // the OS keeps the file descriptor active as long as the model is loaded in VRAM.
         // If a user manually deletes the file from disk, the background file watcher will remove it from `downloaded_models`.
         // Without this check, a re-download would be allowed, and attempting to overwrite the active memory-mapped file
@@ -1627,7 +1627,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let path = entry.path();
                     if let Some(ext) = path.extension()
-                        && (ext == "tmp" || ext == "meta" || ext == "corrupted" || ext == "copy_tmp")
+                        && (ext == "tmp"
+                            || ext == "meta"
+                            || ext == "corrupted"
+                            || ext == "copy_tmp")
                         && let Ok(metadata) = entry.metadata().await
                         && let Ok(modified) = metadata.modified()
                         && let Ok(age) = modified.elapsed()
@@ -1761,17 +1764,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         use notify::Watcher;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<std::path::PathBuf>>();
-        let mut watcher_opt = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res {
-                let _ = tx.send(event.paths);
-            }
-        }) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                warn!("Failed to create file watcher ({}). Falling back to periodic polling.", e);
-                None
-            }
-        };
+        let mut watcher_opt =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    let _ = tx.send(event.paths);
+                }
+            }) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    warn!(
+                        "Failed to create file watcher ({}). Falling back to periodic polling.",
+                        e
+                    );
+                    None
+                }
+            };
 
         let path = std::path::Path::new(&downloads_dir_for_init);
         if let Ok(false) | Err(_) = tokio::fs::try_exists(path).await {
@@ -1785,19 +1792,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cache = hf_hub::Cache::default();
 
         for model in &models {
-            let repo_path = cache.repo(hf_hub::Repo::model(model.repo.clone())).path();
-            if let Ok(true) = tokio::fs::try_exists(&repo_path).await {
-                if let Some(w) = &mut watcher_opt {
-                    let _ = w.watch(&repo_path, notify::RecursiveMode::Recursive);
-                }
+            let repo_path = cache
+                .path()
+                .join(format!("models--{}", model.repo.replace('/', "--")));
+            if let Ok(true) = tokio::fs::try_exists(&repo_path).await
+                && let Some(w) = &mut watcher_opt
+            {
+                let _ = w.watch(&repo_path, notify::RecursiveMode::Recursive);
             }
         }
 
         let mut debounce_timer = tokio::time::interval(std::time::Duration::from_millis(1000));
         debounce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        
+
         let refresh_secs = if watcher_opt.is_some() { 300 } else { 30 };
-        let mut watch_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+        let mut watch_refresh_timer =
+            tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
         watch_refresh_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut pending_update = true;
@@ -1814,7 +1824,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ = watch_refresh_timer.tick() => {
                     models = manager::get_model_registry().await;
                     for model in &models {
-                        let repo_path = cache.repo(hf_hub::Repo::model(model.repo.clone())).path();
+                        let repo_path = cache.path().join(format!("models--{}", model.repo.replace('/', "--")));
                         if let Ok(true) = tokio::fs::try_exists(&repo_path).await {
                             // notify handles duplicates gracefully, so this is safe to call repeatedly
                             if let Some(w) = &mut watcher_opt {
@@ -1842,10 +1852,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let models_clone = models.clone();
                     let downloads_dir = downloads_dir_for_init.clone();
-                    
+
                     let updates = tokio::task::spawn_blocking(move || {
                         let cache = hf_hub::Cache::default();
-                        
+
                         let models_to_check = if is_full_update {
                             models_clone
                         } else {
@@ -1856,8 +1866,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     p.push(".corrupted");
                                     std::path::PathBuf::from(p)
                                 };
-                                let repo_path = cache.repo(hf_hub::Repo::model(m.repo.clone())).path();
-                                
+                                let repo_path = cache.path().join(format!("models--{}", m.repo.replace('/', "--")));
+
                                 paths_to_check.iter().any(|p| {
                                     p == &local_path || p == &corrupted_path || p.starts_with(&repo_path)
                                 })
@@ -1876,11 +1886,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .repo(hf_hub::Repo::model(model.repo.clone()))
                                 .get(&model.filename)
                                 .is_some();
-                            
+
                             let is_cached = is_in_hf_cache;
                             let is_downloaded = local_path.exists() || is_in_hf_cache;
                             let is_corrupted = corrupted_path.exists();
-                            
+
                             results.push((model.id, is_downloaded, is_cached, is_corrupted));
                         }
                         results
@@ -1893,13 +1903,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut d_ids = std::collections::HashSet::new();
                         let mut c_ids = std::collections::HashSet::new();
                         let mut err_ids = std::collections::HashSet::new();
-                        
+
                         for (id, d, c, err) in updates {
                             if d { d_ids.insert(id.clone()); }
                             if c { c_ids.insert(id.clone()); }
                             if err { err_ids.insert(id); }
                         }
-                        
+
                         if first_run {
                             status.downloaded_models = d_ids;
                             status.cached_models = c_ids;
@@ -1926,14 +1936,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for (id, d, c, err) in updates {
                             if d { if status.downloaded_models.insert(id.clone()) { changed = true; } }
                             else { if status.downloaded_models.remove(&id) { changed = true; } }
-                            
+
                             if c { if status.cached_models.insert(id.clone()) { changed = true; } }
                             else { if status.cached_models.remove(&id) { changed = true; } }
-                            
+
                             if err { if status.corrupted_models.insert(id.clone()) { changed = true; } }
                             else { if status.corrupted_models.remove(&id) { changed = true; } }
                         }
-                        
+
                         if changed {
                             info!(
                                 "Disk state incrementally updated. Found {} downloaded models on disk.",

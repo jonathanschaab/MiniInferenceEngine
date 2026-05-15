@@ -206,7 +206,9 @@ async fn restore_hasher_state(tmp_file_path: &Path, existing_size: u64) -> Sha25
                 if n == 0 {
                     break;
                 }
-                h.update(&buf[..n]);
+                tokio::task::block_in_place(|| {
+                    h.update(&buf[..n]);
+                });
                 remaining -= n as u64;
                 tokio::task::yield_now().await;
             } else {
@@ -336,7 +338,7 @@ async fn initiate_request(
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_restore_hasher_state() {
         let test_dir = std::env::temp_dir().join("minio_test_hasher");
         let _ = tokio::fs::create_dir_all(&test_dir).await;
