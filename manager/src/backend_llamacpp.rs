@@ -21,8 +21,6 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-const LLAMA_CPP_COMPUTE_MARGIN_BYTES: u64 = 1_500 * 1024 * 1024;
-
 static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 static LLAMA_BACKEND_INIT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -299,9 +297,7 @@ impl LlamaCppEngine {
 
                             let bytes_per_token = config.estimate_kv_bytes_per_token();
 
-                            let compute_margin: u64 = (LLAMA_CPP_COMPUTE_MARGIN_BYTES as f64
-                                * config.compute_margin_multiplier())
-                                as u64;
+                            let compute_margin: u64 = config.estimate_compute_margin_bytes();
                             let mut final_ctx_len =
                                 required_ctx.max(2048).min(config.max_context_len);
                             let mut n_gpu_layers = config.num_layers as u32;
@@ -422,7 +418,7 @@ impl LlamaCppEngine {
                                 );
                                 {
                                     let mut s = crate::types::lock_status(&status);
-                                    s.log_vram("Measure", "LlamaCpp::Plan", &format!("Reserved 1.5GB Compute Margin. Allocating KV Cache for {} tokens.", final_ctx_len), 0);
+                                    s.log_vram("Measure", "LlamaCpp::Plan", &format!("Reserved {:.2}GB Compute Margin. Allocating KV Cache for {} tokens.", compute_margin as f32 / 1024.0 / 1024.0 / 1024.0, final_ctx_len), 0);
                                 }
                             } else {
                                 info!(

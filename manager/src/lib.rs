@@ -6,8 +6,6 @@ use nvml_wrapper::Nvml;
 use tokenizers::Tokenizer;
 use tracing::{error, info, warn};
 
-const CANDLE_COMPUTE_MARGIN_BYTES: u64 = 500 * 1024 * 1024;
-
 pub mod backend;
 #[cfg(feature = "backend-candle")]
 pub mod backend_candle;
@@ -260,12 +258,14 @@ pub async fn run_batcher_loop(
             None => {
                 let repo = config_for_prompt.tokenizer_repo.clone();
                 let tok_res = async move {
-                    let api = hf_hub::api::tokio::Api::new().map_err(|e| e.to_string())?;
-                    let path = api
-                        .model(repo)
-                        .get("tokenizer.json")
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    let cache = hf_hub::Cache::default();
+                    let path = if let Some(p) = cache.repo(hf_hub::Repo::model(repo.clone())).get("tokenizer.json") {
+                        p
+                    } else {
+                        let api = hf_hub::api::tokio::Api::new().map_err(|e| e.to_string())?;
+                        api.model(repo).get("tokenizer.json").await.map_err(|e| e.to_string())?
+                    };
+
                     tokio::task::spawn_blocking(move || {
                         Tokenizer::from_file(path).map_err(|e| e.to_string())
                     })
@@ -569,8 +569,7 @@ pub async fn run_batcher_loop(
             // This rough heuristic is only for the Candle backend's dynamic memory check.
             // Llama.cpp calculates this precisely during its static allocation.
             let bytes_per_token = config.estimate_kv_bytes_per_token();
-            let compute_margin =
-                (CANDLE_COMPUTE_MARGIN_BYTES as f64 * config.compute_margin_multiplier()) as u64;
+            let compute_margin = config.estimate_compute_margin_bytes();
             let safe_free_vram = free_vram.saturating_sub(compute_margin);
             let absolute_max_tokens =
                 (safe_free_vram as usize / bytes_per_token).min(active_max_context);

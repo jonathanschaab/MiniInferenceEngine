@@ -368,6 +368,12 @@ pub(crate) async fn trigger_download(
     }
 
     {
+        // CRITICAL: This explicit VRAM check is not just for user experience; it prevents fatal OS-level errors.
+        // Because the inference backends use memory-mapped files (mmap) for the model weights, 
+        // the OS keeps the file descriptor active as long as the model is loaded in VRAM.
+        // If a user manually deletes the file from disk, the background file watcher will remove it from `downloaded_models`.
+        // Without this check, a re-download would be allowed, and attempting to overwrite the active memory-mapped file
+        // would cause a "Text file busy" error or a segmentation fault crashing the entire engine.
         let status = lock_status(&state.engine_status);
         if status.models_vram.iter().any(|m| m.id == id) {
             return (
@@ -575,36 +581,6 @@ pub(crate) async fn delete_model(
     info!("Deleted/cleared model {} from disk and state", id);
 
     (StatusCode::OK, "Model deleted").into_response()
-}
-
-#[derive(Serialize)]
-pub struct CacheStatusResponse {
-    is_in_hf_cache: bool,
-}
-
-pub(crate) async fn get_model_cache_status(
-    Path(id): Path<String>,
-) -> Result<Json<CacheStatusResponse>, StatusCode> {
-    let registry = get_model_registry().await;
-    let model = match registry.iter().find(|m| m.id == id) {
-        Some(m) => m,
-        None => return Err(StatusCode::NOT_FOUND),
-    };
-
-    let repo = model.repo.clone();
-    let filename = model.filename.clone();
-
-    let is_in_hf_cache = tokio::task::spawn_blocking(move || {
-        let cache = hf_hub::Cache::default();
-        cache
-            .repo(hf_hub::Repo::model(repo))
-            .get(&filename)
-            .is_some()
-    })
-    .await
-    .unwrap_or(false);
-
-    Ok(Json(CacheStatusResponse { is_in_hf_cache }))
 }
 
 // The Automated Benchmark Trigger

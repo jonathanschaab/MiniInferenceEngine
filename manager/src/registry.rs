@@ -118,6 +118,7 @@ pub struct ModelConfig {
     pub n_head: usize,
     pub n_head_kv: usize,
     pub head_dim: usize,
+    pub intermediate_size: usize,
     pub num_local_experts: Option<usize>,
     pub num_experts_per_tok: Option<usize>,
     pub roles: Vec<ModelRole>,
@@ -155,15 +156,26 @@ impl ModelConfig {
         (2 * self.num_layers * self.head_dim * self.n_head_kv) * bytes_per_element
     }
 
-    pub fn compute_margin_multiplier(&self) -> f64 {
-        if let (Some(local_experts), Some(active_experts)) =
-            (self.num_local_experts, self.num_experts_per_tok)
-            && local_experts > 0
-        {
-            // Clamp to 0.25 to ensure dense base layers and attention still have breathing room
-            return (active_experts as f64 / local_experts as f64).max(0.25);
+    pub fn estimate_compute_margin_bytes(&self) -> u64 {
+        if self.arch == ModelArch::XLMRoberta {
+            return 250 * 1024 * 1024; // Static margin for encoder-only models
         }
-        1.0
+
+        let bytes_per_element = 4; // Activations are typically f32
+        let active_experts = self.num_experts_per_tok.unwrap_or(1);
+        let ffn_size = self.intermediate_size * active_experts;
+
+        // Typical maximum physical batch size (ubatch) for prefill
+        let batch_size = 512;
+
+        // 1. FFN and Hidden States (scales with batch size)
+        let activation_memory = (self.n_embd + ffn_size) * batch_size * bytes_per_element;
+        // 2. Attention Matrix (scales with batch size * context length * n_head)
+        let attention_memory = batch_size * self.n_head * self.max_context_len * bytes_per_element;
+        // 3. Static Overhead (Graph nodes, CUDA context, etc.) - safely baseline around 250MB
+        let static_overhead = 250 * 1024 * 1024;
+
+        (activation_memory + attention_memory + static_overhead) as u64
     }
 }
 
@@ -180,6 +192,7 @@ struct ModelOverrides {
     pub n_head: Option<usize>,
     pub n_head_kv: Option<usize>,
     pub head_dim: Option<usize>,
+    pub intermediate_size: Option<usize>,
     pub num_local_experts: Option<usize>,
     pub num_experts_per_tok: Option<usize>,
     pub size_on_disk_gb: Option<f32>,
@@ -426,6 +439,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                     let mut n_head = reg.overrides.n_head;
                     let mut n_head_kv = reg.overrides.n_head_kv;
                     let mut head_dim = reg.overrides.head_dim;
+                    let mut intermediate_size = reg.overrides.intermediate_size;
                     let mut num_local_experts = reg.overrides.num_local_experts;
                     let mut num_experts_per_tok = reg.overrides.num_experts_per_tok;
                     let mut size_on_disk_gb = reg.overrides.size_on_disk_gb;
@@ -444,6 +458,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                     check_override(n_head.is_some(), "n_head");
                     check_override(n_head_kv.is_some(), "n_head_kv");
                     check_override(head_dim.is_some(), "head_dim");
+                    check_override(intermediate_size.is_some(), "intermediate_size");
                     check_override(num_local_experts.is_some(), "num_local_experts");
                     check_override(num_experts_per_tok.is_some(), "num_experts_per_tok");
                     check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
@@ -480,6 +495,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                                                 "num_key_value_heads",
                                                 "sliding_window",
                                                 "num_local_experts",
+                                                "intermediate_size",
                                                 "num_experts_per_tok",
                                                 "dtype",
                                                 "torch_dtype",
@@ -590,6 +606,11 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                                                 head_dim = Some(v);
                                                 provenance.insert("head_dim".to_string(), "config.json".to_string());
                                             }
+                                        if intermediate_size.is_none()
+                                            && let Some(v) = get_u64("intermediate_size") {
+                                                intermediate_size = Some(v);
+                                                provenance.insert("intermediate_size".to_string(), "config.json".to_string());
+                                            }
                                         if num_local_experts.is_none()
                                             && let Some(v) = get_u64("num_local_experts") {
                                                 num_local_experts = Some(v);
@@ -630,7 +651,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                     let n_head_val = n_head.unwrap_or(1);
                     let n_embd_val = n_embd.unwrap_or(4096);
 
-                    for name in &["arch", "kv_cache_dtype", "max_context_len", "sliding_window", "rope_scaling_factor", "original_max_position_embeddings", "num_layers", "n_embd", "n_head", "n_head_kv", "head_dim", "num_local_experts", "num_experts_per_tok", "size_on_disk_gb"] {
+                    for name in &["arch", "kv_cache_dtype", "max_context_len", "sliding_window", "rope_scaling_factor", "original_max_position_embeddings", "num_layers", "n_embd", "n_head", "n_head_kv", "head_dim", "intermediate_size", "num_local_experts", "num_experts_per_tok", "size_on_disk_gb"] {
                         if !provenance.contains_key(*name) {
                             provenance.insert(name.to_string(), "fallback".to_string());
                         }
@@ -679,6 +700,7 @@ pub async fn get_registry_lock() -> Arc<RwLock<Vec<ModelConfig>>> {
                         n_head: n_head_val,
                         n_head_kv: n_head_kv.unwrap_or(n_head_val),
                         head_dim: head_dim.unwrap_or(n_embd_val / n_head_val.max(1)),
+                        intermediate_size: intermediate_size.unwrap_or(n_embd_val * 4),
                         num_local_experts,
                         num_experts_per_tok,
                         parameters_billions: reg.parameters_billions,
@@ -735,6 +757,7 @@ mod tests {
             n_head: 32,
             n_head_kv: 8,
             head_dim: 128,
+            intermediate_size: 14336,
             num_local_experts: None,
             num_experts_per_tok: None,
             roles: vec![],

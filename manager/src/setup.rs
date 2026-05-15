@@ -9,12 +9,12 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 use crate::{
     AppConfig, AppState, LogReloadHandle, SharedLogBuffer, append_chat_message, auth,
     clear_console_logs, delete_chat_session, delete_model, get_chat_session, get_console_loglevel,
-    get_console_logs, get_download_progress, get_model, get_model_cache_status, get_models,
-    get_stats_data, get_status, handle_generate, list_chat_sessions, pause_download,
-    save_chat_session, serve_chat_js, serve_common_css, serve_common_js, serve_console_js,
-    serve_console_ui, serve_memory_js, serve_memory_ui, serve_models_js, serve_models_ui,
-    serve_settings_js, serve_settings_ui, serve_stats_js, serve_stats_ui, serve_ui,
-    set_console_loglevel, trigger_benchmark, trigger_download, truncate_chat_messages,
+    get_console_logs, get_download_progress, get_model, get_models, get_stats_data, get_status,
+    handle_generate, list_chat_sessions, pause_download, save_chat_session, serve_chat_js,
+    serve_common_css, serve_common_js, serve_console_js, serve_console_ui, serve_memory_js,
+    serve_memory_ui, serve_models_js, serve_models_ui, serve_settings_js, serve_settings_ui,
+    serve_stats_js, serve_stats_ui, serve_ui, set_console_loglevel, trigger_benchmark,
+    trigger_download, truncate_chat_messages,
 };
 
 pub async fn init_db(
@@ -193,7 +193,6 @@ pub fn build_engine_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/api/models/{id}/download",
             post(trigger_download).delete(delete_model),
         )
-        .route("/api/models/{id}/cache_status", get(get_model_cache_status))
         .route("/api/models/{id}/pause", post(pause_download))
         .route("/api/status", get(get_status))
         .route("/api/stats/data", get(get_stats_data))
