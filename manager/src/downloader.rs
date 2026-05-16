@@ -1,7 +1,7 @@
 use crate::AppState;
 use manager::lock_status;
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
@@ -52,16 +52,8 @@ pub async fn perform_model_download(
         return;
     }
     let file_path = downloads_dir.join(&filename);
-    let tmp_file_path = {
-        let mut p = file_path.clone().into_os_string();
-        p.push(".tmp");
-        std::path::PathBuf::from(p)
-    };
-    let meta_file_path = {
-        let mut p = file_path.clone().into_os_string();
-        p.push(".meta");
-        std::path::PathBuf::from(p)
-    };
+    let tmp_file_path = downloads_dir.join(format!("{}.tmp", filename));
+    let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
 
     let (mut existing_size, mut expected_hash) =
         check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path).await;
@@ -346,64 +338,6 @@ async fn initiate_request(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn test_concurrent_sha_waits_for_data() {
-        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
-
-        let hash_task = tokio::spawn(async move {
-            let mut hasher = Sha256::new();
-            while let Some(chunk) = hash_rx.recv().await {
-                hasher.update(&chunk);
-            }
-            hex::encode(hasher.finalize())
-        });
-
-        hash_tx.send(bytes::Bytes::from("hello")).await.unwrap();
-        // Let the hasher catch up and suspend waiting for more data
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        hash_tx.send(bytes::Bytes::from(" world")).await.unwrap();
-
-        drop(hash_tx); // Simulate download stream completion
-
-        let result = hash_task.await.unwrap();
-        assert_eq!(
-            result,
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_download_completes_before_sha() {
-        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
-
-        let hash_task = tokio::spawn(async move {
-            let mut hasher = Sha256::new();
-            while let Some(chunk) = hash_rx.recv().await {
-                tokio::time::sleep(Duration::from_millis(10)).await; // Artificially slow down hashing
-                hasher.update(&chunk);
-            }
-            hex::encode(hasher.finalize())
-        });
-
-        // Blast the channel with data to simulate a very fast local network download
-        for _ in 0..10 {
-            hash_tx.send(bytes::Bytes::from("chunk")).await.unwrap();
-        }
-        drop(hash_tx); // Complete download
-
-        let result = hash_task.await.unwrap(); // This await forces the fast download to wait for the slow hasher
-        assert_eq!(
-            result,
-            "9e649377bd12727055af10d6c2e4bb7954e3cc8fdc7807dc64f6913d4f49ce2e"
-        );
-    }
-}
-
 async fn verify_and_update_etag(
     state: &Arc<AppState>,
     url: &str,
@@ -536,7 +470,11 @@ async fn process_download_stream(
                     }
                 };
 
-                let _ = hash_tx.send(bytes.clone()).await;
+                if let Err(e) = hash_tx.send(bytes.clone()).await {
+                    error!("Error sending to hash channel for {}: {}", id, e);
+                    stream_error = true;
+                    break;
+                }
 
                 if let Err(e) = file.write_all(&bytes).await {
                     error!("Failed to write to file for {}: {}", id, e);
@@ -595,9 +533,7 @@ async fn finalize_download(
     hash_mismatch: bool,
 ) {
     let target_path = if hash_mismatch {
-        let mut p = file_path.to_path_buf().into_os_string();
-        p.push(".corrupted");
-        PathBuf::from(p)
+        file_path.with_file_name(format!("{}.corrupted", filename))
     } else {
         file_path.to_path_buf()
     };
@@ -609,9 +545,13 @@ async fn finalize_download(
             id, e
         );
 
-        let mut copy_tmp_path = target_path.to_path_buf().into_os_string();
-        copy_tmp_path.push(".copy_tmp");
-        let copy_tmp_path = PathBuf::from(copy_tmp_path);
+        let copy_tmp_path = target_path.with_file_name(format!(
+            "{}.copy_tmp",
+            target_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ));
 
         match tokio::fs::copy(tmp_file_path, &copy_tmp_path).await {
             Ok(_) => {
@@ -667,5 +607,63 @@ async fn finalize_download(
                 status.downloaded_models.insert(id.to_string());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_concurrent_sha_waits_for_data() {
+        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
+
+        let hash_task = tokio::spawn(async move {
+            let mut hasher = Sha256::new();
+            while let Some(chunk) = hash_rx.recv().await {
+                hasher.update(&chunk);
+            }
+            hex::encode(hasher.finalize())
+        });
+
+        hash_tx.send(bytes::Bytes::from("hello")).await.unwrap();
+        // Let the hasher catch up and suspend waiting for more data
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        hash_tx.send(bytes::Bytes::from(" world")).await.unwrap();
+
+        drop(hash_tx); // Simulate download stream completion
+
+        let result = hash_task.await.unwrap();
+        assert_eq!(
+            result,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_completes_before_sha() {
+        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
+
+        let hash_task = tokio::spawn(async move {
+            let mut hasher = Sha256::new();
+            while let Some(chunk) = hash_rx.recv().await {
+                tokio::time::sleep(Duration::from_millis(10)).await; // Artificially slow down hashing
+                hasher.update(&chunk);
+            }
+            hex::encode(hasher.finalize())
+        });
+
+        // Blast the channel with data to simulate a very fast local network download
+        for _ in 0..10 {
+            hash_tx.send(bytes::Bytes::from("chunk")).await.unwrap();
+        }
+        drop(hash_tx); // Complete download
+
+        let result = hash_task.await.unwrap(); // This await forces the fast download to wait for the slow hasher
+        assert_eq!(
+            result,
+            "9e649377bd12727055af10d6c2e4bb7954e3cc8fdc7807dc64f6913d4f49ce2e"
+        );
     }
 }

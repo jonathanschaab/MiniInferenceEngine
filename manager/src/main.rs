@@ -443,12 +443,7 @@ pub(crate) async fn trigger_download(
     }
 
     let downloads_dir = manager::types::resolve_absolute_path(&state.config.downloads_directory);
-    let file_path = downloads_dir.join(&model.filename);
-    let corrupted_path = {
-        let mut p = file_path.clone().into_os_string();
-        p.push(".corrupted");
-        std::path::PathBuf::from(p)
-    };
+    let corrupted_path = downloads_dir.join(format!("{}.corrupted", model.filename));
     if let Ok(true) = tokio::fs::try_exists(&corrupted_path).await {
         return (StatusCode::UNPROCESSABLE_ENTITY, "A corrupted download for this model already exists on disk. Please contact an admin to verify it or delete the model to try again.").into_response();
     }
@@ -627,21 +622,9 @@ pub(crate) async fn delete_model(
 
     let downloads_dir = manager::types::resolve_absolute_path(&state.config.downloads_directory);
     let file_path = downloads_dir.join(&model.filename);
-    let tmp_file_path = {
-        let mut p = file_path.clone().into_os_string();
-        p.push(".tmp");
-        std::path::PathBuf::from(p)
-    };
-    let meta_file_path = {
-        let mut p = file_path.clone().into_os_string();
-        p.push(".meta");
-        std::path::PathBuf::from(p)
-    };
-    let corrupted_path = {
-        let mut p = file_path.clone().into_os_string();
-        p.push(".corrupted");
-        std::path::PathBuf::from(p)
-    };
+    let tmp_file_path = downloads_dir.join(format!("{}.tmp", model.filename));
+    let meta_file_path = downloads_dir.join(format!("{}.meta", model.filename));
+    let corrupted_path = downloads_dir.join(format!("{}.corrupted", model.filename));
 
     let _ = tokio::fs::remove_file(&file_path).await;
     let _ = tokio::fs::remove_file(&tmp_file_path).await;
@@ -1680,8 +1663,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if retention_days == 0 {
             return; // 0 disables retention cleanup
         }
+        const TELEMETRY_CLEANUP_INTERVAL_SECS: u64 = 24 * 3600;
         // Check every 24 hours (The first tick completes immediately on startup)
-        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(
+            TELEMETRY_CLEANUP_INTERVAL_SECS,
+        ));
         loop {
             cleanup_interval.tick().await;
             if let Err(e) = manager::cleanup_telemetry(&db_for_cleanup, retention_days).await {
@@ -1697,8 +1683,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager::types::resolve_absolute_path(&config.downloads_directory);
     let active_downloads_for_cleanup = active_downloads.clone();
     tokio::spawn(async move {
+        const TEMP_FILE_CLEANUP_INTERVAL_SECS: u64 = 12 * 3600;
+        const TEMP_FILE_EXPIRY_AGE_SECS: u64 = 3 * 24 * 3600;
+
         // Sweep the downloads directory every 12 hours
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(12 * 3600));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            TEMP_FILE_CLEANUP_INTERVAL_SECS,
+        ));
         loop {
             interval.tick().await;
             match tokio::fs::read_dir(&downloads_dir_for_cleanup).await {
@@ -1720,7 +1711,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             && let Ok(metadata) = entry.metadata().await
                             && let Ok(modified) = metadata.modified()
                             && let Ok(age) = modified.elapsed()
-                            && age.as_secs() > 3 * 24 * 3600
+                            && age.as_secs() > TEMP_FILE_EXPIRY_AGE_SECS
                         {
                             let mut is_active = false;
                             if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
@@ -1754,10 +1745,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status_for_nvml = engine_status.clone();
     let vram_tracker_gpu_idx = config.gpu_device_index;
     tokio::spawn(async move {
+        const VRAM_TRACKER_INTERVAL_SECS: u64 = 1;
+
         let mut sys = System::new_all();
         let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
         let nvml = nvml_wrapper::Nvml::init().ok();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(VRAM_TRACKER_INTERVAL_SECS));
         loop {
             interval.tick().await;
 
@@ -1911,10 +1905,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let mut debounce_timer = tokio::time::interval(std::time::Duration::from_millis(1000));
+        const WATCHER_DEBOUNCE_INTERVAL_MILLIS: u64 = 1000;
+        let mut debounce_timer = tokio::time::interval(std::time::Duration::from_millis(
+            WATCHER_DEBOUNCE_INTERVAL_MILLIS,
+        ));
         debounce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let refresh_secs = if watcher_opt.is_some() { 300 } else { 30 };
+        const WATCHER_REFRESH_INTERVAL_SECS: u64 = 300;
+        const FALLBACK_REFRESH_INTERVAL_SECS: u64 = 30;
+        let refresh_secs = if watcher_opt.is_some() {
+            WATCHER_REFRESH_INTERVAL_SECS
+        } else {
+            FALLBACK_REFRESH_INTERVAL_SECS
+        };
         let mut watch_refresh_timer =
             tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
         watch_refresh_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1982,11 +1985,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 models_clone.into_iter().filter(|m| {
                                     let local_path = abs_downloads_dir.join(&m.filename);
-                                    let corrupted_path = {
-                                        let mut p = local_path.clone().into_os_string();
-                                        p.push(".corrupted");
-                                        std::path::PathBuf::from(p)
-                                    };
+                                    let corrupted_path = abs_downloads_dir.join(format!("{}.corrupted", m.filename));
                                     let repo_path = cache.path().join(format!("models--{}", m.repo.replace('/', "--")));
 
                                     abs_paths_to_check.iter().any(|p| {
@@ -1998,11 +1997,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let mut results = Vec::new();
                             for model in models_to_check {
                                 let local_path = abs_downloads_dir.join(&model.filename);
-                                let corrupted_path = {
-                                    let mut p = local_path.clone().into_os_string();
-                                    p.push(".corrupted");
-                                    std::path::PathBuf::from(p)
-                                };
+                                let corrupted_path = abs_downloads_dir.join(format!("{}.corrupted", model.filename));
                                 let is_in_hf_cache = cache
                                     .repo(hf_hub::Repo::model(model.repo.clone()))
                                     .get(&model.filename)
@@ -2182,10 +2177,11 @@ async fn shutdown_signal(
         #[cfg(not(unix))]
         let terminate = std::future::pending::<()>();
 
+        const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
         tokio::select! {
             _ = ctrl_c => { error!("Received second termination signal. Forcing immediate exit."); },
             _ = terminate => { error!("Received second termination signal. Forcing immediate exit."); },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => { error!("Graceful shutdown timed out after 30 seconds. Forcing exit."); },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS)) => { error!("Graceful shutdown timed out after {} seconds. Forcing exit.", GRACEFUL_SHUTDOWN_TIMEOUT_SECS); },
         }
         let _ = force_tx.send(());
     });
