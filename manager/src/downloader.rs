@@ -104,7 +104,7 @@ pub async fn perform_model_download(
 
     let final_existing_size = existing_size;
     let tmp_path_for_hash = tmp_file_path.clone();
-    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
 
     let hash_task = tokio::spawn(async move {
         let mut hasher = Sha256::new();
@@ -353,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_sha_waits_for_data() {
-        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
 
         let hash_task = tokio::spawn(async move {
             let mut hasher = Sha256::new();
@@ -363,10 +363,10 @@ mod tests {
             hex::encode(hasher.finalize())
         });
 
-        hash_tx.send(bytes::Bytes::from("hello")).unwrap();
+        hash_tx.send(bytes::Bytes::from("hello")).await.unwrap();
         // Let the hasher catch up and suspend waiting for more data
         tokio::time::sleep(Duration::from_millis(50)).await;
-        hash_tx.send(bytes::Bytes::from(" world")).unwrap();
+        hash_tx.send(bytes::Bytes::from(" world")).await.unwrap();
 
         drop(hash_tx); // Simulate download stream completion
 
@@ -379,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_completes_before_sha() {
-        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::unbounded_channel::<bytes::Bytes>();
+        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
 
         let hash_task = tokio::spawn(async move {
             let mut hasher = Sha256::new();
@@ -392,7 +392,7 @@ mod tests {
 
         // Blast the channel with data to simulate a very fast local network download
         for _ in 0..10 {
-            hash_tx.send(bytes::Bytes::from("chunk")).unwrap();
+            hash_tx.send(bytes::Bytes::from("chunk")).await.unwrap();
         }
         drop(hash_tx); // Complete download
 
@@ -507,7 +507,7 @@ async fn process_download_stream(
     id: &str,
     res: &mut reqwest::Response,
     file: &mut tokio::fs::File,
-    hash_tx: tokio::sync::mpsc::UnboundedSender<bytes::Bytes>,
+    hash_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
     existing_size: u64,
     meta_file_path: &Path,
     expected_hash: &Option<String>,
@@ -536,7 +536,7 @@ async fn process_download_stream(
                     }
                 };
 
-                let _ = hash_tx.send(bytes.clone());
+                let _ = hash_tx.send(bytes.clone()).await;
 
                 if let Err(e) = file.write_all(&bytes).await {
                     error!("Failed to write to file for {}: {}", id, e);
