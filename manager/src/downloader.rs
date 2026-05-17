@@ -591,7 +591,9 @@ async fn finalize_download(
                         id, rename_err
                     );
                     let _ = tokio::fs::remove_file(&copy_tmp_path).await;
-                    let _ = tokio::fs::remove_file(tmp_file_path).await;
+                    // CRITICAL: Do not remove the original `tmp_file_path` here!
+                    // If the fallback rename fails, we want to preserve the downloaded data
+                    // so the user doesn't have to restart the download from scratch.
                 } else {
                     let _ = tokio::fs::remove_file(tmp_file_path).await;
                     success = true;
@@ -603,7 +605,9 @@ async fn finalize_download(
                     id, copy_err
                 );
                 let _ = tokio::fs::remove_file(&copy_tmp_path).await;
-                let _ = tokio::fs::remove_file(tmp_file_path).await;
+                // CRITICAL: Do not remove the original `tmp_file_path` here!
+                // If the fallback copy fails, we want to preserve the downloaded data
+                // so the user doesn't have to restart the download from scratch.
             }
         }
     } else {
@@ -663,6 +667,82 @@ mod tests {
             result,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[tokio::test]
+    async fn test_finalize_download_fallback_failure_retains_tmp_file() {
+        let downloads_dir = std::env::temp_dir().join("test_finalize_failure");
+        let _ = tokio::fs::create_dir_all(&downloads_dir).await;
+
+        let id = "test-model";
+        let filename = "model.safetensors";
+        let file_path = downloads_dir.join(filename);
+        let tmp_file_path = downloads_dir.join(format!("{}.tmp", filename));
+        let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
+
+        // Create dummy tmp and meta files
+        let _ = tokio::fs::write(&tmp_file_path, "dummy data").await;
+        let _ = tokio::fs::write(&meta_file_path, "{}").await;
+
+        // Force both `rename` and `copy` to fail by creating a directory at `file_path`.
+        let _ = tokio::fs::create_dir(&file_path).await;
+
+        let (queue_tx, _) = tokio::sync::mpsc::channel(1);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+
+        let state = Arc::new(crate::AppState {
+            queue_tx,
+            engine_status: Arc::new(std::sync::Mutex::new(crate::EngineStatus::default())),
+            telemetry: Arc::new(std::sync::Mutex::new(crate::TelemetryStore::default())),
+            auth_store: Arc::new(std::sync::Mutex::new(crate::auth::AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client: oauth2::basic::BasicClient::new(
+                oauth2::ClientId::new("dummy".to_string()),
+                None,
+                oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+                None,
+            ),
+            config: Arc::new(crate::AppConfig::default()),
+            log_buffer: crate::SharedLogBuffer(Arc::new(std::sync::Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle: tracing_subscriber::reload::Layer::new(
+                tracing_subscriber::EnvFilter::new("info"),
+            )
+            .1,
+            current_log_level: Arc::new(std::sync::Mutex::new("info".to_string())),
+            active_downloads: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            db,
+            shutdown_tx,
+        });
+
+        super::finalize_download(
+            &state,
+            id,
+            filename,
+            &file_path,
+            &tmp_file_path,
+            &meta_file_path,
+            false,
+        )
+        .await;
+
+        // The tmp file should still exist to prevent data loss!
+        assert!(
+            tmp_file_path.exists(),
+            "The .tmp file should have been preserved after fallback failure."
+        );
+        assert!(
+            meta_file_path.exists(),
+            "The .meta file should have been preserved after fallback failure."
+        );
+
+        let _ = tokio::fs::remove_dir_all(&downloads_dir).await;
     }
 
     #[tokio::test]
