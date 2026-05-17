@@ -45,7 +45,7 @@ const SharedDownloadProgress = {
         }
         this.fetchPromise = (async () => {
             try {
-                const res = await fetchWithAuth('/api/models/download/progress');
+                const res = await fetchWithAuth('/api/downloads');
                 this.cache = await res.json();
                 this.lastFetchTime = Date.now();
                 return this.cache;
@@ -81,7 +81,7 @@ function downloadModel(modelId, callbacks = {}) {
         isStopped = true;
         stopReason = "Canceled";
         try {
-            await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
+            await fetchWithAuth(`/api/downloads/${modelId}`, { method: 'DELETE' });
             SharedDownloadProgress.clearCache();
         } catch (e) {
             console.error("Failed to send cancel request to server:", e);
@@ -92,7 +92,7 @@ function downloadModel(modelId, callbacks = {}) {
         isStopped = true;
         stopReason = "Paused";
         try {
-            await fetchWithAuth(`/api/models/${modelId}/pause`, { method: 'POST' });
+            await fetchWithAuth(`/api/downloads/${modelId}/pause`, { method: 'POST' });
             SharedDownloadProgress.clearCache();
         } catch (e) {
             console.error("Failed to send pause request to server:", e);
@@ -113,7 +113,11 @@ function downloadModel(modelId, callbacks = {}) {
                 
                 if (!activeDls[modelId]) {
                     try {
-                        await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'POST' });
+                        await fetchWithAuth('/api/downloads', { 
+                            method: 'POST', 
+                            headers: { 'Content-Type': 'application/json' }, 
+                            body: JSON.stringify({ model_id: modelId }) 
+                        });
                         SharedDownloadProgress.clearCache();
                         retryCount = 0;
                     } catch (e) {

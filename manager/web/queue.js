@@ -64,11 +64,11 @@ async function loadQueue() {
 
 window.cancelDownload = async function(id) {
     if (!confirm(`Are you sure you want to cancel the download for ${id}?`)) return;
-    try { await fetchWithAuth(`/api/models/${id}/download`, { method: 'DELETE' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to cancel download:", e); alert("Failed to cancel download."); }
+    try { await fetchWithAuth(`/api/downloads/${id}`, { method: 'DELETE' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to cancel download:", e); alert("Failed to cancel download."); }
 };
 
 window.pauseDownload = async function(id) {
-    try { await fetchWithAuth(`/api/models/${id}/pause`, { method: 'POST' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to pause download:", e); alert("Failed to pause download."); }
+    try { await fetchWithAuth(`/api/downloads/${id}/pause`, { method: 'POST' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to pause download:", e); alert("Failed to pause download."); }
 };
 
 window.clearAllDownloads = async function() {

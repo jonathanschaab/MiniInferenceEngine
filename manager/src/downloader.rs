@@ -6,6 +6,13 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 
+const HASH_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const UPDATE_INTERVAL_MS: u128 = 500;
+const UPDATE_BYTES_THRESHOLD: u64 = 1024 * 1024;
+const META_SAVE_INTERVAL_SECS: u64 = 5;
+const CORRUPT_RESTART_DELAY_SECS: u64 = 3;
+const HASH_CHANNEL_CAPACITY: usize = 32;
+
 pub struct DownloadCleanupGuard {
     state: Arc<AppState>,
     id: String,
@@ -96,34 +103,51 @@ pub async fn perform_model_download(
 
     let final_existing_size = existing_size;
     let tmp_path_for_hash = tmp_file_path.clone();
-    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
+    let hash_id = id.clone();
+    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(HASH_CHANNEL_CAPACITY);
 
     let hash_task = tokio::spawn(async move {
         let mut hasher = Sha256::new();
 
         if final_existing_size > 0 {
-            hasher = tokio::task::spawn_blocking(move || {
-                if let Ok(mut f) = std::fs::File::open(&tmp_path_for_hash) {
-                    use std::io::Read;
-                    let mut buf = vec![0u8; 4 * 1024 * 1024];
-                    let mut remaining = final_existing_size;
-                    while remaining > 0 {
-                        let to_read = (buf.len() as u64).min(remaining) as usize;
-                        if let Ok(n) = f.read(&mut buf[..to_read]) {
-                            if n == 0 {
-                                break;
+            hasher = match tokio::task::spawn_blocking(move || {
+                match std::fs::File::open(&tmp_path_for_hash) {
+                    Ok(mut f) => {
+                        use std::io::Read;
+                        let mut buf = vec![0u8; HASH_BUFFER_SIZE];
+                        let mut remaining = final_existing_size;
+                        while remaining > 0 {
+                            let to_read = (buf.len() as u64).min(remaining) as usize;
+                            match f.read(&mut buf[..to_read]) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    hasher.update(&buf[..n]);
+                                    remaining -= n as u64;
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Failed to read temp file for hashing {}: {}",
+                                        hash_id, e
+                                    );
+                                    break;
+                                }
                             }
-                            hasher.update(&buf[..n]);
-                            remaining -= n as u64;
-                        } else {
-                            break;
                         }
+                    }
+                    Err(e) => {
+                        error!("Failed to open temp file for hashing {}: {}", hash_id, e);
                     }
                 }
                 hasher
             })
             .await
-            .unwrap_or_else(|_| Sha256::new());
+            {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("Background hashing task panicked or failed: {}", e);
+                    Sha256::new()
+                }
+            };
         }
 
         while let Some(chunk) = hash_rx.recv().await {
@@ -258,7 +282,7 @@ async fn check_existing_metadata(
             }
             let _ = tokio::fs::remove_file(meta_file_path).await;
             let _ = tokio::fs::remove_file(tmp_file_path).await;
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(CORRUPT_RESTART_DELAY_SECS)).await;
         }
     }
 
@@ -454,9 +478,6 @@ async fn process_download_stream(
     let mut last_ui_update = std::time::Instant::now();
     let mut bytes_since_last_ui_update = 0;
 
-    let update_interval_ms = 500;
-    let update_bytes_threshold = 1024 * 1024;
-
     loop {
         tokio::select! {
             chunk_res = res.chunk() => {
@@ -484,8 +505,8 @@ async fn process_download_stream(
                 downloaded += bytes.len() as u64;
                 bytes_since_last_ui_update += bytes.len() as u64;
 
-                if last_ui_update.elapsed().as_millis() >= update_interval_ms
-                    || bytes_since_last_ui_update >= update_bytes_threshold
+                if last_ui_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS
+                    || bytes_since_last_ui_update >= UPDATE_BYTES_THRESHOLD
                 {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let speed = if elapsed > 0.0 {
@@ -507,7 +528,7 @@ async fn process_download_stream(
                     bytes_since_last_ui_update = 0;
                 }
 
-                if last_meta_save.elapsed().as_secs() > 5 {
+                if last_meta_save.elapsed().as_secs() >= META_SAVE_INTERVAL_SECS {
                     save_metadata(meta_file_path, downloaded, expected_hash).await;
                     last_meta_save = std::time::Instant::now();
                 }
@@ -570,6 +591,7 @@ async fn finalize_download(
                         id, rename_err
                     );
                     let _ = tokio::fs::remove_file(&copy_tmp_path).await;
+                    let _ = tokio::fs::remove_file(tmp_file_path).await;
                 } else {
                     let _ = tokio::fs::remove_file(tmp_file_path).await;
                     success = true;
@@ -581,6 +603,7 @@ async fn finalize_download(
                     id, copy_err
                 );
                 let _ = tokio::fs::remove_file(&copy_tmp_path).await;
+                let _ = tokio::fs::remove_file(tmp_file_path).await;
             }
         }
     } else {
@@ -617,7 +640,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_sha_waits_for_data() {
-        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
+        let (hash_tx, mut hash_rx) =
+            tokio::sync::mpsc::channel::<bytes::Bytes>(HASH_CHANNEL_CAPACITY);
 
         let hash_task = tokio::spawn(async move {
             let mut hasher = Sha256::new();
@@ -643,7 +667,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_completes_before_sha() {
-        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(32);
+        let (hash_tx, mut hash_rx) =
+            tokio::sync::mpsc::channel::<bytes::Bytes>(HASH_CHANNEL_CAPACITY);
 
         let hash_task = tokio::spawn(async move {
             let mut hasher = Sha256::new();

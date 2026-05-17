@@ -114,8 +114,12 @@ async function mockEngineApis(page) {
         route.fulfill({ status: 200, json: { level: 'info' } });
     });
 
-    await page.route('**/api/models/download/progress', async route => {
-        await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+    await page.route('**/api/downloads', async route => {
+        if (route.request().method() === 'GET') {
+            await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+        } else {
+            route.fallback();
+        }
     });
 }
 
@@ -452,19 +456,20 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             }
         });
 
-        await page.route('**/api/models/download/progress', async route => {
-            await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(downloadState) });
-        });
-
-        await page.route('**/api/models/*/download', async route => {
-            if (route.request().method() === 'POST') {
-                downloadState['mock-comp-1'] = {
-                    bytes_transferred: 52428800, // 50 MB
-                    total_bytes: 104857600,      // 100 MB
-                    current_speed_bps: 10485760, // 10 MB/s
-                    start_time: Math.floor(Date.now() / 1000) - 5,
-                    state: 'Downloading...'
-                };
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(downloadState) });
+            } else if (route.request().method() === 'POST') {
+                const postData = JSON.parse(route.request().postData());
+                if (postData.model_id === 'mock-comp-1') {
+                    downloadState['mock-comp-1'] = {
+                        bytes_transferred: 52428800, // 50 MB
+                        total_bytes: 104857600,      // 100 MB
+                        current_speed_bps: 10485760, // 10 MB/s
+                        start_time: Math.floor(Date.now() / 1000) - 5,
+                        state: 'Downloading...'
+                    };
+                }
                 await route.fulfill({ status: 202, body: '' });
             } else {
                 route.fallback();
@@ -522,19 +527,18 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             }
         });
 
-        // Mock the download POST request
-        await page.route('**/api/models/mock-model-1/download', async route => {
-            if (route.request().method() === 'POST') {
-                downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 1000000, start_time: 0, state: 'Downloading...' };
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, json: downloadState });
+            } else if (route.request().method() === 'POST') {
+                const postData = JSON.parse(route.request().postData());
+                if (postData.model_id === 'mock-model-1') {
+                    downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 1000000, start_time: 0, state: 'Downloading...' };
+                }
                 await route.fulfill({ status: 202, body: '' });
             } else {
                 route.fallback();
             }
-        });
-
-        // Mock progress
-        await page.route('**/api/models/download/progress', async route => {
-            await route.fulfill({ status: 200, json: downloadState });
         });
 
         // Mock generate
@@ -577,13 +581,14 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             }
         });
 
-        await page.route('**/api/models/download/progress', async route => {
-            await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(downloadState) });
-        });
-
-        await page.route('**/api/models/*/download', async route => {
-            if (route.request().method() === 'POST') {
-                downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 10, start_time: Math.floor(Date.now() / 1000), state: 'Downloading...' };
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(downloadState) });
+            } else if (route.request().method() === 'POST') {
+                const postData = JSON.parse(route.request().postData());
+                if (postData.model_id === 'mock-model-1') {
+                    downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 10, start_time: Math.floor(Date.now() / 1000), state: 'Downloading...' };
+                }
                 await route.fulfill({ status: 202, body: '' });
             } else {
                 route.fallback();
@@ -627,8 +632,10 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         });
 
         let postCount = 0;
-        await page.route('**/api/models/*/download', async route => {
-            if (route.request().method() === 'POST') {
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, json: downloadState });
+            } else if (route.request().method() === 'POST') {
                 postCount++;
                 if (postCount === 1) {
                     downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 10, start_time: 0, state: "Downloading..." };
@@ -639,10 +646,6 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             } else {
                 route.fallback();
             }
-        });
-
-        await page.route('**/api/models/download/progress', async route => {
-            await route.fulfill({ status: 200, json: downloadState });
         });
 
         await page.goto('/models');
@@ -665,25 +668,14 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         let pauseCalled = false;
         let clearAllCalled = false;
 
-        // Override default progress mock for this test to simulate a queue
-        await page.route('**/api/models/download/progress', async route => {
-            await route.fulfill({
-                status: 200,
-                json: {
-                    'mock-model-1': { bytes_transferred: 5242880, total_bytes: 10485760, current_speed_bps: 1048576, start_time: 0, state: 'Downloading...' },
-                    'mock-model-2': { bytes_transferred: 0, total_bytes: 0, current_speed_bps: 0, start_time: 0, state: 'Queued...' }
-                }
-            });
-        });
-
-        await page.route('**/api/models/mock-model-2/download', async route => {
+        await page.route('**/api/downloads/mock-model-2', async route => {
             if (route.request().method() === 'DELETE') {
                 deleteCalled = true;
                 await route.fulfill({ status: 200 });
             } else { route.fallback(); }
         });
 
-        await page.route('**/api/models/mock-model-1/pause', async route => {
+        await page.route('**/api/downloads/mock-model-1/pause', async route => {
             if (route.request().method() === 'POST') {
                 pauseCalled = true;
                 await route.fulfill({ status: 200 });
@@ -691,7 +683,15 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         });
 
         await page.route('**/api/downloads', async route => {
-            if (route.request().method() === 'DELETE') {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        'mock-model-1': { bytes_transferred: 5242880, total_bytes: 10485760, current_speed_bps: 1048576, start_time: 0, state: 'Downloading...' },
+                        'mock-model-2': { bytes_transferred: 0, total_bytes: 0, current_speed_bps: 0, start_time: 0, state: 'Queued...' }
+                    }
+                });
+            } else if (route.request().method() === 'DELETE') {
                 clearAllCalled = true;
                 await route.fulfill({ status: 200 });
             } else { route.fallback(); }
@@ -724,11 +724,14 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
     test('SharedDownloadProgress prevents redundant API requests', async ({ page }) => {
         let apiCallCount = 0;
         
-        // Override the default mock to count calls and add an artificial delay to ensure promises overlap
-        await page.route('**/api/models/download/progress', async route => {
-            apiCallCount++;
-            await new Promise(resolve => setTimeout(resolve, 50));
-            await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                apiCallCount++;
+                await new Promise(resolve => setTimeout(resolve, 50));
+                await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+            } else {
+                route.fallback();
+            }
         });
 
         // Use the chat page, which does not aggressively poll on load by default

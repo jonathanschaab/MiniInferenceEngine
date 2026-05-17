@@ -255,7 +255,7 @@ async function deleteModel(modelId) {
     if (!confirm(warning)) return;
 
     try {
-        await fetchWithAuth(`/api/models/${modelId}/download`, { method: 'DELETE' });
+        await fetchWithAuth(`/api/models/${modelId}`, { method: 'DELETE' });
         SharedDownloadProgress.clearCache();
         loadModels();
     } catch (e) {

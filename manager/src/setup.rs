@@ -8,9 +8,9 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 
 use crate::{
     AppConfig, AppState, LogReloadHandle, SharedLogBuffer, append_chat_message, auth,
-    cancel_all_downloads, clear_console_logs, delete_chat_session, delete_model, get_chat_session,
-    get_console_loglevel, get_console_logs, get_download_progress, get_model, get_models,
-    get_stats_data, get_status, handle_generate, list_chat_sessions, pause_download,
+    cancel_all_downloads, cancel_download, clear_console_logs, delete_chat_session, delete_model,
+    get_chat_session, get_console_loglevel, get_console_logs, get_download_progress, get_model,
+    get_models, get_stats_data, get_status, handle_generate, list_chat_sessions, pause_download,
     save_chat_session, serve_chat_js, serve_common_css, serve_common_js, serve_console_js,
     serve_console_ui, serve_memory_js, serve_memory_ui, serve_models_js, serve_models_ui,
     serve_queue_js, serve_queue_ui, serve_settings_js, serve_settings_ui, serve_stats_js,
@@ -191,14 +191,15 @@ pub fn build_engine_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             delete(truncate_chat_messages),
         )
         .route("/api/models", get(get_models))
-        .route("/api/models/{id}", get(get_model))
-        .route("/api/models/download/progress", get(get_download_progress))
+        .route("/api/models/{id}", get(get_model).delete(delete_model))
         .route(
-            "/api/models/{id}/download",
-            post(trigger_download).delete(delete_model),
+            "/api/downloads",
+            get(get_download_progress)
+                .post(trigger_download)
+                .delete(cancel_all_downloads),
         )
-        .route("/api/downloads", delete(cancel_all_downloads))
-        .route("/api/models/{id}/pause", post(pause_download))
+        .route("/api/downloads/{id}", delete(cancel_download))
+        .route("/api/downloads/{id}/pause", post(pause_download))
         .route("/api/status", get(get_status))
         .route("/api/stats/data", get(get_stats_data))
         .route(
