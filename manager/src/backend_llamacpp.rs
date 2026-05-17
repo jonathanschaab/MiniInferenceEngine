@@ -283,6 +283,8 @@ impl LlamaCppEngine {
                             let repo = api.model(config.repo.clone());
                             let local_weights =
                                 std::path::Path::new(&downloads_dir).join(&config.filename);
+                            
+                            // Note: We are inside a dedicated OS thread here (`std::thread::spawn`), so blocking I/O is safe.
                             let weights_path = if local_weights.exists() {
                                 local_weights
                             } else {
