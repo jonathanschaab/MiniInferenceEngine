@@ -52,6 +52,34 @@ pub async fn perform_model_download(
         filename
     );
 
+    let mut remote_sha256 = None;
+    if let Ok(no_redirect_client) = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        info!(
+            "Fetching upstream metadata for {} to bypass CDN limitations...",
+            id
+        );
+        if let Ok(head_res) = no_redirect_client.head(&url).send().await
+            && let Some(etag) = head_res
+                .headers()
+                .get("X-Linked-Etag")
+                .or_else(|| head_res.headers().get("ETag"))
+        {
+            let etag_str = etag.to_str().unwrap_or("").trim_matches('"');
+            let clean_etag = etag_str
+                .strip_prefix("W/")
+                .unwrap_or(etag_str)
+                .trim_matches('"');
+            if clean_etag.len() == 64 && clean_etag.chars().all(|c| c.is_ascii_hexdigit()) {
+                remote_sha256 = Some(clean_etag.to_string());
+                info!("Successfully retrieved upstream SHA-256: {}", clean_etag);
+            }
+        }
+    }
+
     let downloads_dir = manager::types::resolve_absolute_path(&state.config.downloads_directory);
 
     if let Err(e) = tokio::fs::create_dir_all(&downloads_dir).await {
@@ -62,8 +90,8 @@ pub async fn perform_model_download(
     let tmp_file_path = downloads_dir.join(format!("{}.tmp", filename));
     let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
 
-    let (mut existing_size, mut expected_hash) =
-        check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path).await;
+    let (mut existing_size, mut expected_hash, mut is_sha256) =
+        check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path, &remote_sha256).await;
 
     // Wait in the queue for an available download slot
     let _permit = match state.download_semaphore.acquire().await {
@@ -85,6 +113,7 @@ pub async fn perform_model_download(
         &mut res,
         &mut existing_size,
         &mut expected_hash,
+        &mut is_sha256,
     )
     .await
     .is_err()
@@ -163,7 +192,7 @@ pub async fn perform_model_download(
         res.content_length().unwrap_or(0)
     };
 
-    save_metadata(&meta_file_path, existing_size, &expected_hash).await;
+    save_metadata(&meta_file_path, existing_size, &expected_hash, is_sha256).await;
     update_status_downloading(&state, &id, existing_size, total_size);
 
     let mut file = match open_temp_file(&tmp_file_path, is_partial, existing_size).await {
@@ -183,12 +212,13 @@ pub async fn perform_model_download(
         existing_size,
         &meta_file_path,
         &expected_hash,
+        is_sha256,
         &mut shutdown_rx,
     )
     .await;
 
     if stream_error {
-        save_metadata(&meta_file_path, downloaded, &expected_hash).await;
+        save_metadata(&meta_file_path, downloaded, &expected_hash, is_sha256).await;
         info!(
             "Network interrupted. Kept partial temp file for {} to resume later.",
             id
@@ -211,7 +241,13 @@ pub async fn perform_model_download(
     let final_hash = hash_task.await.unwrap_or_default();
 
     let hash_mismatch = if let Some(ref expected) = expected_hash {
-        if expected.len() == 64 && expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        info!(
+            "Validating downloaded file for {}. Tracked ETag/Hash: {}, Computed SHA-256: {}, Is Verified SHA-256: {}",
+            id, expected, final_hash, is_sha256
+        );
+
+        // Only perform strict cryptographic failure if we are certain the ETag is a SHA-256 hash.
+        if is_sha256 && expected.len() == 64 && expected.chars().all(|c| c.is_ascii_hexdigit()) {
             if &final_hash != expected {
                 error!(
                     "Checksum mismatch for {}. Expected {}, got {}. Marking as corrupted.",
@@ -223,9 +259,9 @@ pub async fn perform_model_download(
                 false
             }
         } else {
-            info!(
-                "No SHA-256 ETag found for {}. Saving. Computed: {}",
-                id, final_hash
+            warn!(
+                "ETag for {} is not a verified X-Linked-Etag SHA-256 (Value: {}). Skipping strict cryptographic validation. Computed SHA-256 was: {}",
+                id, expected, final_hash
             );
             false
         }
@@ -254,17 +290,37 @@ async fn check_existing_metadata(
     id: &str,
     tmp_file_path: &Path,
     meta_file_path: &Path,
-) -> (u64, Option<String>) {
+    remote_sha256: &Option<String>,
+) -> (u64, Option<String>, bool) {
     let mut existing_size = 0;
-    let mut expected_hash = None;
+    let mut expected_hash = remote_sha256.clone();
+    let mut is_sha256 = remote_sha256.is_some();
 
     if let Ok(meta_str) = tokio::fs::read_to_string(meta_file_path).await {
         if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str)
             && let Some(bytes) = meta.get("downloaded_bytes").and_then(|v| v.as_u64())
         {
             existing_size = bytes;
-            if let Some(hash) = meta.get("expected_hash").and_then(|v| v.as_str()) {
+            let local_hash = meta.get("expected_hash").and_then(|v| v.as_str());
+            let local_is_sha256 = meta
+                .get("is_sha256")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            // If we successfully fetched a remote SHA-256, and it DIFFERS from the local tracked SHA-256,
+            // the file has been updated upstream. We must restart the download!
+            if let Some(remote) = remote_sha256 {
+                if local_is_sha256 && local_hash != Some(remote.as_str()) {
+                    warn!(
+                        "Upstream file for {} has changed (SHA-256 mismatch). Discarding local partial download.",
+                        id
+                    );
+                    existing_size = 0;
+                }
+            } else if let Some(hash) = local_hash {
+                // Fallback to whatever was tracked if we couldn't fetch remote_sha256
                 expected_hash = Some(hash.to_string());
+                is_sha256 = local_is_sha256;
             }
         } else {
             warn!(
@@ -304,7 +360,7 @@ async fn check_existing_metadata(
         }
     }
 
-    (existing_size, expected_hash)
+    (existing_size, expected_hash, is_sha256)
 }
 
 fn update_status_connecting(state: &Arc<AppState>, id: &str, existing_size: u64) {
@@ -369,20 +425,54 @@ async fn verify_and_update_etag(
     res: &mut reqwest::Response,
     existing_size: &mut u64,
     expected_hash: &mut Option<String>,
+    is_sha256: &mut bool,
 ) -> Result<(), ()> {
+    info!("Inspecting HTTP Headers for {}:", id);
+    for (k, v) in res.headers() {
+        info!("  {}: {:?}", k.as_str(), v.to_str().unwrap_or("<binary>"));
+    }
+
+    if *is_sha256 {
+        info!(
+            "  Already tracking a verified upstream SHA-256 for {}. Ignoring CDN ETags.",
+            id
+        );
+        return Ok(());
+    }
+
     let mut new_etag = None;
-    if let Some(etag) = res
+    let mut x_linked_found = false;
+
+    let x_linked = res
         .headers()
         .get("X-Linked-Etag")
-        .or_else(|| res.headers().get("ETag"))
-    {
-        let etag_str = etag.to_str().unwrap_or("").trim_matches('"');
+        .and_then(|v| v.to_str().ok());
+    let std_etag = res.headers().get("ETag").and_then(|v| v.to_str().ok());
+
+    info!("  Parsed X-Linked-Etag: {:?}", x_linked);
+    info!("  Parsed ETag: {:?}", std_etag);
+
+    if let Some(etag_str) = x_linked {
+        x_linked_found = true;
         let clean_etag = etag_str
             .strip_prefix("W/")
             .unwrap_or(etag_str)
             .trim_matches('"');
         if !clean_etag.is_empty() {
             new_etag = Some(clean_etag.to_string());
+            info!("  Selected X-Linked-Etag for validation: {}", clean_etag);
+        }
+    } else if let Some(etag_str) = std_etag {
+        let clean_etag = etag_str
+            .strip_prefix("W/")
+            .unwrap_or(etag_str)
+            .trim_matches('"');
+        if !clean_etag.is_empty() {
+            new_etag = Some(clean_etag.to_string());
+            info!(
+                "  Selected standard ETag for resume tracking: {}",
+                clean_etag
+            );
         }
     }
 
@@ -397,6 +487,7 @@ async fn verify_and_update_etag(
         );
         *existing_size = 0;
         *expected_hash = new_etag.clone();
+        *is_sha256 = x_linked_found;
 
         if let Ok(r) = state.reqwest_client.get(url).send().await {
             if r.status().is_success() {
@@ -415,16 +506,23 @@ async fn verify_and_update_etag(
         }
     } else if new_etag.is_some() {
         *expected_hash = new_etag;
+        *is_sha256 = x_linked_found;
     }
     Ok(())
 }
 
-async fn save_metadata(meta_file_path: &Path, downloaded: u64, expected_hash: &Option<String>) {
+async fn save_metadata(
+    meta_file_path: &Path,
+    downloaded: u64,
+    expected_hash: &Option<String>,
+    is_sha256: bool,
+) {
     let _ = tokio::fs::write(
         meta_file_path,
         serde_json::json!({
             "downloaded_bytes": downloaded,
-            "expected_hash": expected_hash
+            "expected_hash": expected_hash,
+            "is_sha256": is_sha256
         })
         .to_string(),
     )
@@ -469,6 +567,7 @@ async fn process_download_stream(
     existing_size: u64,
     meta_file_path: &Path,
     expected_hash: &Option<String>,
+    is_sha256: bool,
     shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
 ) -> (bool, u64) {
     let start_time = std::time::Instant::now();
@@ -529,13 +628,13 @@ async fn process_download_stream(
                 }
 
                 if last_meta_save.elapsed().as_secs() >= META_SAVE_INTERVAL_SECS {
-                    save_metadata(meta_file_path, downloaded, expected_hash).await;
+                save_metadata(meta_file_path, downloaded, expected_hash, is_sha256).await;
                     last_meta_save = std::time::Instant::now();
                 }
             }
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received. Flushing metadata for {}...", id);
-                save_metadata(meta_file_path, downloaded, expected_hash).await;
+            save_metadata(meta_file_path, downloaded, expected_hash, is_sha256).await;
                 return (true, downloaded);
             }
         }

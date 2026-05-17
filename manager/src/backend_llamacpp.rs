@@ -38,7 +38,19 @@ extern "C" fn llama_log_callback(
         return;
     } // Filter out empty lines and progress dots
 
-    match level {
+    // Downgrade harmless, extremely noisy upstream Llama.cpp warnings to DEBUG
+    let mut effective_level = level;
+    if level == llama_cpp_sys_2::GGML_LOG_LEVEL_WARN {
+        if msg.contains("was not control-type; this is probably a bug in the model")
+            || msg.contains("special_eog_ids contains")
+            || msg.contains("the full capacity of the model will not be utilized")
+            || msg.contains("using full-size SWA cache")
+        {
+            effective_level = llama_cpp_sys_2::GGML_LOG_LEVEL_DEBUG;
+        }
+    }
+
+    match effective_level {
         llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => tracing::error!("llama.cpp: {}", msg),
         llama_cpp_sys_2::GGML_LOG_LEVEL_WARN => tracing::warn!("llama.cpp: {}", msg),
         llama_cpp_sys_2::GGML_LOG_LEVEL_INFO => tracing::info!("llama.cpp: {}", msg),
@@ -283,7 +295,7 @@ impl LlamaCppEngine {
                             let repo = api.model(config.repo.clone());
                             let local_weights =
                                 std::path::Path::new(&downloads_dir).join(&config.filename);
-                            
+
                             // Note: We are inside a dedicated OS thread here (`std::thread::spawn`), so blocking I/O is safe.
                             let weights_path = if local_weights.exists() {
                                 local_weights

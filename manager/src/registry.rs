@@ -20,6 +20,7 @@ pub enum ModelArch {
     XLMRoberta,
     GptOss,
     Mistral,
+    Gemma,
 }
 
 pub trait PromptFormatter {
@@ -73,6 +74,20 @@ impl PromptFormatter for ModelArch {
                 if !system_prompt.is_empty() {
                     prompt.push_str(&format!("[INST] {} [/INST]", system_prompt));
                 }
+            }
+            ModelArch::Gemma => {
+                for msg in messages {
+                    let role = if msg.role == "assistant" {
+                        "model"
+                    } else {
+                        &msg.role
+                    };
+                    prompt.push_str(&format!(
+                        "<start_of_turn>{}\n{}<end_of_turn>\n",
+                        role, msg.content
+                    ));
+                }
+                prompt.push_str("<start_of_turn>model\n");
             }
             _ => {
                 for msg in messages {
@@ -238,6 +253,36 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                 is_default_compressor: false,
                 parameters_billions: 8.0,
                 non_layer_params_billions: 1.05,
+                overrides: ModelOverrides::default(),
+            },
+            ModelRegistration {
+                id: "llama-3.2-3b",
+                name: "Llama 3.2 (3B)",
+                repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
+                tokenizer_repo: "unsloth/Llama-3.2-3B-Instruct",
+                filename: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+                roles: vec![ModelRole::GeneralChat],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::Candle, BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 3.21,
+                non_layer_params_billions: 0.40,
+                overrides: ModelOverrides::default(),
+            },
+            ModelRegistration {
+                id: "qwen-2.5-1.5b",
+                name: "Qwen 2.5 (1.5B)",
+                repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+                tokenizer_repo: "Qwen/Qwen2.5-1.5B-Instruct",
+                filename: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+                roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::Candle, BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 1.54,
+                non_layer_params_billions: 0.23,
                 overrides: ModelOverrides::default(),
             },
             ModelRegistration {
@@ -414,6 +459,36 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     ..Default::default()
                 },
             },
+            ModelRegistration {
+                id: "gemma-4-e4b",
+                name: "Gemma 4 (E4B)",
+                repo: "unsloth/gemma-4-E4B-it-GGUF",
+                tokenizer_repo: "google/gemma-4-E4B-it",
+                filename: "gemma-4-E4B-it-Q4_K_M.gguf",
+                roles: vec![ModelRole::GeneralChat],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 4.0,
+                non_layer_params_billions: 0.5,
+                overrides: ModelOverrides::default(),
+            },
+            ModelRegistration {
+                id: "gemma-4-31b",
+                name: "Gemma 4 (31B)",
+                repo: "unsloth/gemma-4-31B-it-GGUF",
+                tokenizer_repo: "google/gemma-4-31B-it",
+                filename: "gemma-4-31B-it-Q4_K_M.gguf",
+                roles: vec![ModelRole::GeneralChat],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 31.0,
+                non_layer_params_billions: 1.5,
+                overrides: ModelOverrides::default(),
+            },
         ];
 
         let mut handles = Vec::new();
@@ -477,7 +552,22 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                 }
 
                 // 2. Fetch config.json from tokenizer repo to dynamically populate architectural details
-                if num_layers.is_none() || n_head.is_none() || arch.is_none() || kv_cache_dtype.is_none() || max_context_len.is_none() || sliding_window.is_none() || rope_scaling_factor.is_none() || original_max_position_embeddings.is_none() {
+                let needs_remote_config = arch.is_none()
+                    || kv_cache_dtype.is_none()
+                    || max_context_len.is_none()
+                    || sliding_window.is_none()
+                    || rope_scaling_factor.is_none()
+                    || original_max_position_embeddings.is_none()
+                    || num_layers.is_none()
+                    || n_embd.is_none()
+                    || n_head.is_none()
+                    || n_head_kv.is_none()
+                    || head_dim.is_none()
+                    || intermediate_size.is_none()
+                    || num_local_experts.is_none()
+                    || num_experts_per_tok.is_none();
+
+                if needs_remote_config {
                     if let Some(api) = &api_opt {
                         match api.model(reg.tokenizer_repo.to_string()).get("config.json").await {
                             Ok(config_path) => {
@@ -538,6 +628,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                     "xlm-roberta" => Some(ModelArch::XLMRoberta),
                                                     "gpt_oss" => Some(ModelArch::GptOss),
                                                     "mistral" | "mixtral" => Some(ModelArch::Mistral),
+                                                    "gemma" | "gemma2" | "gemma4_text" => Some(ModelArch::Gemma),
                                                     _ => {
                                                     warn!("Unrecognized 'model_type' ({}) in config.json for {}", model_type, reg.id);
                                                         None
