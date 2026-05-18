@@ -1,4 +1,5 @@
 use crate::AppState;
+use crypto_common::hazmat::SerializableState;
 use manager::lock_status;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -6,12 +7,38 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 
-const HASH_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const UPDATE_INTERVAL_MS: u128 = 500;
 const UPDATE_BYTES_THRESHOLD: u64 = 1024 * 1024;
 const META_SAVE_INTERVAL_SECS: u64 = 5;
 const CORRUPT_RESTART_DELAY_SECS: u64 = 3;
-const HASH_CHANNEL_CAPACITY: usize = 32;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct Checkpoint {
+    pub downloaded_bytes: u64,
+    pub hasher_state: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct DownloadMetadata {
+    pub expected_hash: Option<String>,
+    pub is_sha256: bool,
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
+}
+
+// Safely extract the internal state of the Sha256 struct into a hex string
+fn serialize_hasher(hasher: &Sha256) -> String {
+    let state = hasher.serialize();
+    hex::encode(state.as_slice())
+}
+
+// Safely reconstruct the Sha256 struct from a hex string
+fn deserialize_hasher(hex_str: &str) -> Option<Sha256> {
+    let decoded = hex::decode(hex_str).ok()?;
+    let state: crypto_common::hazmat::SerializedState<Sha256> =
+        decoded.as_slice().try_into().ok()?;
+    Sha256::deserialize(&state).ok()
+}
 
 pub struct DownloadCleanupGuard {
     state: Arc<AppState>,
@@ -38,47 +65,12 @@ pub async fn perform_model_download(
     id: String,
     repo: String,
     filename: String,
-    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let _guard = DownloadCleanupGuard {
         state: state.clone(),
         id: id.clone(),
     };
-
-    let url = format!(
-        "{}/{}/resolve/main/{}",
-        state.config.hf_base_url.trim_end_matches('/'),
-        repo,
-        filename
-    );
-
-    let mut remote_sha256 = None;
-    if let Ok(no_redirect_client) = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        info!(
-            "Fetching upstream metadata for {} to bypass CDN limitations...",
-            id
-        );
-        if let Ok(head_res) = no_redirect_client.head(&url).send().await
-            && let Some(etag) = head_res
-                .headers()
-                .get("X-Linked-Etag")
-                .or_else(|| head_res.headers().get("ETag"))
-        {
-            let etag_str = etag.to_str().unwrap_or("").trim_matches('"');
-            let clean_etag = etag_str
-                .strip_prefix("W/")
-                .unwrap_or(etag_str)
-                .trim_matches('"');
-            if clean_etag.len() == 64 && clean_etag.chars().all(|c| c.is_ascii_hexdigit()) {
-                remote_sha256 = Some(clean_etag.to_string());
-                info!("Successfully retrieved upstream SHA-256: {}", clean_etag);
-            }
-        }
-    }
 
     let downloads_dir = manager::types::resolve_absolute_path(&state.config.downloads_directory);
 
@@ -86,12 +78,89 @@ pub async fn perform_model_download(
         error!("Failed to create downloads directory for {}: {}", id, e);
         return;
     }
-    let file_path = downloads_dir.join(&filename);
-    let tmp_file_path = downloads_dir.join(format!("{}.tmp", filename));
-    let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
 
-    let (mut existing_size, mut expected_hash, mut is_sha256) =
-        check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path, &remote_sha256).await;
+    let files = manager::get_split_filenames(&filename);
+    let shared_downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let grand_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let mut client_builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10));
+
+    if let Ok(token) = std::env::var("HF_TOKEN") {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(auth_val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+            headers.insert(reqwest::header::AUTHORIZATION, auth_val);
+        }
+        client_builder = client_builder.default_headers(headers);
+    }
+
+    let client = client_builder.build().unwrap_or_default();
+
+    let mut chunk_infos = Vec::new();
+
+    // Sequential HEAD pre-check to establish totals immediately
+    for fname in &files {
+        let file_path = downloads_dir.join(fname);
+        let url = format!(
+            "{}/{}/resolve/main/{}",
+            state.config.hf_base_url.trim_end_matches('/'),
+            repo,
+            fname
+        );
+
+        if let Ok(meta) = tokio::fs::metadata(&file_path).await {
+            shared_downloaded.fetch_add(meta.len(), std::sync::atomic::Ordering::Relaxed);
+            grand_total.fetch_add(meta.len(), std::sync::atomic::Ordering::Relaxed);
+            chunk_infos.push((fname.clone(), url, None, true));
+            continue;
+        }
+
+        let mut remote_sha256 = None;
+        let mut backoff = 2;
+        loop {
+            if let Ok(head_res) = client.head(&url).send().await {
+                if head_res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    warn!(
+                        "429 Too Many Requests during metadata fetch for {}. Retrying in {} seconds...",
+                        fname, backoff
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(30);
+                    continue;
+                }
+                if let Some(cl) = head_res.headers().get(reqwest::header::CONTENT_LENGTH)
+                    && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
+                {
+                    grand_total.fetch_add(s, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(etag) = head_res
+                    .headers()
+                    .get("X-Linked-Etag")
+                    .or_else(|| head_res.headers().get("ETag"))
+                {
+                    let clean_etag = etag
+                        .to_str()
+                        .unwrap_or("")
+                        .trim_matches('"')
+                        .strip_prefix("W/")
+                        .unwrap_or_else(|| etag.to_str().unwrap_or("").trim_matches('"'));
+                    if clean_etag.len() == 64 && clean_etag.chars().all(|c| c.is_ascii_hexdigit()) {
+                        remote_sha256 = Some(clean_etag.to_string());
+                    }
+                }
+            }
+            break;
+        }
+        chunk_infos.push((fname.clone(), url, remote_sha256, false));
+    }
+
+    // Check if fully completed already
+    if chunk_infos.iter().all(|(_, _, _, done)| *done) {
+        let mut status = lock_status(&state.engine_status);
+        status.downloaded_models.insert(id.clone());
+        return;
+    }
 
     // Wait in the queue for an available download slot
     let _permit = match state.download_semaphore.acquire().await {
@@ -99,11 +168,105 @@ pub async fn perform_model_download(
         Err(_) => return, // Semaphore closed, safely shutting down
     };
 
-    update_status_connecting(&state, &id, existing_size);
+    update_status_connecting(
+        &state,
+        &id,
+        shared_downloaded.load(std::sync::atomic::Ordering::Relaxed),
+    );
+
+    let initial_shared_downloaded = shared_downloaded.load(std::sync::atomic::Ordering::Relaxed);
+    let start_time = std::time::Instant::now();
+    let mut join_set = tokio::task::JoinSet::new();
+
+    // Limit concurrent chunk downloads to prevent blasting HF and getting 429s
+    let chunk_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        state.config.max_concurrent_chunk_downloads,
+    ));
+
+    for (chunk_filename, url, remote_sha256, is_already_done) in chunk_infos {
+        if is_already_done {
+            continue;
+        }
+        let state = state.clone();
+        let id = id.clone();
+        let downloads_dir = downloads_dir.clone();
+        let shutdown_rx = shutdown_rx.resubscribe();
+        let shared_downloaded = shared_downloaded.clone();
+        let grand_total = grand_total.clone();
+        let sem = chunk_semaphore.clone();
+
+        join_set.spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            download_chunk(
+                state,
+                id,
+                url,
+                chunk_filename,
+                downloads_dir,
+                remote_sha256,
+                shared_downloaded,
+                grand_total,
+                shutdown_rx,
+                start_time,
+                initial_shared_downloaded,
+            )
+            .await
+        });
+    }
+
+    let mut hash_mismatch_occurred = false;
+    while let Some(res) = join_set.join_next().await {
+        if let Ok(chunk_mismatch) = res
+            && chunk_mismatch
+        {
+            hash_mismatch_occurred = true;
+        }
+    }
+
+    // Finalize state
+    let mut status = lock_status(&state.engine_status);
+    if hash_mismatch_occurred {
+        status.corrupted_models.insert(id.clone());
+    } else {
+        let mut all_exist = true;
+        for f in &files {
+            if !downloads_dir.join(f).exists() {
+                all_exist = false;
+                break;
+            }
+        }
+        if all_exist {
+            info!("Finished downloading all parts for {}", id);
+            status.downloaded_models.insert(id.clone());
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_chunk(
+    state: Arc<AppState>,
+    id: String,
+    url: String,
+    filename: String,
+    downloads_dir: std::path::PathBuf,
+    remote_sha256: Option<String>,
+    shared_downloaded: Arc<std::sync::atomic::AtomicU64>,
+    grand_total: Arc<std::sync::atomic::AtomicU64>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    start_time: std::time::Instant,
+    initial_shared_downloaded: u64,
+) -> bool {
+    let tmp_file_path = downloads_dir.join(format!("{}.tmp", filename));
+    let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
+
+    let (mut existing_size, mut expected_hash, mut is_sha256, mut initial_hasher, mut checkpoints) =
+        check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path, &remote_sha256).await;
+
+    shared_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
 
     let mut res = match initiate_request(&state, &url, &id, &mut existing_size).await {
         Some(r) => r,
-        None => return,
+        None => return false,
     };
 
     if verify_and_update_etag(
@@ -118,163 +281,67 @@ pub async fn perform_model_download(
     .await
     .is_err()
     {
-        return;
+        return false;
     }
 
     let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     if !is_partial && existing_size > 0 {
-        info!(
-            "Server did not return partial content, restarting download for {}",
-            id
-        );
+        shared_downloaded.fetch_sub(existing_size, std::sync::atomic::Ordering::Relaxed);
         existing_size = 0;
     }
 
-    let final_existing_size = existing_size;
-    let tmp_path_for_hash = tmp_file_path.clone();
-    let hash_id = id.clone();
-    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(HASH_CHANNEL_CAPACITY);
+    if existing_size == 0 {
+        initial_hasher = Sha256::new();
+        checkpoints.clear();
+    }
 
-    let hash_task = tokio::spawn(async move {
-        let mut hasher = Sha256::new();
-
-        if final_existing_size > 0 {
-            hasher = match tokio::task::spawn_blocking(move || {
-                match std::fs::File::open(&tmp_path_for_hash) {
-                    Ok(mut f) => {
-                        use std::io::Read;
-                        let mut buf = vec![0u8; HASH_BUFFER_SIZE];
-                        let mut remaining = final_existing_size;
-                        while remaining > 0 {
-                            let to_read = (buf.len() as u64).min(remaining) as usize;
-                            match f.read(&mut buf[..to_read]) {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    hasher.update(&buf[..n]);
-                                    remaining -= n as u64;
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to read temp file for hashing {}: {}",
-                                        hash_id, e
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to open temp file for hashing {}: {}", hash_id, e);
-                    }
-                }
-                hasher
-            })
-            .await
-            {
-                Ok(h) => h,
-                Err(e) => {
-                    error!("Background hashing task panicked or failed: {}", e);
-                    Sha256::new()
-                }
-            };
-        }
-
-        while let Some(chunk) = hash_rx.recv().await {
-            hasher.update(&chunk);
-        }
-
-        hex::encode(hasher.finalize())
-    });
-
-    let total_size = if is_partial {
-        existing_size + res.content_length().unwrap_or(0)
-    } else {
-        res.content_length().unwrap_or(0)
-    };
-
-    save_metadata(&meta_file_path, existing_size, &expected_hash, is_sha256).await;
-    update_status_downloading(&state, &id, existing_size, total_size);
+    save_metadata(&meta_file_path, &expected_hash, is_sha256, &checkpoints).await;
 
     let mut file = match open_temp_file(&tmp_file_path, is_partial, existing_size).await {
         Ok(f) => f,
         Err(e) => {
-            error!("Failed to open/create file for {}: {}", id, e);
-            return;
+            error!("Failed to open file for {}: {}", id, e);
+            return false;
         }
     };
 
-    let (stream_error, downloaded) = process_download_stream(
+    let (stream_error, _) = process_download_stream(
         &state,
         &id,
         &mut res,
         &mut file,
-        hash_tx,
+        &mut initial_hasher,
         existing_size,
         &meta_file_path,
         &expected_hash,
         is_sha256,
+        checkpoints,
         &mut shutdown_rx,
+        shared_downloaded,
+        grand_total,
+        start_time,
+        initial_shared_downloaded,
     )
     .await;
 
     if stream_error {
-        save_metadata(&meta_file_path, downloaded, &expected_hash, is_sha256).await;
-        info!(
-            "Network interrupted. Kept partial temp file for {} to resume later.",
-            id
-        );
-        return;
+        return false;
     }
 
     drop(file);
 
-    {
-        let mut dl = state
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(status) = dl.get_mut(&id) {
-            status.state = "Verifying checksum...".to_string();
-        }
-    }
-
-    let final_hash = hash_task.await.unwrap_or_default();
-
+    let final_hash = hex::encode(initial_hasher.finalize());
     let hash_mismatch = if let Some(ref expected) = expected_hash {
-        info!(
-            "Validating downloaded file for {}. Tracked ETag/Hash: {}, Computed SHA-256: {}, Is Verified SHA-256: {}",
-            id, expected, final_hash, is_sha256
-        );
-
-        // Only perform strict cryptographic failure if we are certain the ETag is a SHA-256 hash.
-        if is_sha256 && expected.len() == 64 && expected.chars().all(|c| c.is_ascii_hexdigit()) {
-            if &final_hash != expected {
-                error!(
-                    "Checksum mismatch for {}. Expected {}, got {}. Marking as corrupted.",
-                    id, expected, final_hash
-                );
-                true
-            } else {
-                info!("Checksum validated successfully for {}.", id);
-                false
-            }
-        } else {
-            warn!(
-                "ETag for {} is not a verified X-Linked-Etag SHA-256 (Value: {}). Skipping strict cryptographic validation. Computed SHA-256 was: {}",
-                id, expected, final_hash
-            );
-            false
-        }
+        is_sha256
+            && expected.len() == 64
+            && expected.chars().all(|c| c.is_ascii_hexdigit())
+            && &final_hash != expected
     } else {
-        info!(
-            "No SHA-256 ETag found for {}. Saving. Computed: {}",
-            id, final_hash
-        );
         false
     };
 
+    let file_path = downloads_dir.join(&filename);
     finalize_download(
-        &state,
         &id,
         &filename,
         &file_path,
@@ -283,6 +350,8 @@ pub async fn perform_model_download(
         hash_mismatch,
     )
     .await;
+
+    hash_mismatch
 }
 
 async fn check_existing_metadata(
@@ -291,36 +360,91 @@ async fn check_existing_metadata(
     tmp_file_path: &Path,
     meta_file_path: &Path,
     remote_sha256: &Option<String>,
-) -> (u64, Option<String>, bool) {
+) -> (u64, Option<String>, bool, Sha256, Vec<Checkpoint>) {
     let mut existing_size = 0;
     let mut expected_hash = remote_sha256.clone();
     let mut is_sha256 = remote_sha256.is_some();
+    let mut initial_hasher = Sha256::new();
+    let mut checkpoints = Vec::new();
 
     if let Ok(meta_str) = tokio::fs::read_to_string(meta_file_path).await {
-        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str)
-            && let Some(bytes) = meta.get("downloaded_bytes").and_then(|v| v.as_u64())
-        {
-            existing_size = bytes;
-            let local_hash = meta.get("expected_hash").and_then(|v| v.as_str());
-            let local_is_sha256 = meta
-                .get("is_sha256")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+        let mut parsed_meta: Option<DownloadMetadata> = None;
+
+        if let Ok(meta) = serde_json::from_str::<DownloadMetadata>(&meta_str) {
+            parsed_meta = Some(meta);
+        } else if let Ok(old_meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+            // Fallback for migrating old metadata
+            if let Some(bytes) = old_meta.get("downloaded_bytes").and_then(|v| v.as_u64()) {
+                let mut cps = Vec::new();
+                if let Some(state_hex) = old_meta.get("hasher_state").and_then(|v| v.as_str()) {
+                    cps.push(Checkpoint {
+                        downloaded_bytes: bytes,
+                        hasher_state: state_hex.to_string(),
+                    });
+                }
+                parsed_meta = Some(DownloadMetadata {
+                    expected_hash: old_meta
+                        .get("expected_hash")
+                        .and_then(|v| v.as_str().map(|s| s.to_string())),
+                    is_sha256: old_meta
+                        .get("is_sha256")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    checkpoints: cps,
+                });
+            }
+        }
+
+        if let Some(meta) = parsed_meta {
+            let local_hash = meta.expected_hash.clone();
+            let local_is_sha256 = meta.is_sha256;
 
             // If we successfully fetched a remote SHA-256, and it DIFFERS from the local tracked SHA-256,
             // the file has been updated upstream. We must restart the download!
             if let Some(remote) = remote_sha256 {
-                if local_is_sha256 && local_hash != Some(remote.as_str()) {
+                if local_is_sha256 && local_hash != Some(remote.to_string()) {
                     warn!(
                         "Upstream file for {} has changed (SHA-256 mismatch). Discarding local partial download.",
                         id
                     );
-                    existing_size = 0;
+                    return (0, expected_hash, is_sha256, initial_hasher, checkpoints);
                 }
             } else if let Some(hash) = local_hash {
                 // Fallback to whatever was tracked if we couldn't fetch remote_sha256
                 expected_hash = Some(hash.to_string());
                 is_sha256 = local_is_sha256;
+            }
+
+            // Find the most recent valid checkpoint
+            if let Ok(metadata) = tokio::fs::metadata(tmp_file_path).await {
+                let actual_size = metadata.len();
+                // Iterate backwards (newest first)
+                for cp in meta.checkpoints.iter().rev() {
+                    if cp.downloaded_bytes <= actual_size
+                        && let Some(restored) = deserialize_hasher(&cp.hasher_state)
+                    {
+                        initial_hasher = restored;
+                        existing_size = cp.downloaded_bytes;
+                        checkpoints = meta.checkpoints.clone();
+
+                        // If the physical file is larger than the checkpoint, it means the OS crashed
+                        // before syncing the newest metadata to disk. We truncate the physical file back to the checkpoint.
+                        if actual_size > existing_size {
+                            info!(
+                                "Dropping back to checkpoint at {} bytes for {}",
+                                existing_size, id
+                            );
+                            if let Ok(f) = tokio::fs::OpenOptions::new()
+                                .write(true)
+                                .open(tmp_file_path)
+                                .await
+                            {
+                                let _ = f.set_len(existing_size).await;
+                            }
+                        }
+                        break;
+                    }
+                }
             }
         } else {
             warn!(
@@ -342,25 +466,13 @@ async fn check_existing_metadata(
         }
     }
 
-    if existing_size > 0 {
-        if let Ok(file) = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(tmp_file_path)
-            .await
-            && let Ok(metadata) = file.metadata().await
-        {
-            let actual_size = metadata.len();
-            if actual_size < existing_size {
-                existing_size = actual_size;
-            } else if actual_size > existing_size {
-                let _ = file.set_len(existing_size).await;
-            }
-        } else {
-            existing_size = 0;
-        }
-    }
-
-    (existing_size, expected_hash, is_sha256)
+    (
+        existing_size,
+        expected_hash,
+        is_sha256,
+        initial_hasher,
+        checkpoints,
+    )
 }
 
 fn update_status_connecting(state: &Arc<AppState>, id: &str, existing_size: u64) {
@@ -381,39 +493,38 @@ async fn initiate_request(
     existing_size: &mut u64,
 ) -> Option<reqwest::Response> {
     let client = &state.reqwest_client;
-    let mut req = client.get(url);
-    if *existing_size > 0 {
-        req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_size));
-    }
+    let mut backoff = 5;
 
-    match req.send().await {
-        Ok(r) => {
-            if r.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-                *existing_size = 0;
-                match client.get(url).send().await {
-                    Ok(r2) => {
-                        if !r2.status().is_success() {
-                            error!("Download failed for {} with status: {}", id, r2.status());
-                            None
-                        } else {
-                            Some(r2)
-                        }
-                    }
-                    Err(e) => {
-                        error!("Download failed for {}: {}", id, e);
-                        None
-                    }
-                }
-            } else if !r.status().is_success() {
-                error!("Download failed for {} with status: {}", id, r.status());
-                None
-            } else {
-                Some(r)
-            }
+    loop {
+        let mut req = client.get(url);
+        if *existing_size > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_size));
         }
-        Err(e) => {
-            error!("Download failed for {}: {}", id, e);
-            None
+
+        match req.send().await {
+            Ok(r) => {
+                if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    warn!(
+                        "Hugging Face rate limit (429) hit for {}. Retrying in {} seconds...",
+                        id, backoff
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    backoff = (backoff * 2).min(60);
+                    continue;
+                } else if r.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                    *existing_size = 0;
+                    continue; // Loop will retry without the RANGE header
+                } else if !r.status().is_success() {
+                    error!("Download failed for {} with status: {}", id, r.status());
+                    return None;
+                } else {
+                    return Some(r);
+                }
+            }
+            Err(e) => {
+                error!("Download failed for {}: {}", id, e);
+                return None;
+            }
         }
     }
 }
@@ -513,32 +624,20 @@ async fn verify_and_update_etag(
 
 async fn save_metadata(
     meta_file_path: &Path,
-    downloaded: u64,
     expected_hash: &Option<String>,
     is_sha256: bool,
+    checkpoints: &[Checkpoint],
 ) {
+    let meta = DownloadMetadata {
+        expected_hash: expected_hash.clone(),
+        is_sha256,
+        checkpoints: checkpoints.to_vec(),
+    };
     let _ = tokio::fs::write(
         meta_file_path,
-        serde_json::json!({
-            "downloaded_bytes": downloaded,
-            "expected_hash": expected_hash,
-            "is_sha256": is_sha256
-        })
-        .to_string(),
+        serde_json::to_string(&meta).unwrap_or_default(),
     )
     .await;
-}
-
-fn update_status_downloading(state: &Arc<AppState>, id: &str, existing_size: u64, total_size: u64) {
-    let mut dl = state
-        .active_downloads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(status) = dl.get_mut(id) {
-        status.total_bytes = total_size;
-        status.bytes_transferred = existing_size;
-        status.state = "Downloading...".to_string();
-    }
 }
 
 async fn open_temp_file(
@@ -563,14 +662,18 @@ async fn process_download_stream(
     id: &str,
     res: &mut reqwest::Response,
     file: &mut tokio::fs::File,
-    hash_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    hasher: &mut Sha256,
     existing_size: u64,
     meta_file_path: &Path,
     expected_hash: &Option<String>,
     is_sha256: bool,
+    mut checkpoints: Vec<Checkpoint>,
     shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    shared_downloaded: Arc<std::sync::atomic::AtomicU64>,
+    grand_total: Arc<std::sync::atomic::AtomicU64>,
+    start_time: std::time::Instant,
+    initial_shared_downloaded: u64,
 ) -> (bool, u64) {
-    let start_time = std::time::Instant::now();
     let mut downloaded: u64 = existing_size;
     let mut stream_error = false;
     let mut last_meta_save = std::time::Instant::now();
@@ -590,34 +693,35 @@ async fn process_download_stream(
                     }
                 };
 
-                if let Err(e) = hash_tx.send(bytes.clone()).await {
-                    error!("Error sending to hash channel for {}: {}", id, e);
-                    stream_error = true;
-                    break;
-                }
+                hasher.update(&bytes);
 
                 if let Err(e) = file.write_all(&bytes).await {
                     error!("Failed to write to file for {}: {}", id, e);
                     stream_error = true;
                     break;
                 }
-                downloaded += bytes.len() as u64;
-                bytes_since_last_ui_update += bytes.len() as u64;
+                let chunk_len = bytes.len() as u64;
+                downloaded += chunk_len;
+                bytes_since_last_ui_update += chunk_len;
+
+                let total_transferred = shared_downloaded.fetch_add(chunk_len, std::sync::atomic::Ordering::Relaxed) + chunk_len;
 
                 if last_ui_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS
                     || bytes_since_last_ui_update >= UPDATE_BYTES_THRESHOLD
                 {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let speed = if elapsed > 0.0 {
-                        (downloaded.saturating_sub(existing_size)) as f64 / elapsed
+                        (total_transferred.saturating_sub(initial_shared_downloaded)) as f64 / elapsed
                     } else {
                         0.0
                     };
 
+                    let current_grand_total = grand_total.load(std::sync::atomic::Ordering::Relaxed);
                     {
                         let mut dl = state.active_downloads.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(status) = dl.get_mut(id) {
-                            status.bytes_transferred = downloaded;
+                            status.bytes_transferred = total_transferred;
+                            status.total_bytes = current_grand_total;
                             status.current_speed_bps = speed;
                             status.state = "Downloading...".to_string();
                         }
@@ -628,13 +732,29 @@ async fn process_download_stream(
                 }
 
                 if last_meta_save.elapsed().as_secs() >= META_SAVE_INTERVAL_SECS {
-                save_metadata(meta_file_path, downloaded, expected_hash, is_sha256).await;
+                    let state_hex = serialize_hasher(hasher);
+                    checkpoints.push(Checkpoint {
+                        downloaded_bytes: downloaded,
+                        hasher_state: state_hex,
+                    });
+                    if checkpoints.len() > 5 {
+                        checkpoints.remove(0);
+                    }
+                    save_metadata(meta_file_path, expected_hash, is_sha256, &checkpoints).await;
                     last_meta_save = std::time::Instant::now();
                 }
             }
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received. Flushing metadata for {}...", id);
-            save_metadata(meta_file_path, downloaded, expected_hash, is_sha256).await;
+                let state_hex = serialize_hasher(hasher);
+                checkpoints.push(Checkpoint {
+                    downloaded_bytes: downloaded,
+                    hasher_state: state_hex,
+                });
+                if checkpoints.len() > 5 {
+                    checkpoints.remove(0);
+                }
+                save_metadata(meta_file_path, expected_hash, is_sha256, &checkpoints).await;
                 return (true, downloaded);
             }
         }
@@ -644,7 +764,6 @@ async fn process_download_stream(
 }
 
 async fn finalize_download(
-    state: &Arc<AppState>,
     id: &str,
     filename: &str,
     file_path: &Path,
@@ -722,16 +841,6 @@ async fn finalize_download(
                 target_path.display(),
                 filename
             );
-            {
-                let mut status = lock_status(&state.engine_status);
-                status.corrupted_models.insert(id.to_string());
-            }
-        } else {
-            info!("Finished downloading {}", id);
-            {
-                let mut status = lock_status(&state.engine_status);
-                status.downloaded_models.insert(id.to_string());
-            }
         }
     }
 }
@@ -739,33 +848,27 @@ async fn finalize_download(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    #[tokio::test]
-    async fn test_concurrent_sha_waits_for_data() {
-        let (hash_tx, mut hash_rx) =
-            tokio::sync::mpsc::channel::<bytes::Bytes>(HASH_CHANNEL_CAPACITY);
+    #[test]
+    fn test_serialize_deserialize_hasher() {
+        let mut hasher1 = Sha256::new();
+        hasher1.update(b"hello");
+        let state_hex = serialize_hasher(&hasher1);
 
-        let hash_task = tokio::spawn(async move {
-            let mut hasher = Sha256::new();
-            while let Some(chunk) = hash_rx.recv().await {
-                hasher.update(&chunk);
-            }
-            hex::encode(hasher.finalize())
-        });
+        let mut hasher2 = deserialize_hasher(&state_hex).expect("Failed to deserialize");
+        hasher2.update(b" world");
 
-        hash_tx.send(bytes::Bytes::from("hello")).await.unwrap();
-        // Let the hasher catch up and suspend waiting for more data
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        hash_tx.send(bytes::Bytes::from(" world")).await.unwrap();
-
-        drop(hash_tx); // Simulate download stream completion
-
-        let result = hash_task.await.unwrap();
+        let result = hex::encode(hasher2.finalize());
         assert_eq!(
             result,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[test]
+    fn test_deserialize_hasher_invalid_hex() {
+        assert!(deserialize_hasher("invalidhex").is_none());
+        assert!(deserialize_hasher("deadbeef").is_none()); // Valid hex characters, but incomplete byte array
     }
 
     #[tokio::test]
@@ -791,7 +894,7 @@ mod tests {
         let db = surrealdb::engine::any::connect("mem://").await.unwrap();
         db.use_ns("test").use_db("test").await.unwrap();
 
-        let state = Arc::new(crate::AppState {
+        let _state = Arc::new(crate::AppState {
             queue_tx,
             engine_status: Arc::new(std::sync::Mutex::new(crate::EngineStatus::default())),
             telemetry: Arc::new(std::sync::Mutex::new(crate::TelemetryStore::default())),
@@ -821,7 +924,6 @@ mod tests {
         });
 
         super::finalize_download(
-            &state,
             id,
             filename,
             &file_path,
@@ -842,32 +944,5 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&downloads_dir).await;
-    }
-
-    #[tokio::test]
-    async fn test_download_completes_before_sha() {
-        let (hash_tx, mut hash_rx) =
-            tokio::sync::mpsc::channel::<bytes::Bytes>(HASH_CHANNEL_CAPACITY);
-
-        let hash_task = tokio::spawn(async move {
-            let mut hasher = Sha256::new();
-            while let Some(chunk) = hash_rx.recv().await {
-                tokio::time::sleep(Duration::from_millis(10)).await; // Artificially slow down hashing
-                hasher.update(&chunk);
-            }
-            hex::encode(hasher.finalize())
-        });
-
-        // Blast the channel with data to simulate a very fast local network download
-        for _ in 0..10 {
-            hash_tx.send(bytes::Bytes::from("chunk")).await.unwrap();
-        }
-        drop(hash_tx); // Complete download
-
-        let result = hash_task.await.unwrap(); // This await forces the fast download to wait for the slow hasher
-        assert_eq!(
-            result,
-            "9e649377bd12727055af10d6c2e4bb7954e3cc8fdc7807dc64f6913d4f49ce2e"
-        );
     }
 }

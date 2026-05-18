@@ -584,7 +584,7 @@ impl InferenceBackend for CandleEngine {
                 0,
                 0,
             );
-            s.update_nvml(total, used_after, free_after);
+            s.update_nvml(total, used_after, free_after, None);
         }
         Ok(config.max_context_len)
     }

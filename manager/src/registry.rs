@@ -21,6 +21,8 @@ pub enum ModelArch {
     GptOss,
     Mistral,
     Gemma,
+    Deepseek,
+    Cohere,
 }
 
 pub trait PromptFormatter {
@@ -89,6 +91,35 @@ impl PromptFormatter for ModelArch {
                 }
                 prompt.push_str("<start_of_turn>model\n");
             }
+            ModelArch::Deepseek => {
+                for msg in messages {
+                    if msg.role == "system" {
+                        prompt.push_str(&format!("{}\n", msg.content));
+                    } else if msg.role == "user" {
+                        prompt.push_str(&format!("<｜User｜>{}", msg.content));
+                    } else if msg.role == "assistant" {
+                        prompt.push_str(&format!("<｜Assistant｜>{}", msg.content));
+                    } else {
+                        prompt.push_str(&format!("{}: {}", msg.role, msg.content));
+                    }
+                }
+                prompt.push_str("<｜Assistant｜>");
+            }
+            ModelArch::Cohere => {
+                for msg in messages {
+                    let role_token = match msg.role.as_str() {
+                        "system" => "<|SYSTEM_TOKEN|>",
+                        "user" => "<|USER_TOKEN|>",
+                        "assistant" => "<|CHATBOT_TOKEN|>",
+                        _ => "<|USER_TOKEN|>",
+                    };
+                    prompt.push_str(&format!(
+                        "<|START_OF_TURN_TOKEN|>{}{}<|END_OF_TURN_TOKEN|>",
+                        role_token, msg.content
+                    ));
+                }
+                prompt.push_str("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
+            }
             _ => {
                 for msg in messages {
                     prompt.push_str(&format!("{}: {}\n", msg.role, msg.content));
@@ -136,6 +167,8 @@ pub struct ModelConfig {
     pub intermediate_size: usize,
     pub num_local_experts: Option<usize>,
     pub num_experts_per_tok: Option<usize>,
+    pub kv_lora_rank: Option<usize>,
+    pub qk_rope_head_dim: Option<usize>,
     pub roles: Vec<ModelRole>,
     pub arch: ModelArch,
     pub compression_dtype: Option<ModelDType>,
@@ -168,6 +201,12 @@ impl ModelConfig {
             ModelDType::F16 | ModelDType::BF16 => 2,
         };
 
+        // Multi-head Latent Attention (MLA) Detection
+        if let Some(lora_rank) = self.kv_lora_rank {
+            let rope_dim = self.qk_rope_head_dim.unwrap_or(64);
+            return self.num_layers * (lora_rank + rope_dim) * bytes_per_element;
+        }
+
         (2 * self.num_layers * self.head_dim * self.n_head_kv) * bytes_per_element
     }
 
@@ -182,13 +221,44 @@ impl ModelConfig {
 
         // 1. FFN and Hidden States (scales with physical batch size)
         let activation_memory = (self.n_embd + ffn_size) * ubatch_size * bytes_per_element;
-        // 2. Attention Matrix (scales with physical batch size * context length * n_head)
-        let attention_memory = ubatch_size * self.n_head * self.max_context_len * bytes_per_element;
-        // 3. Static Overhead (Graph nodes, CUDA context, etc.) - safely baseline around 250MB
-        let static_overhead = 250 * 1024 * 1024;
+        // 2. Attention Matrix (Flash Attention / Tiled Computation)
+        // The full [ubatch_size, n_head, max_context_len] matrix is never materialized.
+        // Temporary memory scales closer to the tile size: ubatch_size * n_head * ubatch_size.
+        let attention_memory = ubatch_size * self.n_head * ubatch_size * bytes_per_element;
+        // 3. Static Overhead (Graph nodes, CUDA context, etc.)
+        // Dynamically scale with parameter count (e.g., 150MB base + 15MB per billion params)
+        let static_overhead_mb = 150.0 + (self.parameters_billions * 15.0);
+        let static_overhead = (static_overhead_mb * 1024.0 * 1024.0) as usize;
 
         (activation_memory + attention_memory + static_overhead) as u64
     }
+}
+
+// Detects if a filename is the first chunk of a split GGUF array and generates the full list of files
+pub fn get_split_filenames(first_filename: &str) -> Vec<String> {
+    let pattern = "-00001-of-";
+    if let Some(pos) = first_filename.find(pattern) {
+        let prefix = &first_filename[..pos];
+        let suffix_start = pos + pattern.len();
+        if let Some(end_pos) = first_filename[suffix_start..].find(".gguf") {
+            let total_str = &first_filename[suffix_start..suffix_start + end_pos];
+            if let Ok(total) = total_str.parse::<usize>() {
+                let mut files = Vec::new();
+                let pad = total_str.len();
+                for i in 1..=total {
+                    files.push(format!(
+                        "{}-{:0width$}-of-{}.gguf",
+                        prefix,
+                        i,
+                        total_str,
+                        width = pad
+                    ));
+                }
+                return files;
+            }
+        }
+    }
+    vec![first_filename.to_string()]
 }
 
 #[derive(Default, Clone)]
@@ -207,6 +277,8 @@ struct ModelOverrides {
     pub intermediate_size: Option<usize>,
     pub num_local_experts: Option<usize>,
     pub num_experts_per_tok: Option<usize>,
+    pub kv_lora_rank: Option<usize>,
+    pub qk_rope_head_dim: Option<usize>,
     pub size_on_disk_gb: Option<f32>,
 }
 
@@ -489,6 +561,51 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                 non_layer_params_billions: 1.5,
                 overrides: ModelOverrides::default(),
             },
+            ModelRegistration {
+                id: "deepseek-v3-671b",
+                name: "DeepSeek V3 (671B)",
+                repo: "unsloth/DeepSeek-V3-GGUF",
+                tokenizer_repo: "deepseek-ai/DeepSeek-V3",
+                filename: "DeepSeek-V3-Q4_K_M.gguf",
+                roles: vec![ModelRole::GeneralChat, ModelRole::Reasoning, ModelRole::CodeSpecialist],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 671.0,
+                non_layer_params_billions: 2.5,
+                overrides: ModelOverrides::default(),
+            },
+            ModelRegistration {
+                id: "deepseek-coder-v2-lite",
+                name: "DeepSeek Coder V2 Lite (16B)",
+                repo: "bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+                tokenizer_repo: "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+                filename: "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf",
+                roles: vec![ModelRole::GeneralChat, ModelRole::CodeSpecialist],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 16.0,
+                non_layer_params_billions: 0.5,
+                overrides: ModelOverrides::default(),
+            },
+            ModelRegistration {
+                id: "c4ai-command-r-plus",
+                name: "Command R+ (104B)",
+                repo: "pmysl/c4ai-command-r-plus-GGUF",
+                tokenizer_repo: "CohereForAI/c4ai-command-r-plus",
+                filename: "c4ai-command-r-plus-Q4_K_M.gguf",
+                roles: vec![ModelRole::GeneralChat, ModelRole::ToolCaller],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 104.0,
+                non_layer_params_billions: 1.5,
+                overrides: ModelOverrides::default(),
+            },
         ];
 
         let mut handles = Vec::new();
@@ -515,6 +632,8 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     let mut intermediate_size = reg.overrides.intermediate_size;
                     let mut num_local_experts = reg.overrides.num_local_experts;
                     let mut num_experts_per_tok = reg.overrides.num_experts_per_tok;
+                    let mut kv_lora_rank = reg.overrides.kv_lora_rank;
+                    let mut qk_rope_head_dim = reg.overrides.qk_rope_head_dim;
                     let mut size_on_disk_gb = reg.overrides.size_on_disk_gb;
 
                     let mut check_override = |opt: bool, name: &str| {
@@ -534,21 +653,30 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     check_override(intermediate_size.is_some(), "intermediate_size");
                     check_override(num_local_experts.is_some(), "num_local_experts");
                     check_override(num_experts_per_tok.is_some(), "num_experts_per_tok");
+                    check_override(kv_lora_rank.is_some(), "kv_lora_rank");
+                    check_override(qk_rope_head_dim.is_some(), "qk_rope_head_dim");
                     check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
 
                 let repo = reg.repo;
                 let filename = reg.filename;
-                let cached_meta = if let Some(gguf_path) = hf_cache.repo(hf_hub::Repo::model(repo.to_string())).get(filename) {
-                    tokio::fs::metadata(&gguf_path).await.ok()
-                } else {
-                    None
-                };
 
-                if size_on_disk_gb.is_none()
-                    && let Some(meta) = cached_meta
-                {
-                    size_on_disk_gb = Some(meta.len() as f32 / 1024.0 / 1024.0 / 1024.0);
-                    provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
+                if size_on_disk_gb.is_none() {
+                    let filenames = get_split_filenames(filename);
+                    let mut total_bytes = 0;
+                    let mut all_found = true;
+
+                    for fname in filenames {
+                        if let Some(gguf_path) = hf_cache.repo(hf_hub::Repo::model(repo.to_string())).get(&fname) {
+                            if let Ok(meta) = tokio::fs::metadata(&gguf_path).await {
+                                total_bytes += meta.len();
+                            } else { all_found = false; }
+                        } else { all_found = false; }
+                    }
+
+                    if all_found && total_bytes > 0 {
+                        size_on_disk_gb = Some(total_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
+                        provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
+                    }
                 }
 
                 // 2. Fetch config.json from tokenizer repo to dynamically populate architectural details
@@ -565,7 +693,9 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     || head_dim.is_none()
                     || intermediate_size.is_none()
                     || num_local_experts.is_none()
-                    || num_experts_per_tok.is_none();
+                    || num_experts_per_tok.is_none()
+                    || kv_lora_rank.is_none()
+                    || qk_rope_head_dim.is_none();
 
                 if needs_remote_config {
                     if let Some(api) = &api_opt {
@@ -585,6 +715,8 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                 "num_local_experts",
                                                 "intermediate_size",
                                                 "num_experts_per_tok",
+                                                "kv_lora_rank",
+                                                "qk_rope_head_dim",
                                                 "dtype",
                                                 "torch_dtype",
                                             ]
@@ -629,6 +761,8 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                     "gpt_oss" => Some(ModelArch::GptOss),
                                                     "mistral" | "mixtral" => Some(ModelArch::Mistral),
                                                     "gemma" | "gemma2" | "gemma4_text" => Some(ModelArch::Gemma),
+                                                    "deepseek_v2" | "deepseek_v3" | "deepseek" => Some(ModelArch::Deepseek),
+                                                    "cohere" => Some(ModelArch::Cohere),
                                                     _ => {
                                                     warn!("Unrecognized 'model_type' ({}) in config.json for {}", model_type, reg.id);
                                                         None
@@ -710,6 +844,16 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                 num_experts_per_tok = Some(v);
                                                 provenance.insert("num_experts_per_tok".to_string(), "config.json".to_string());
                                             }
+                                        if kv_lora_rank.is_none()
+                                            && let Some(v) = get_u64("kv_lora_rank") {
+                                                kv_lora_rank = Some(v);
+                                                provenance.insert("kv_lora_rank".to_string(), "config.json".to_string());
+                                            }
+                                        if qk_rope_head_dim.is_none()
+                                            && let Some(v) = get_u64("qk_rope_head_dim") {
+                                                qk_rope_head_dim = Some(v);
+                                                provenance.insert("qk_rope_head_dim".to_string(), "config.json".to_string());
+                                            }
                                         if kv_cache_dtype.is_none() {
                                             if let Some(dt) = get_str("dtype").or_else(|| get_str("torch_dtype")) {
                                                 kv_cache_dtype = match dt.as_str() {
@@ -730,7 +874,14 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                         }
                                     }
                             }
-                        Err(e) => warn!("Failed to fetch config.json for {}: {}", reg.id, e),
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("401") || msg.contains("Unauthorized") {
+                                warn!("Failed to fetch config.json for {}: HTTP 401 Unauthorized. If this is a gated model, make sure you have accepted the license on Hugging Face and set the HF_TOKEN environment variable.", reg.id);
+                            } else {
+                                warn!("Failed to fetch config.json for {}: {}", reg.id, e);
+                            }
+                        }
                         }
                     } else {
                     warn!("HF API not initialized, skipping remote config.json fetch for {}", reg.id);
@@ -740,7 +891,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     let n_head_val = n_head.unwrap_or(1);
                     let n_embd_val = n_embd.unwrap_or(4096);
 
-                    for name in &["arch", "kv_cache_dtype", "max_context_len", "sliding_window", "rope_scaling_factor", "original_max_position_embeddings", "num_layers", "n_embd", "n_head", "n_head_kv", "head_dim", "intermediate_size", "num_local_experts", "num_experts_per_tok", "size_on_disk_gb"] {
+                    for name in &["arch", "kv_cache_dtype", "max_context_len", "sliding_window", "rope_scaling_factor", "original_max_position_embeddings", "num_layers", "n_embd", "n_head", "n_head_kv", "head_dim", "intermediate_size", "num_local_experts", "num_experts_per_tok", "kv_lora_rank", "qk_rope_head_dim", "size_on_disk_gb"] {
                         if !provenance.contains_key(*name) {
                             provenance.insert(name.to_string(), "fallback".to_string());
                         }
@@ -792,6 +943,8 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                         intermediate_size: intermediate_size.unwrap_or(n_embd_val * 4),
                         num_local_experts,
                         num_experts_per_tok,
+                        kv_lora_rank,
+                        qk_rope_head_dim,
                         parameters_billions: reg.parameters_billions,
                         non_layer_params_billions: reg.non_layer_params_billions,
                         size_on_disk_gb: size_on_disk_gb.unwrap_or(fallback_size_gb),
@@ -843,6 +996,8 @@ mod tests {
             intermediate_size: 14336,
             num_local_experts: None,
             num_experts_per_tok: None,
+            kv_lora_rank: None,
+            qk_rope_head_dim: None,
             roles: vec![],
             arch,
             compression_dtype: None,
@@ -914,6 +1069,31 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_formatter_deepseek() {
+        let arch = ModelArch::Deepseek;
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+        }];
+        let prompt = arch.format_chat(&msgs);
+        assert_eq!(prompt, "<｜User｜>Hi<｜Assistant｜>");
+    }
+
+    #[test]
+    fn test_prompt_formatter_cohere() {
+        let arch = ModelArch::Cohere;
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+        }];
+        let prompt = arch.format_chat(&msgs);
+        assert_eq!(
+            prompt,
+            "<|START_OF_TURN_TOKEN|><|USER_TOKEN|>Hi<|END_OF_TURN_TOKEN|><|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"
+        );
+    }
+
+    #[test]
     fn test_prompt_formatter_fallback() {
         let arch = ModelArch::XLMRoberta;
         let msgs = vec![Message {
@@ -957,5 +1137,21 @@ mod tests {
     fn test_estimate_kv_bytes_compressor() {
         let config = mock_config(ModelArch::XLMRoberta, ModelDType::F16);
         assert_eq!(config.estimate_kv_bytes_per_token(), 0); // Context compressors have no generative KV cache
+    }
+
+    #[test]
+    fn test_get_split_filenames() {
+        let single = get_split_filenames("model.gguf");
+        assert_eq!(single, vec!["model.gguf"]);
+
+        let split = get_split_filenames("model-00001-of-00003.gguf");
+        assert_eq!(
+            split,
+            vec![
+                "model-00001-of-00003.gguf",
+                "model-00002-of-00003.gguf",
+                "model-00003-of-00003.gguf"
+            ]
+        );
     }
 }

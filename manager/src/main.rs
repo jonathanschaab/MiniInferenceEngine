@@ -77,6 +77,8 @@ pub struct AppConfig {
     pub gpu_device_index: u32,
     #[serde(default = "default_max_concurrent_downloads")]
     pub max_concurrent_downloads: usize,
+    #[serde(default = "default_max_concurrent_chunk_downloads")]
+    pub max_concurrent_chunk_downloads: usize,
     #[serde(default = "default_telemetry_retention_days")]
     pub telemetry_retention_days: u64,
     #[serde(default = "default_log_level_console")]
@@ -122,6 +124,9 @@ fn default_oauth_userinfo_url() -> String {
 fn default_max_concurrent_downloads() -> usize {
     2
 }
+fn default_max_concurrent_chunk_downloads() -> usize {
+    8
+}
 fn default_telemetry_retention_days() -> u64 {
     30
 }
@@ -147,6 +152,7 @@ impl Default for AppConfig {
             secure_cookies: true,
             gpu_device_index: 0,
             max_concurrent_downloads: default_max_concurrent_downloads(),
+            max_concurrent_chunk_downloads: default_max_concurrent_chunk_downloads(),
             telemetry_retention_days: default_telemetry_retention_days(),
             log_level_console: default_log_level_console(),
             log_level_file: default_log_level_file(),
@@ -172,6 +178,10 @@ impl AppConfig {
                 warn!("max_concurrent_downloads cannot be 0. Enforcing minimum value of 1.");
                 config.max_concurrent_downloads = 1;
             }
+            if config.max_concurrent_chunk_downloads == 0 {
+                warn!("max_concurrent_chunk_downloads cannot be 0. Enforcing minimum value of 1.");
+                config.max_concurrent_chunk_downloads = 1;
+            }
             match toml::to_string_pretty(&config) {
                 Ok(toml_str) => {
                     if let Err(e) = tokio::fs::write(&toml_path, toml_str).await {
@@ -185,6 +195,9 @@ impl AppConfig {
             let mut config = Self::default();
             if config.max_concurrent_downloads == 0 {
                 config.max_concurrent_downloads = 1;
+            }
+            if config.max_concurrent_chunk_downloads == 0 {
+                config.max_concurrent_chunk_downloads = 1;
             }
             match toml::to_string_pretty(&config) {
                 Ok(toml_str) => {
@@ -200,6 +213,10 @@ impl AppConfig {
         if config.max_concurrent_downloads == 0 {
             warn!("max_concurrent_downloads cannot be 0. Enforcing minimum value of 1.");
             config.max_concurrent_downloads = 1;
+        }
+        if config.max_concurrent_chunk_downloads == 0 {
+            warn!("max_concurrent_chunk_downloads cannot be 0. Enforcing minimum value of 1.");
+            config.max_concurrent_chunk_downloads = 1;
         }
 
         config
@@ -631,10 +648,13 @@ pub(crate) async fn cancel_download(
     if let Some(model) = registry.into_iter().find(|m| m.id == id) {
         let downloads_dir =
             manager::types::resolve_absolute_path(&state.config.downloads_directory);
-        let tmp_file_path = downloads_dir.join(format!("{}.tmp", model.filename));
-        let meta_file_path = downloads_dir.join(format!("{}.meta", model.filename));
-        let _ = tokio::fs::remove_file(&tmp_file_path).await;
-        let _ = tokio::fs::remove_file(&meta_file_path).await;
+        let filenames = manager::get_split_filenames(&model.filename);
+        for fname in filenames {
+            let tmp_file_path = downloads_dir.join(format!("{}.tmp", fname));
+            let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
+            let _ = tokio::fs::remove_file(&tmp_file_path).await;
+            let _ = tokio::fs::remove_file(&meta_file_path).await;
+        }
     }
 
     (StatusCode::OK, "Download cancelled").into_response()
@@ -1849,7 +1869,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((used, total, free)) =
                 manager::get_vram_info(nvml.as_ref(), vram_tracker_gpu_idx)
             {
-                s.update_nvml(total, used, free);
+                let proc_vram =
+                    manager::get_engine_process_vram(nvml.as_ref(), vram_tracker_gpu_idx);
+                s.update_nvml(total, used, free, proc_vram);
             }
         }
     });
@@ -1927,7 +1949,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_store = Arc::new(Mutex::new(store));
 
     // Initialize global pooled clients once!
-    let reqwest_client = reqwest::Client::new();
+    let mut reqwest_client_builder = reqwest::Client::builder();
+    if let Ok(token) = std::env::var("HF_TOKEN") {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(auth_value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+        {
+            headers.insert(reqwest::header::AUTHORIZATION, auth_value);
+        }
+        reqwest_client_builder = reqwest_client_builder.default_headers(headers);
+    }
+    let reqwest_client = reqwest_client_builder.build().unwrap_or_default();
     let oauth_client = auth::build_oauth_client(
         &config.oauth_redirect_uri,
         &config.oauth_client_secret_path,
@@ -2866,12 +2897,17 @@ mod tests {
                 axum::response::Response::builder()
                     .header(axum::http::header::CONTENT_LENGTH, "102400")
                     .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
-                    .unwrap()
+                    .expect("Failed to build mock response")
             }),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener
+            .local_addr()
+            .expect("Failed to get local address")
+            .port();
         tokio::spawn(async move {
             let _ = axum::serve(listener, mock_app).await;
         });
@@ -2885,8 +2921,13 @@ mod tests {
         let _ = tokio::fs::create_dir_all(&config.downloads_directory).await;
 
         let (queue_tx, _) = mpsc::channel(1);
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select test namespace and DB");
         let (_, log_reload_handle) =
             tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
@@ -2894,7 +2935,8 @@ mod tests {
         let oauth_client = oauth2::basic::BasicClient::new(
             oauth2::ClientId::new("dummy".to_string()),
             None,
-            oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+            oauth2::AuthUrl::new("http://localhost".to_string())
+                .expect("Failed to parse dummy AuthUrl"),
             None,
         );
 
@@ -2948,8 +2990,15 @@ mod tests {
             .await
             .expect("Meta file should exist after graceful abort");
 
-        let meta_json: serde_json::Value = serde_json::from_str(&meta_content).unwrap();
-        let downloaded = meta_json["downloaded_bytes"].as_u64().unwrap();
+        let meta_json: serde_json::Value =
+            serde_json::from_str(&meta_content).expect("Metadata content should be valid JSON");
+        let downloaded = meta_json["checkpoints"]
+            .as_array()
+            .expect("Metadata should contain a checkpoints array")
+            .last()
+            .expect("Checkpoints array should not be empty")["downloaded_bytes"]
+            .as_u64()
+            .expect("Downloaded bytes should be a valid u64");
 
         assert!(
             downloaded > 0,

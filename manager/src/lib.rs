@@ -32,6 +32,25 @@ pub fn get_vram_info(nvml: Option<&Nvml>, device_index: u32) -> Option<(u64, u64
     Some((info.used, info.total, info.free))
 }
 
+/// Gets the exact VRAM currently allocated specifically to this Rust process.
+pub fn get_engine_process_vram(nvml: Option<&Nvml>, device_index: u32) -> Option<u64> {
+    use nvml_wrapper::enums::device::UsedGpuMemory;
+    let device = nvml?.device_by_index(device_index).ok()?;
+    let current_pid = std::process::id();
+
+    if let Ok(processes) = device.running_compute_processes() {
+        for process in processes {
+            if process.pid == current_pid {
+                return match process.used_gpu_memory {
+                    UsedGpuMemory::Used(bytes) => Some(bytes),
+                    UsedGpuMemory::Unavailable => None,
+                };
+            }
+        }
+    }
+    None
+}
+
 pub async fn wait_for_vram_release(
     nvml: Option<&Nvml>,
     device_index: u32,
@@ -424,7 +443,7 @@ pub async fn run_batcher_loop(
                     0,
                 );
                 if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), gpu_device_index) {
-                    s.update_nvml(total, used, free);
+                    s.update_nvml(total, used, free, None);
                 }
             }
 
@@ -901,7 +920,7 @@ pub async fn run_batcher_loop(
                     0,
                 );
                 if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), gpu_device_index) {
-                    s.update_nvml(total, used, free);
+                    s.update_nvml(total, used, free, None);
                 }
                 // Mark the main chat model as active again now that the compressor is gone
                 s.set_model_status(&active_model_id, "Active");

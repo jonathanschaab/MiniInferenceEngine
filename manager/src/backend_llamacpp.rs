@@ -40,14 +40,13 @@ extern "C" fn llama_log_callback(
 
     // Downgrade harmless, extremely noisy upstream Llama.cpp warnings to DEBUG
     let mut effective_level = level;
-    if level == llama_cpp_sys_2::GGML_LOG_LEVEL_WARN {
-        if msg.contains("was not control-type; this is probably a bug in the model")
+    if level == llama_cpp_sys_2::GGML_LOG_LEVEL_WARN
+        && (msg.contains("was not control-type; this is probably a bug in the model")
             || msg.contains("special_eog_ids contains")
             || msg.contains("the full capacity of the model will not be utilized")
-            || msg.contains("using full-size SWA cache")
-        {
-            effective_level = llama_cpp_sys_2::GGML_LOG_LEVEL_DEBUG;
-        }
+            || msg.contains("using full-size SWA cache"))
+    {
+        effective_level = llama_cpp_sys_2::GGML_LOG_LEVEL_DEBUG;
     }
 
     match effective_level {
@@ -414,7 +413,7 @@ impl LlamaCppEngine {
                                     "Model Weights",
                                     weights_vram as i64,
                                 );
-                                s.update_nvml(vram_total, vram_used_after, vram_free_after);
+                                s.update_nvml(vram_total, vram_used_after, vram_free_after, None);
                             }
 
                             if strategy == MemoryStrategy::Compress {
@@ -478,7 +477,12 @@ impl LlamaCppEngine {
                                     kv_vram,
                                     compute_margin,
                                 );
-                                s.update_nvml(vram_total, vram_used_after_ctx, vram_free_final);
+                                s.update_nvml(
+                                    vram_total,
+                                    vram_used_after_ctx,
+                                    vram_free_final,
+                                    None,
+                                );
                             }
 
                             instance = Some(inst);

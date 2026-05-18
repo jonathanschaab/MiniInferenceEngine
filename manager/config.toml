@@ -9,6 +9,7 @@ user_emails = []
 secure_cookies = false
 gpu_device_index = 0
 max_concurrent_downloads = 2
+max_concurrent_chunk_downloads = 8
 telemetry_retention_days = 30
 log_level_console = "warn"
 log_level_file = "info"

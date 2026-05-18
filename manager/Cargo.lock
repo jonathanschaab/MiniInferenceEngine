@@ -3176,6 +3176,8 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-transformers",
+ "crypto-common 0.2.1",
+ "generic-array 0.14.7",
  "hex",
  "hf-hub",
  "llama-cpp-2",
