@@ -112,11 +112,12 @@ pub async fn perform_model_download(
         if let Ok(meta) = tokio::fs::metadata(&file_path).await {
             shared_downloaded.fetch_add(meta.len(), std::sync::atomic::Ordering::Relaxed);
             grand_total.fetch_add(meta.len(), std::sync::atomic::Ordering::Relaxed);
-            chunk_infos.push((fname.clone(), url, None, true));
+            chunk_infos.push((fname.clone(), url, None, true, meta.len()));
             continue;
         }
 
         let mut remote_sha256 = None;
+        let mut chunk_size = 0;
         let mut backoff = 2;
         loop {
             if let Ok(head_res) = client.head(&url).send().await {
@@ -129,10 +130,22 @@ pub async fn perform_model_download(
                     backoff = (backoff * 2).min(30);
                     continue;
                 }
-                if let Some(cl) = head_res.headers().get(reqwest::header::CONTENT_LENGTH)
+
+                let size_header = head_res
+                    .headers()
+                    .get("X-Linked-Size")
+                    .or_else(|| head_res.headers().get(reqwest::header::CONTENT_LENGTH));
+                if let Some(cl) = size_header
                     && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
                 {
-                    grand_total.fetch_add(s, std::sync::atomic::Ordering::Relaxed);
+                    // Ignore small Content-Length values that represent the 302 redirect body
+                    if !head_res.status().is_redirection()
+                        || s > 10000
+                        || head_res.headers().contains_key("X-Linked-Size")
+                    {
+                        chunk_size = s;
+                        grand_total.fetch_add(s, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 if let Some(etag) = head_res
                     .headers()
@@ -152,11 +165,11 @@ pub async fn perform_model_download(
             }
             break;
         }
-        chunk_infos.push((fname.clone(), url, remote_sha256, false));
+        chunk_infos.push((fname.clone(), url, remote_sha256, false, chunk_size));
     }
 
     // Check if fully completed already
-    if chunk_infos.iter().all(|(_, _, _, done)| *done) {
+    if chunk_infos.iter().all(|(_, _, _, done, _)| *done) {
         let mut status = lock_status(&state.engine_status);
         status.downloaded_models.insert(id.clone());
         return;
@@ -183,7 +196,7 @@ pub async fn perform_model_download(
         state.config.max_concurrent_chunk_downloads,
     ));
 
-    for (chunk_filename, url, remote_sha256, is_already_done) in chunk_infos {
+    for (chunk_filename, url, remote_sha256, is_already_done, chunk_size) in chunk_infos {
         if is_already_done {
             continue;
         }
@@ -209,6 +222,7 @@ pub async fn perform_model_download(
                 shutdown_rx,
                 start_time,
                 initial_shared_downloaded,
+                chunk_size,
             )
             .await
         });
@@ -255,9 +269,14 @@ async fn download_chunk(
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     start_time: std::time::Instant,
     initial_shared_downloaded: u64,
+    known_chunk_size: u64,
 ) -> bool {
     let tmp_file_path = downloads_dir.join(format!("{}.tmp", filename));
     let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
+
+    if let Some(parent) = tmp_file_path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
 
     let (mut existing_size, mut expected_hash, mut is_sha256, mut initial_hasher, mut checkpoints) =
         check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path, &remote_sha256).await;
@@ -288,6 +307,13 @@ async fn download_chunk(
     if !is_partial && existing_size > 0 {
         shared_downloaded.fetch_sub(existing_size, std::sync::atomic::Ordering::Relaxed);
         existing_size = 0;
+    }
+
+    if known_chunk_size == 0
+        && let Some(content_length) = res.content_length()
+    {
+        let actual_chunk_size = existing_size + content_length;
+        grand_total.fetch_add(actual_chunk_size, std::sync::atomic::Ordering::Relaxed);
     }
 
     if existing_size == 0 {
@@ -772,7 +798,10 @@ async fn finalize_download(
     hash_mismatch: bool,
 ) {
     let target_path = if hash_mismatch {
-        file_path.with_file_name(format!("{}.corrupted", filename))
+        file_path.with_file_name(format!(
+            "{}.corrupted",
+            file_path.file_name().unwrap_or_default().to_string_lossy()
+        ))
     } else {
         file_path.to_path_buf()
     };

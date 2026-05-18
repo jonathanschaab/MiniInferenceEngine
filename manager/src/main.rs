@@ -592,10 +592,13 @@ pub(crate) async fn cancel_all_downloads(
         if let Some(model) = registry.into_iter().find(|m| m.id == id) {
             let downloads_dir =
                 manager::types::resolve_absolute_path(&state.config.downloads_directory);
-            let tmp_file_path = downloads_dir.join(format!("{}.tmp", model.filename));
-            let meta_file_path = downloads_dir.join(format!("{}.meta", model.filename));
-            let _ = tokio::fs::remove_file(&tmp_file_path).await;
-            let _ = tokio::fs::remove_file(&meta_file_path).await;
+            let filenames = manager::get_split_filenames(&model.filename);
+            for fname in filenames {
+                let tmp_file_path = downloads_dir.join(format!("{}.tmp", fname));
+                let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
+                let _ = tokio::fs::remove_file(&tmp_file_path).await;
+                let _ = tokio::fs::remove_file(&meta_file_path).await;
+            }
         }
     }
 
@@ -724,15 +727,18 @@ pub(crate) async fn delete_model(
     };
 
     let downloads_dir = manager::types::resolve_absolute_path(&state.config.downloads_directory);
-    let file_path = downloads_dir.join(&model.filename);
-    let tmp_file_path = downloads_dir.join(format!("{}.tmp", model.filename));
-    let meta_file_path = downloads_dir.join(format!("{}.meta", model.filename));
-    let corrupted_path = downloads_dir.join(format!("{}.corrupted", model.filename));
+    let filenames = manager::get_split_filenames(&model.filename);
+    for fname in filenames {
+        let file_path = downloads_dir.join(&fname);
+        let tmp_file_path = downloads_dir.join(format!("{}.tmp", fname));
+        let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
+        let corrupted_path = downloads_dir.join(format!("{}.corrupted", fname));
 
-    let _ = tokio::fs::remove_file(&file_path).await;
-    let _ = tokio::fs::remove_file(&tmp_file_path).await;
-    let _ = tokio::fs::remove_file(&meta_file_path).await;
-    let _ = tokio::fs::remove_file(&corrupted_path).await;
+        let _ = tokio::fs::remove_file(&file_path).await;
+        let _ = tokio::fs::remove_file(&tmp_file_path).await;
+        let _ = tokio::fs::remove_file(&meta_file_path).await;
+        let _ = tokio::fs::remove_file(&corrupted_path).await;
+    }
 
     {
         let mut status = lock_status(&state.engine_status);

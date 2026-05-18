@@ -1,5 +1,4 @@
 use crate::types::Message;
-use hf_hub::api::tokio::Api;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -578,7 +577,22 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                 name: "DeepSeek V3 (671B)",
                 repo: "unsloth/DeepSeek-V3-GGUF",
                 tokenizer_repo: "deepseek-ai/DeepSeek-V3",
-                filename: "DeepSeek-V3-Q4_K_M.gguf",
+            filename: "DeepSeek-V3-Q4_K_M/DeepSeek-V3-Q4_K_M-00001-of-00009.gguf",
+                roles: vec![ModelRole::GeneralChat, ModelRole::Reasoning, ModelRole::CodeSpecialist],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 671.0,
+                non_layer_params_billions: 2.5,
+                overrides: ModelOverrides::default(),
+            },
+            ModelRegistration {
+                id: "deepseek-v3-q2-xs",
+                name: "DeepSeek V3 (671B - Q2_K_XS)",
+                repo: "unsloth/DeepSeek-V3-GGUF",
+                tokenizer_repo: "deepseek-ai/DeepSeek-V3",
+                filename: "DeepSeek-V3-Q2_K_XS/DeepSeek-V3-Q2_K_XS-00001-of-00005.gguf",
                 roles: vec![ModelRole::GeneralChat, ModelRole::Reasoning, ModelRole::CodeSpecialist],
                 compression_dtype: None,
                 supported_backends: vec![BackendType::LlamaCpp],
