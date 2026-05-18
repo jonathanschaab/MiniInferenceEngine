@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
 pub enum ModelDType {
@@ -306,7 +306,19 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
     let registry_lock = REGISTRY.get_or_init(|| async {
         let lock = Arc::new(RwLock::new(Vec::new()));
 
-        let api_opt = Api::new().ok();
+        let mut builder = hf_hub::api::tokio::ApiBuilder::new();
+        if let Ok(token) = std::env::var("HF_TOKEN") {
+            let masked = if token.len() > 4 {
+                format!("{}...", &token[..4])
+            } else {
+                "***".to_string()
+            };
+            info!("Found HF_TOKEN in environment (starts with {}). Applying to registry API client.", masked);
+            builder = builder.with_token(Some(token));
+        } else {
+            debug!("No HF_TOKEN found in environment. Using default HF API client.");
+        }
+        let api_opt = builder.build().ok();
         if api_opt.is_none() {
             warn!("Failed to init HF API. Offline mode fallback active.");
         }
