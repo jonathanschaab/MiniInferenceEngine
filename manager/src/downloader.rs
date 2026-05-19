@@ -81,7 +81,7 @@ pub async fn perform_model_download(
     id: String,
     repo: String,
     filename: String,
-    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let _guard = DownloadCleanupGuard {
         state: state.clone(),
@@ -102,7 +102,7 @@ pub async fn perform_model_download(
 
     let mut client_builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10));
+        .connect_timeout(std::time::Duration::from_secs(10));
 
     if let Ok(token) = std::env::var("HF_TOKEN") {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -112,7 +112,7 @@ pub async fn perform_model_download(
         client_builder = client_builder.default_headers(headers);
     }
 
-    let client = client_builder.build().unwrap_or_default();
+    let download_client = Arc::new(client_builder.build().unwrap_or_default());
 
     let mut chunk_infos = Vec::new();
 
@@ -139,7 +139,7 @@ pub async fn perform_model_download(
         let mut retries = 0;
         const MAX_RETRIES: usize = 5;
         loop {
-            match client.head(&url).send().await {
+            match download_client.head(&url).send().await {
                 Ok(head_res) => {
                     if head_res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         retries += 1;
@@ -154,7 +154,13 @@ pub async fn perform_model_download(
                             "429 Too Many Requests during metadata fetch for {}. Retrying ({}/{}) in {} seconds...",
                             fname, retries, MAX_RETRIES, backoff
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => {}
+                            _ = shutdown_rx.recv() => {
+                                info!("Shutdown signal received during metadata fetch backoff. Aborting.");
+                                return;
+                            }
+                        }
                         backoff = (backoff * 2).min(30);
                         continue;
                     }
@@ -209,9 +215,17 @@ pub async fn perform_model_download(
     }
 
     // Wait in the queue for an available download slot
-    let _permit = match state.download_semaphore.acquire().await {
-        Ok(p) => p,
-        Err(_) => return, // Semaphore closed, safely shutting down
+    let _permit = tokio::select! {
+        permit_res = state.download_semaphore.acquire() => {
+            match permit_res {
+                Ok(p) => p,
+                Err(_) => return, // Semaphore closed, safely shutting down
+            }
+        }
+        _ = shutdown_rx.recv() => {
+            info!("Shutdown signal received while waiting in queue for {}. Aborting.", id);
+            return;
+        }
     };
 
     update_status_connecting(
@@ -234,18 +248,31 @@ pub async fn perform_model_download(
             continue;
         }
         let state = state.clone();
+        let client = download_client.clone();
         let id = id.clone();
         let downloads_dir = downloads_dir.clone();
-        let shutdown_rx = shutdown_rx.resubscribe();
+        let mut shutdown_rx = shutdown_rx.resubscribe();
         let shared_downloaded = shared_downloaded.clone();
         let grand_total = grand_total.clone();
         let sem = chunk_semaphore.clone();
         let active_streams = active_streams.clone();
 
         join_set.spawn(async move {
-            let _permit = sem.acquire_owned().await;
+            let _permit = tokio::select! {
+                res = sem.acquire_owned() => {
+                    match res {
+                        Ok(p) => p,
+                        Err(_) => return false,
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received while waiting for chunk permit. Aborting.");
+                    return false;
+                }
+            };
             download_chunk(
                 state,
+                client,
                 id,
                 url,
                 chunk_filename,
@@ -294,6 +321,7 @@ pub async fn perform_model_download(
 #[allow(clippy::too_many_arguments)]
 async fn download_chunk(
     state: Arc<AppState>,
+    client: Arc<reqwest::Client>,
     id: String,
     url: String,
     filename: String,
@@ -319,15 +347,23 @@ async fn download_chunk(
 
     shared_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
 
-    let mut res =
-        match initiate_request(&state, &url, &id, &mut existing_size, &active_streams).await {
-            Some(r) => r,
-            None => return false,
-        };
+    let (mut res, final_url) = match initiate_request(
+        &client,
+        &url,
+        &id,
+        &mut existing_size,
+        &active_streams,
+        &mut shutdown_rx,
+    )
+    .await
+    {
+        Some(result) => result,
+        None => return false,
+    };
 
     if verify_and_update_etag(
-        &state,
-        &url,
+        &client,
+        &final_url,
         &id,
         &mut res,
         &mut existing_size,
@@ -370,6 +406,7 @@ async fn download_chunk(
 
     let (stream_error, _) = process_download_stream(
         &state,
+        &client,
         &id,
         &mut res,
         &mut file,
@@ -551,32 +588,54 @@ fn update_status_connecting(state: &Arc<AppState>, id: &str, existing_size: u64)
 }
 
 async fn initiate_request(
-    state: &Arc<AppState>,
+    client: &reqwest::Client,
     url: &str,
     id: &str,
     existing_size: &mut u64,
     active_streams: &Arc<std::sync::atomic::AtomicUsize>,
-) -> Option<reqwest::Response> {
-    let client = &state.reqwest_client;
+    shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+) -> Option<(reqwest::Response, String)> {
+    let mut current_url = url.to_string();
     let mut backoff = 5;
     let mut retries = 0;
     const MAX_RETRIES: usize = 5;
+    let mut redirects = 0;
+    const MAX_REDIRECTS: usize = 10;
 
     loop {
-        let mut req = client.get(url);
+        let mut req = client.get(&current_url);
         if *existing_size > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_size));
         }
 
         match req.send().await {
             Ok(r) => {
+                if r.status().is_redirection()
+                    && let Some(location) = r.headers().get(reqwest::header::LOCATION)
+                    && let Ok(new_url) = location.to_str()
+                {
+                    info!("Following redirect for {} to {}", id, new_url);
+                    current_url = new_url.to_string();
+                    redirects += 1;
+                    if redirects > MAX_REDIRECTS {
+                        break;
+                    }
+                    // Don't reset existing_size, let the server decide with RANGE_NOT_SATISFIABLE
+                    continue;
+                }
                 if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     if active_streams.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                         warn!(
                             "Hugging Face rate limit (429) hit for {}. Other chunks are actively downloading, waiting {} seconds...",
                             id, backoff
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => {}
+                            _ = shutdown_rx.recv() => {
+                                info!("Shutdown signal received during request backoff for {}. Aborting.", id);
+                                return None;
+                            }
+                        }
                         backoff = (backoff * 2).min(60);
                         continue;
                     } else {
@@ -592,7 +651,13 @@ async fn initiate_request(
                             "Hugging Face rate limit (429) hit for {}. No active chunks. Retrying ({}/{}) in {} seconds...",
                             id, retries, MAX_RETRIES, backoff
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => {}
+                            _ = shutdown_rx.recv() => {
+                                info!("Shutdown signal received during request backoff for {}. Aborting.", id);
+                                return None;
+                            }
+                        }
                         backoff = (backoff * 2).min(60);
                         continue;
                     }
@@ -603,7 +668,7 @@ async fn initiate_request(
                     error!("Download failed for {} with status: {}", id, r.status());
                     return None;
                 } else {
-                    return Some(r);
+                    return Some((r, current_url));
                 }
             }
             Err(e) => {
@@ -612,11 +677,13 @@ async fn initiate_request(
             }
         }
     }
+    error!("Too many redirects for {}", id);
+    None
 }
 
 async fn verify_and_update_etag(
-    state: &Arc<AppState>,
-    url: &str,
+    client: &reqwest::Client,
+    url: &str, // This is now the final URL
     id: &str,
     res: &mut reqwest::Response,
     existing_size: &mut u64,
@@ -685,7 +752,7 @@ async fn verify_and_update_etag(
         *expected_hash = new_etag.clone();
         *is_sha256 = x_linked_found;
 
-        if let Ok(r) = state.reqwest_client.get(url).send().await {
+        if let Ok(r) = client.get(url).send().await {
             if r.status().is_success() {
                 *res = r;
             } else {
@@ -744,6 +811,7 @@ async fn open_temp_file(
 #[allow(clippy::too_many_arguments)]
 async fn process_download_stream(
     state: &Arc<AppState>,
+    _client: &Arc<reqwest::Client>,
     id: &str,
     res: &mut reqwest::Response,
     file: &mut tokio::fs::File,

@@ -91,13 +91,17 @@ impl PromptFormatter for ModelArch {
                 prompt.push_str("<start_of_turn>model\n");
             }
             ModelArch::Deepseek => {
+                prompt.push_str("<｜begin of sentence｜>");
                 for msg in messages {
                     if msg.role == "system" {
                         prompt.push_str(&format!("{}\n", msg.content));
                     } else if msg.role == "user" {
                         prompt.push_str(&format!("<｜User｜>{}", msg.content));
                     } else if msg.role == "assistant" {
-                        prompt.push_str(&format!("<｜Assistant｜>{}", msg.content));
+                        prompt.push_str(&format!(
+                            "<｜Assistant｜>{}<｜end of sentence｜>",
+                            msg.content
+                        ));
                     } else {
                         prompt.push_str(&format!("{}: {}", msg.role, msg.content));
                     }
@@ -300,6 +304,11 @@ struct ModelRegistration {
 
 static REGISTRY: OnceCell<Arc<RwLock<Vec<ModelConfig>>>> = OnceCell::const_new();
 
+#[derive(Deserialize)]
+struct PartialConfig {
+    downloads_directory: Option<String>,
+}
+
 // Expose the registry so the web server can send it to the UI
 pub async fn get_model_registry() -> Vec<ModelConfig> {
     let registry_lock = REGISTRY.get_or_init(|| async {
@@ -320,6 +329,20 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
         let api_opt = builder.build().ok();
         if api_opt.is_none() {
             warn!("Failed to init HF API. Offline mode fallback active.");
+        }
+
+        let mut downloads_dir = crate::types::resolve_absolute_path("downloads");
+        if let Ok(data) = tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.toml")).await {
+            if let Ok(config) = toml::from_str::<PartialConfig>(&data)
+                && let Some(dir) = config.downloads_directory
+            {
+                downloads_dir = crate::types::resolve_absolute_path(dir);
+            }
+        } else if let Ok(data) = tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.json")).await
+            && let Ok(config) = serde_json::from_str::<PartialConfig>(&data)
+            && let Some(dir) = config.downloads_directory
+        {
+            downloads_dir = crate::types::resolve_absolute_path(dir);
         }
 
         let registrations = vec![
@@ -621,8 +644,8 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                 id: "c4ai-command-r-plus",
                 name: "Command R+ (104B)",
                 repo: "pmysl/c4ai-command-r-plus-GGUF",
-                tokenizer_repo: "CohereForAI/c4ai-command-r-plus",
-                filename: "c4ai-command-r-plus-Q4_K_M.gguf",
+                tokenizer_repo: "CohereLabs/c4ai-command-r-plus",
+                filename: "command-r-plus-Q4_K_M-00001-of-00002.gguf",
                 roles: vec![ModelRole::GeneralChat, ModelRole::ToolCaller],
                 compression_dtype: None,
                 supported_backends: vec![BackendType::LlamaCpp],
@@ -640,6 +663,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
         for reg in registrations {
             let api_opt = api_opt.clone();
             let hf_cache = hf_cache.clone();
+            let downloads_dir = downloads_dir.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut provenance = std::collections::HashMap::new();
@@ -692,7 +716,10 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     let mut all_found = true;
 
                     for fname in &filenames {
-                        if let Some(gguf_path) = hf_cache.repo(hf_hub::Repo::model(repo.to_string())).get(fname) {
+                        let local_path = downloads_dir.join(fname);
+                        if let Ok(meta) = tokio::fs::metadata(&local_path).await {
+                            total_bytes += meta.len();
+                        } else if let Some(gguf_path) = hf_cache.repo(hf_hub::Repo::model(repo.to_string())).get(fname) {
                             if let Ok(meta) = tokio::fs::metadata(&gguf_path).await {
                                 total_bytes += meta.len();
                             } else { all_found = false; }
@@ -1156,7 +1183,7 @@ mod tests {
             content: "Hi".into(),
         }];
         let prompt = arch.format_chat(&msgs);
-        assert_eq!(prompt, "<｜User｜>Hi<｜Assistant｜>");
+        assert_eq!(prompt, "<｜begin of sentence｜><｜User｜>Hi<｜Assistant｜>");
     }
 
     #[test]

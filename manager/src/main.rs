@@ -1981,6 +1981,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let downloads_dir_for_init = manager::types::resolve_absolute_path(&config.downloads_directory)
         .to_string_lossy()
         .to_string();
+    let mut shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
         use notify::Watcher;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<std::path::PathBuf>>();
@@ -2061,6 +2062,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Force a state update in case we missed a directory creation event
                     pending_update = true;
                     pending_paths.clear();
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received. Stopping model registry watcher task.");
+                    break;
                 }
                 _ = debounce_timer.tick() => {
                     if !pending_update && pending_paths.is_empty() && !first_run {
