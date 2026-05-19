@@ -4,9 +4,13 @@ async function fetchWithAuth(url, options = {}) {
     if (!response.ok) {
         if (response.status === 401) {
             window.location.href = '/auth/login';
-            throw new Error('Unauthorized'); // Stop further execution in the caller
+            const err = new Error('Unauthorized');
+            err.status = 401;
+            throw err; // Stop further execution in the caller
         }
-        throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
+        const err = new Error(`HTTP error ${response.status}: ${response.statusText}`);
+        err.status = response.status;
+        throw err;
     }
     return response;
 }
@@ -121,10 +125,10 @@ function downloadModel(modelId, callbacks = {}) {
                         SharedDownloadProgress.clearCache();
                         retryCount = 0;
                     } catch (e) {
-                        if (e.message === 'Unauthorized') throw e;
-                        if (!e.message.includes('409')) {
+                        if (e.status === 401 || e.message === 'Unauthorized') throw e;
+                        if (e.status !== 409) {
                             // Immediately abort on permanent 4xx errors (excluding 409 Conflict and 429 Too Many Requests)
-                            const isPermanent = e.message.match(/HTTP error 4(?!09|29)\d\d/);
+                            const isPermanent = e.status >= 400 && e.status < 500 && e.status !== 429;
                             if (isPermanent) {
                                 if (callbacks.onStatusText) callbacks.onStatusText('Download Failed (Permanent Error).');
                                 throw e;
@@ -193,9 +197,9 @@ function downloadModel(modelId, callbacks = {}) {
                 if (isStopped) {
                     break;
                 }
-                if (e.message === 'Unauthorized') throw e;
+                if (e.status === 401 || e.message === 'Unauthorized') throw e;
                 
-                const isPermanent = e.message.match(/HTTP error 4(?!09|29)\d\d/);
+                const isPermanent = e.status >= 400 && e.status < 500 && e.status !== 409 && e.status !== 429;
                 if (isPermanent) {
                     if (callbacks.onStatusText) callbacks.onStatusText('Download Failed (Permanent Error).');
                     throw e;

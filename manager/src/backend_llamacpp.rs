@@ -299,8 +299,18 @@ impl LlamaCppEngine {
                             let weights_path = if local_weights.exists() {
                                 local_weights
                             } else {
-                                repo.get(&config.filename)
-                                    .map_err(|e| format!("Missing weights: {}", e))?
+                                let filenames =
+                                    crate::registry::get_split_filenames(&config.filename);
+                                let mut first_cached_path = None;
+                                for fname in filenames {
+                                    let cached_path = repo.get(&fname).map_err(|e| {
+                                        format!("Missing weights ({}): {}", fname, e)
+                                    })?;
+                                    if first_cached_path.is_none() {
+                                        first_cached_path = Some(cached_path);
+                                    }
+                                }
+                                first_cached_path.unwrap()
                             };
 
                             let available_vram =

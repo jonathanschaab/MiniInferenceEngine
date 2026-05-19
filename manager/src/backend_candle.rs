@@ -66,9 +66,18 @@ pub async fn load_engine(
         let weights_path = if let Ok(true) = tokio::fs::try_exists(&local_weights).await {
             local_weights
         } else {
-            repo.get(&config.filename)
-                .await
-                .map_err(|e| format!("Missing weights: {}", e))?
+            let filenames = crate::registry::get_split_filenames(&config.filename);
+            let mut first_cached_path = None;
+            for fname in filenames {
+                let cached_path = repo
+                    .get(&fname)
+                    .await
+                    .map_err(|e| format!("Missing weights ({}): {}", fname, e))?;
+                if first_cached_path.is_none() {
+                    first_cached_path = Some(cached_path);
+                }
+            }
+            first_cached_path.unwrap()
         };
         let cache = hf_hub::Cache::default();
         let config_path = if let Some(p) = cache
@@ -135,10 +144,16 @@ pub async fn load_engine(
     let weights_path = if let Ok(true) = tokio::fs::try_exists(&local_weights).await {
         local_weights
     } else {
-        api.model(config.repo.clone())
-            .get(&config.filename)
-            .await
-            .map_err(|e| e.to_string())?
+        let filenames = crate::registry::get_split_filenames(&config.filename);
+        let mut first_cached_path = None;
+        let repo = api.model(config.repo.clone());
+        for fname in filenames {
+            let cached_path = repo.get(&fname).await.map_err(|e| e.to_string())?;
+            if first_cached_path.is_none() {
+                first_cached_path = Some(cached_path);
+            }
+        }
+        first_cached_path.unwrap()
     };
 
     let cache = hf_hub::Cache::default();

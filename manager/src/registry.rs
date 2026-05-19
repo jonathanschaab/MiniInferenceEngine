@@ -691,8 +691,8 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     let mut total_bytes = 0;
                     let mut all_found = true;
 
-                    for fname in filenames {
-                        if let Some(gguf_path) = hf_cache.repo(hf_hub::Repo::model(repo.to_string())).get(&fname) {
+                    for fname in &filenames {
+                        if let Some(gguf_path) = hf_cache.repo(hf_hub::Repo::model(repo.to_string())).get(fname) {
                             if let Ok(meta) = tokio::fs::metadata(&gguf_path).await {
                                 total_bytes += meta.len();
                             } else { all_found = false; }
@@ -702,6 +702,42 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     if all_found && total_bytes > 0 {
                         size_on_disk_gb = Some(total_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
                         provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
+                    } else {
+                        let mut client_builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+                        if let Ok(token) = std::env::var("HF_TOKEN") {
+                            let mut headers = reqwest::header::HeaderMap::new();
+                            if let Ok(auth_val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
+                                headers.insert(reqwest::header::AUTHORIZATION, auth_val);
+                            }
+                            client_builder = client_builder.default_headers(headers);
+                        }
+                        let client = client_builder.build().unwrap_or_default();
+
+                        let mut remote_bytes = 0;
+                        let mut remote_found = true;
+
+                        for fname in &filenames {
+                            let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, fname);
+                            if let Ok(res) = client.head(&url).send().await {
+                                let size_header = res.headers().get("X-Linked-Size").or_else(|| res.headers().get(reqwest::header::CONTENT_LENGTH));
+                                if let Some(cl) = size_header
+                                    && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
+                                {
+                                    remote_bytes += s;
+                                } else {
+                                    remote_found = false;
+                                    break;
+                                }
+                            } else {
+                                remote_found = false;
+                                break;
+                            }
+                        }
+
+                        if remote_found && remote_bytes > 0 {
+                            size_on_disk_gb = Some(remote_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
+                            provenance.insert("size_on_disk_gb".to_string(), "api".to_string());
+                        }
                     }
                 }
 
@@ -910,39 +946,57 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                         }
                         }
                     } else {
-                    warn!("HF API not initialized, skipping remote config.json fetch for {}", reg.id);
+                        warn!("HF API not initialized, skipping remote config.json fetch for {}", reg.id);
                     }
                 }
 
-                    let n_head_val = n_head.unwrap_or(1);
-                    let n_embd_val = n_embd.unwrap_or(4096);
+                let n_head_val = n_head.unwrap_or(1);
+                let n_embd_val = n_embd.unwrap_or(4096);
 
-                    for name in &["arch", "kv_cache_dtype", "max_context_len", "sliding_window", "rope_scaling_factor", "original_max_position_embeddings", "num_layers", "n_embd", "n_head", "n_head_kv", "head_dim", "intermediate_size", "num_local_experts", "num_experts_per_tok", "kv_lora_rank", "qk_rope_head_dim", "size_on_disk_gb"] {
-                        if !provenance.contains_key(*name) {
-                            provenance.insert(name.to_string(), "fallback".to_string());
-                        }
+                for name in &[
+                    "arch",
+                    "kv_cache_dtype",
+                    "max_context_len",
+                    "sliding_window",
+                    "rope_scaling_factor",
+                    "original_max_position_embeddings",
+                    "num_layers",
+                    "n_embd",
+                    "n_head",
+                    "n_head_kv",
+                    "head_dim",
+                    "intermediate_size",
+                    "num_local_experts",
+                    "num_experts_per_tok",
+                    "kv_lora_rank",
+                    "qk_rope_head_dim",
+                    "size_on_disk_gb",
+                ] {
+                    if !provenance.contains_key(*name) {
+                        provenance.insert(name.to_string(), "fallback".to_string());
                     }
+                }
 
-                    let arch_val = arch.unwrap_or(ModelArch::Llama);
-                    let max_context_len_val = max_context_len.unwrap_or(8192);
+                let arch_val = arch.unwrap_or(ModelArch::Llama);
+                let max_context_len_val = max_context_len.unwrap_or(8192);
 
-                    let mut max_yarn_context = max_context_len_val;
-                    if arch_val == ModelArch::Qwen2 {
-                        if let Some(sw) = sliding_window {
-                            max_yarn_context = max_yarn_context.max(sw);
-                        }
-                    } else if let (Some(factor), Some(orig_ctx)) = (rope_scaling_factor, original_max_position_embeddings) {
-                        let scaled_ctx = (orig_ctx as f32 * factor) as usize;
-                        max_yarn_context = max_yarn_context.max(scaled_ctx);
+                let mut max_yarn_context = max_context_len_val;
+                if arch_val == ModelArch::Qwen2 {
+                    if let Some(sw) = sliding_window {
+                        max_yarn_context = max_yarn_context.max(sw);
                     }
+                } else if let (Some(factor), Some(orig_ctx)) = (rope_scaling_factor, original_max_position_embeddings) {
+                    let scaled_ctx = (orig_ctx as f32 * factor) as usize;
+                    max_yarn_context = max_yarn_context.max(scaled_ctx);
+                }
 
-                    let fallback_size_gb = match reg.compression_dtype {
-                        Some(ModelDType::F32) => reg.parameters_billions * 4.0,
-                        Some(ModelDType::F16) | Some(ModelDType::BF16) => reg.parameters_billions * 2.0,
-                        None => reg.parameters_billions * 0.65, // Assume typical Q4_K_M GGUF
-                    };
+                let fallback_size_gb = match reg.compression_dtype {
+                    Some(ModelDType::F32) => reg.parameters_billions * 4.0,
+                    Some(ModelDType::F16) | Some(ModelDType::BF16) => reg.parameters_billions * 2.0,
+                    None => reg.parameters_billions * 0.65, // Assume typical Q4_K_M GGUF
+                };
 
-                    ModelConfig {
+                ModelConfig {
                         id: reg.id.to_string(),
                         name: reg.name.to_string(),
                         repo: reg.repo.to_string(),

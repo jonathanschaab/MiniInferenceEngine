@@ -477,9 +477,12 @@ pub(crate) async fn trigger_download(
     }
 
     let downloads_dir = manager::types::resolve_absolute_path(&state.config.downloads_directory);
-    let corrupted_path = downloads_dir.join(format!("{}.corrupted", model.filename));
-    if let Ok(true) = tokio::fs::try_exists(&corrupted_path).await {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "A corrupted download for this model already exists on disk. Please contact an admin to verify it or delete the model to try again.").into_response();
+    let filenames = manager::get_split_filenames(&model.filename);
+    for fname in filenames {
+        let corrupted_path = downloads_dir.join(format!("{}.corrupted", fname));
+        if let Ok(true) = tokio::fs::try_exists(&corrupted_path).await {
+            return (StatusCode::UNPROCESSABLE_ENTITY, "A corrupted download for this model already exists on disk. Please contact an admin to verify it or delete the model to try again.").into_response();
+        }
     }
 
     {
@@ -2095,28 +2098,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 models_clone
                             } else {
                                 models_clone.into_iter().filter(|m| {
-                                    let local_path = abs_downloads_dir.join(&m.filename);
-                                    let corrupted_path = abs_downloads_dir.join(format!("{}.corrupted", m.filename));
+                        let filenames = manager::get_split_filenames(&m.filename);
                                     let repo_path = cache.path().join(format!("models--{}", m.repo.replace('/', "--")));
 
                                     abs_paths_to_check.iter().any(|p| {
-                                        p == &local_path || p == &corrupted_path || p.starts_with(&repo_path)
+                            p.starts_with(&repo_path) || filenames.iter().any(|f| {
+                                p == &abs_downloads_dir.join(f) || p == &abs_downloads_dir.join(format!("{}.corrupted", f))
+                            })
                                     })
                                 }).collect::<Vec<_>>()
                             };
 
                             let mut results = Vec::new();
                             for model in models_to_check {
-                                let local_path = abs_downloads_dir.join(&model.filename);
-                                let corrupted_path = abs_downloads_dir.join(format!("{}.corrupted", model.filename));
-                                let is_in_hf_cache = cache
-                                    .repo(hf_hub::Repo::model(model.repo.clone()))
-                                    .get(&model.filename)
-                                    .is_some();
+                    let filenames = manager::get_split_filenames(&model.filename);
+                    let mut is_downloaded = true;
+                    let mut is_cached = true;
+                    let mut is_corrupted = false;
 
-                                let is_cached = is_in_hf_cache;
-                                let is_downloaded = local_path.exists() || is_in_hf_cache;
-                                let is_corrupted = corrupted_path.exists();
+                    for fname in &filenames {
+                        let local_path = abs_downloads_dir.join(fname);
+                        let corrupted_path = abs_downloads_dir.join(format!("{}.corrupted", fname));
+
+                        let is_in_hf_cache = cache
+                            .repo(hf_hub::Repo::model(model.repo.clone()))
+                            .get(fname)
+                            .is_some();
+
+                        if !is_in_hf_cache { is_cached = false; }
+                        if !local_path.exists() && !is_in_hf_cache { is_downloaded = false; }
+                        if corrupted_path.exists() { is_corrupted = true; }
+                    }
 
                                 results.push((model.id, is_downloaded, is_cached, is_corrupted));
                             }

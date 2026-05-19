@@ -40,6 +40,22 @@ fn deserialize_hasher(hex_str: &str) -> Option<Sha256> {
     Sha256::deserialize(&state).ok()
 }
 
+struct ActiveStreamGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl ActiveStreamGuard {
+    fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { counter }
+    }
+}
+impl Drop for ActiveStreamGuard {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub struct DownloadCleanupGuard {
     state: Arc<AppState>,
     id: String,
@@ -82,6 +98,7 @@ pub async fn perform_model_download(
     let files = manager::get_split_filenames(&filename);
     let shared_downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let grand_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let active_streams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let mut client_builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -119,48 +136,64 @@ pub async fn perform_model_download(
         let mut remote_sha256 = None;
         let mut chunk_size = 0;
         let mut backoff = 2;
+        let mut retries = 0;
+        const MAX_RETRIES: usize = 5;
         loop {
-            if let Ok(head_res) = client.head(&url).send().await {
-                if head_res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    warn!(
-                        "429 Too Many Requests during metadata fetch for {}. Retrying in {} seconds...",
-                        fname, backoff
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(30);
-                    continue;
-                }
+            match client.head(&url).send().await {
+                Ok(head_res) => {
+                    if head_res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        retries += 1;
+                        if retries > MAX_RETRIES {
+                            error!(
+                                "Max retries reached for 429 Too Many Requests during metadata fetch for {}. Aborting.",
+                                fname
+                            );
+                            return;
+                        }
+                        warn!(
+                            "429 Too Many Requests during metadata fetch for {}. Retrying ({}/{}) in {} seconds...",
+                            fname, retries, MAX_RETRIES, backoff
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        backoff = (backoff * 2).min(30);
+                        continue;
+                    }
 
-                let size_header = head_res
-                    .headers()
-                    .get("X-Linked-Size")
-                    .or_else(|| head_res.headers().get(reqwest::header::CONTENT_LENGTH));
-                if let Some(cl) = size_header
-                    && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
-                {
-                    // Ignore small Content-Length values that represent the 302 redirect body
-                    if !head_res.status().is_redirection()
-                        || s > 10000
-                        || head_res.headers().contains_key("X-Linked-Size")
+                    let size_header = head_res
+                        .headers()
+                        .get("X-Linked-Size")
+                        .or_else(|| head_res.headers().get(reqwest::header::CONTENT_LENGTH));
+                    if let Some(cl) = size_header
+                        && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
                     {
-                        chunk_size = s;
-                        grand_total.fetch_add(s, std::sync::atomic::Ordering::Relaxed);
+                        // Ignore small Content-Length values that represent the 302 redirect body
+                        if !head_res.status().is_redirection()
+                            || s > 10000
+                            || head_res.headers().contains_key("X-Linked-Size")
+                        {
+                            chunk_size = s;
+                            grand_total.fetch_add(s, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    if let Some(etag) = head_res
+                        .headers()
+                        .get("X-Linked-Etag")
+                        .or_else(|| head_res.headers().get("ETag"))
+                        && let Ok(etag_str) = etag.to_str()
+                    {
+                        let clean_etag = etag_str
+                            .strip_prefix("W/")
+                            .unwrap_or(etag_str)
+                            .trim_matches('"');
+                        if clean_etag.len() == 64
+                            && clean_etag.chars().all(|c| c.is_ascii_hexdigit())
+                        {
+                            remote_sha256 = Some(clean_etag.to_string());
+                        }
                     }
                 }
-                if let Some(etag) = head_res
-                    .headers()
-                    .get("X-Linked-Etag")
-                    .or_else(|| head_res.headers().get("ETag"))
-                {
-                    let clean_etag = etag
-                        .to_str()
-                        .unwrap_or("")
-                        .trim_matches('"')
-                        .strip_prefix("W/")
-                        .unwrap_or_else(|| etag.to_str().unwrap_or("").trim_matches('"'));
-                    if clean_etag.len() == 64 && clean_etag.chars().all(|c| c.is_ascii_hexdigit()) {
-                        remote_sha256 = Some(clean_etag.to_string());
-                    }
+                Err(e) => {
+                    warn!("Failed to fetch metadata for {}: {}", fname, e);
                 }
             }
             break;
@@ -207,6 +240,7 @@ pub async fn perform_model_download(
         let shared_downloaded = shared_downloaded.clone();
         let grand_total = grand_total.clone();
         let sem = chunk_semaphore.clone();
+        let active_streams = active_streams.clone();
 
         join_set.spawn(async move {
             let _permit = sem.acquire_owned().await;
@@ -223,6 +257,7 @@ pub async fn perform_model_download(
                 start_time,
                 initial_shared_downloaded,
                 chunk_size,
+                active_streams,
             )
             .await
         });
@@ -270,6 +305,7 @@ async fn download_chunk(
     start_time: std::time::Instant,
     initial_shared_downloaded: u64,
     known_chunk_size: u64,
+    active_streams: Arc<std::sync::atomic::AtomicUsize>,
 ) -> bool {
     let tmp_file_path = downloads_dir.join(format!("{}.tmp", filename));
     let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
@@ -283,10 +319,11 @@ async fn download_chunk(
 
     shared_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
 
-    let mut res = match initiate_request(&state, &url, &id, &mut existing_size).await {
-        Some(r) => r,
-        None => return false,
-    };
+    let mut res =
+        match initiate_request(&state, &url, &id, &mut existing_size, &active_streams).await {
+            Some(r) => r,
+            None => return false,
+        };
 
     if verify_and_update_etag(
         &state,
@@ -347,6 +384,7 @@ async fn download_chunk(
         grand_total,
         start_time,
         initial_shared_downloaded,
+        active_streams,
     )
     .await;
 
@@ -517,9 +555,12 @@ async fn initiate_request(
     url: &str,
     id: &str,
     existing_size: &mut u64,
+    active_streams: &Arc<std::sync::atomic::AtomicUsize>,
 ) -> Option<reqwest::Response> {
     let client = &state.reqwest_client;
     let mut backoff = 5;
+    let mut retries = 0;
+    const MAX_RETRIES: usize = 5;
 
     loop {
         let mut req = client.get(url);
@@ -530,13 +571,31 @@ async fn initiate_request(
         match req.send().await {
             Ok(r) => {
                 if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                    warn!(
-                        "Hugging Face rate limit (429) hit for {}. Retrying in {} seconds...",
-                        id, backoff
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    backoff = (backoff * 2).min(60);
-                    continue;
+                    if active_streams.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        warn!(
+                            "Hugging Face rate limit (429) hit for {}. Other chunks are actively downloading, waiting {} seconds...",
+                            id, backoff
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        backoff = (backoff * 2).min(60);
+                        continue;
+                    } else {
+                        retries += 1;
+                        if retries > MAX_RETRIES {
+                            error!(
+                                "Max retries reached for 429 Too Many Requests on {}. Aborting.",
+                                id
+                            );
+                            return None;
+                        }
+                        warn!(
+                            "Hugging Face rate limit (429) hit for {}. No active chunks. Retrying ({}/{}) in {} seconds...",
+                            id, retries, MAX_RETRIES, backoff
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        backoff = (backoff * 2).min(60);
+                        continue;
+                    }
                 } else if r.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
                     *existing_size = 0;
                     continue; // Loop will retry without the RANGE header
@@ -699,7 +758,10 @@ async fn process_download_stream(
     grand_total: Arc<std::sync::atomic::AtomicU64>,
     start_time: std::time::Instant,
     initial_shared_downloaded: u64,
+    active_streams: Arc<std::sync::atomic::AtomicUsize>,
 ) -> (bool, u64) {
+    let _active_guard = ActiveStreamGuard::new(active_streams);
+
     let mut downloaded: u64 = existing_size;
     let mut stream_error = false;
     let mut last_meta_save = std::time::Instant::now();

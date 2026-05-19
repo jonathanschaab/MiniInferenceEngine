@@ -129,6 +129,13 @@ async function discoverActiveDownloads() {
             if (!activeDownloads.has(id)) {
                 const card = document.getElementById(`model-card-${id}`);
                 if (card) { // Check if the model card is rendered on the page
+                    // Prevent duplicate progress containers if one already exists
+                    const existingProgress = card.querySelector('.download-progress-container');
+                    if (existingProgress) {
+                        existingProgress.remove();
+                    }
+                    const dlBtn = card.querySelector('.btn-download');
+                    if (dlBtn) dlBtn.style.display = 'none';
                     startDownload(id); // This will create the UI and start the poller via downloadModel
                 }
             }
@@ -169,9 +176,9 @@ async function startDownload(modelId) {
             rightCol.prepend(progressDiv);
         } else {
             const cancelBtn = progressDiv.querySelector('.dl-cancel-btn');
-            if (cancelBtn) cancelBtn.style.display = 'block';
+            if (cancelBtn) cancelBtn.style.display = 'inline-block';
             const pauseBtn = progressDiv.querySelector('.dl-pause-btn');
-            if (pauseBtn) pauseBtn.style.display = 'block';
+            if (pauseBtn) pauseBtn.style.display = 'inline-block';
         }
     }
 
