@@ -112,7 +112,16 @@ pub async fn perform_model_download(
         client_builder = client_builder.default_headers(headers);
     }
 
-    let download_client = Arc::new(client_builder.build().unwrap_or_default());
+    let download_client = match client_builder.build() {
+        Ok(client) => Arc::new(client),
+        Err(e) => {
+            error!(
+                "Failed to build reqwest client for downloader (model {}): {}",
+                id, e
+            );
+            return;
+        }
+    };
 
     let mut chunk_infos = Vec::new();
 

@@ -1967,7 +1967,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         reqwest_client_builder = reqwest_client_builder.default_headers(headers);
     }
-    let reqwest_client = reqwest_client_builder.build().unwrap_or_default();
+    let reqwest_client = reqwest_client_builder.build()?;
     let oauth_client = auth::build_oauth_client(
         &config.oauth_redirect_uri,
         &config.oauth_client_secret_path,

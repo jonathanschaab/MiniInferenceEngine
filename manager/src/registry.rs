@@ -307,6 +307,7 @@ static REGISTRY: OnceCell<Arc<RwLock<Vec<ModelConfig>>>> = OnceCell::const_new()
 #[derive(Deserialize)]
 struct PartialConfig {
     downloads_directory: Option<String>,
+    hf_base_url: Option<String>,
 }
 
 // Expose the registry so the web server can send it to the UI
@@ -314,7 +315,30 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
     let registry_lock = REGISTRY.get_or_init(|| async {
         let lock = Arc::new(RwLock::new(Vec::new()));
 
-        let mut builder = hf_hub::api::tokio::ApiBuilder::new();
+        let mut downloads_dir = crate::types::resolve_absolute_path("downloads");
+        let mut hf_base_url = "https://huggingface.co".to_string();
+
+        if let Ok(data) = tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.toml")).await
+            && let Ok(config) = toml::from_str::<PartialConfig>(&data)
+        {
+            if let Some(dir) = config.downloads_directory {
+                downloads_dir = crate::types::resolve_absolute_path(dir);
+            }
+            if let Some(url) = config.hf_base_url {
+                hf_base_url = url;
+            }
+        } else if let Ok(data) = tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.json")).await
+            && let Ok(config) = serde_json::from_str::<PartialConfig>(&data)
+        {
+            if let Some(dir) = config.downloads_directory {
+                downloads_dir = crate::types::resolve_absolute_path(dir);
+            }
+            if let Some(url) = config.hf_base_url {
+                hf_base_url = url;
+            }
+        }
+
+        let mut builder = hf_hub::api::tokio::ApiBuilder::new().with_endpoint(hf_base_url.clone());
         if let Ok(token) = std::env::var("HF_TOKEN") {
             let masked = if token.len() > 4 {
                 format!("{}...", &token[..4])
@@ -329,20 +353,6 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
         let api_opt = builder.build().ok();
         if api_opt.is_none() {
             warn!("Failed to init HF API. Offline mode fallback active.");
-        }
-
-        let mut downloads_dir = crate::types::resolve_absolute_path("downloads");
-        if let Ok(data) = tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.toml")).await {
-            if let Ok(config) = toml::from_str::<PartialConfig>(&data)
-                && let Some(dir) = config.downloads_directory
-            {
-                downloads_dir = crate::types::resolve_absolute_path(dir);
-            }
-        } else if let Ok(data) = tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.json")).await
-            && let Ok(config) = serde_json::from_str::<PartialConfig>(&data)
-            && let Some(dir) = config.downloads_directory
-        {
-            downloads_dir = crate::types::resolve_absolute_path(dir);
         }
 
         let registrations = vec![
@@ -655,6 +665,21 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                 non_layer_params_billions: 1.5,
                 overrides: ModelOverrides::default(),
             },
+            ModelRegistration {
+                id: "deepseek-v4-pro-q2-k-xl",
+                name: "DeepSeek V4 Pro (Q2_K-XL)",
+                repo: "teamblobfish/DeepSeek-V4-Pro-GGUF",
+                tokenizer_repo: "deepseek-ai/DeepSeek-V4-Pro",
+                filename: "Q2_K-XL/DeepSeek-V4-Pro-Q2_K-XL-00001-of-00013.gguf",
+                roles: vec![ModelRole::GeneralChat, ModelRole::Reasoning, ModelRole::CodeSpecialist],
+                compression_dtype: None,
+                supported_backends: vec![BackendType::LlamaCpp],
+                is_default_chat: false,
+                is_default_compressor: false,
+                parameters_billions: 1600.0,
+                non_layer_params_billions: 2.5,
+                overrides: ModelOverrides::default(),
+            },
         ];
 
         let mut handles = Vec::new();
@@ -664,6 +689,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
             let api_opt = api_opt.clone();
             let hf_cache = hf_cache.clone();
             let downloads_dir = downloads_dir.clone();
+            let hf_base_url = hf_base_url.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut provenance = std::collections::HashMap::new();
@@ -738,32 +764,36 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                             }
                             client_builder = client_builder.default_headers(headers);
                         }
-                        let client = client_builder.build().unwrap_or_default();
 
-                        let mut remote_bytes = 0;
-                        let mut remote_found = true;
+                        match client_builder.build() {
+                            Ok(client) => {
+                                let mut remote_bytes = 0;
+                                let mut remote_found = true;
 
-                        for fname in &filenames {
-                            let url = format!("https://huggingface.co/{}/resolve/main/{}", repo, fname);
-                            if let Ok(res) = client.head(&url).send().await {
-                                let size_header = res.headers().get("X-Linked-Size").or_else(|| res.headers().get(reqwest::header::CONTENT_LENGTH));
-                                if let Some(cl) = size_header
-                                    && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
-                                {
-                                    remote_bytes += s;
-                                } else {
-                                    remote_found = false;
-                                    break;
+                                for fname in &filenames {
+                                    let url = format!("{}/{}/resolve/main/{}", hf_base_url.trim_end_matches('/'), repo, fname);
+                                    if let Ok(res) = client.head(&url).send().await {
+                                        let size_header = res.headers().get("X-Linked-Size").or_else(|| res.headers().get(reqwest::header::CONTENT_LENGTH));
+                                        if let Some(cl) = size_header
+                                            && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
+                                        {
+                                            remote_bytes += s;
+                                        } else {
+                                            remote_found = false;
+                                            break;
+                                        }
+                                    } else {
+                                        remote_found = false;
+                                        break;
+                                    }
                                 }
-                            } else {
-                                remote_found = false;
-                                break;
-                            }
-                        }
 
-                        if remote_found && remote_bytes > 0 {
-                            size_on_disk_gb = Some(remote_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
-                            provenance.insert("size_on_disk_gb".to_string(), "api".to_string());
+                                if remote_found && remote_bytes > 0 {
+                                    size_on_disk_gb = Some(remote_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
+                                    provenance.insert("size_on_disk_gb".to_string(), "api".to_string());
+                                }
+                            }
+                            Err(e) => warn!("Failed to build reqwest client for size check of {}: {}", reg.id, e),
                         }
                     }
                 }
@@ -850,7 +880,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                     "gpt_oss" => Some(ModelArch::GptOss),
                                                     "mistral" | "mixtral" => Some(ModelArch::Mistral),
                                                     "gemma" | "gemma2" | "gemma4_text" => Some(ModelArch::Gemma),
-                                                    "deepseek_v2" | "deepseek_v3" | "deepseek" => Some(ModelArch::Deepseek),
+                                                    "deepseek_v2" | "deepseek_v3" | "deepseek_v4" | "deepseek" => Some(ModelArch::Deepseek),
                                                     "cohere" => Some(ModelArch::Cohere),
                                                     _ => {
                                                     warn!("Unrecognized 'model_type' ({}) in config.json for {}", model_type, reg.id);
