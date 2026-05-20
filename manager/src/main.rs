@@ -274,6 +274,11 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
 pub type LogReloadHandle =
     tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
 
+pub type DownloadTaskInfo = (
+    tokio::sync::broadcast::Sender<()>,
+    tokio::task::JoinHandle<()>,
+);
+
 // State to share the transmitter queue across web requests
 pub struct AppState {
     pub queue_tx: mpsc::Sender<UserRequest>,
@@ -287,7 +292,7 @@ pub struct AppState {
     pub log_reload_handle: LogReloadHandle,
     pub current_log_level: Arc<Mutex<String>>,
     pub active_downloads: Arc<Mutex<std::collections::HashMap<String, DownloadStatus>>>,
-    pub download_tasks: Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
+    pub download_tasks: Arc<Mutex<std::collections::HashMap<String, DownloadTaskInfo>>>,
     pub download_semaphore: Arc<tokio::sync::Semaphore>,
     pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -513,17 +518,25 @@ pub(crate) async fn trigger_download(
     let repo = model.repo.clone();
     let filename = model.filename.clone();
     let shutdown_rx = state.shutdown_tx.subscribe();
+    let (cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(16);
 
     let task = tokio::spawn(async move {
-        downloader::perform_model_download(state_clone, id_clone, repo, filename, shutdown_rx)
-            .await;
+        downloader::perform_model_download(
+            state_clone,
+            id_clone,
+            repo,
+            filename,
+            shutdown_rx,
+            cancel_rx,
+        )
+        .await;
     });
 
     state
         .download_tasks
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(id.clone(), task);
+        .insert(id.clone(), (cancel_tx, task));
 
     (StatusCode::ACCEPTED, format!("Download started for {}", id)).into_response()
 }
@@ -550,8 +563,8 @@ pub(crate) async fn pause_download(
         tasks.remove(&id)
     };
 
-    if let Some(task) = download_task {
-        task.abort();
+    if let Some((cancel_tx, task)) = download_task {
+        let _ = cancel_tx.send(()); // Trigger graceful checkpoint and exit
         let _ = task.await; // Wait for the task to finish cancelling
         info!("Aborted active download task for model {} (Paused)", id);
 
@@ -587,8 +600,8 @@ pub(crate) async fn cancel_all_downloads(
         tasks.drain().collect()
     };
 
-    for (id, task) in tasks_to_abort {
-        task.abort();
+    for (id, (cancel_tx, task)) in tasks_to_abort {
+        let _ = cancel_tx.send(());
         let _ = task.await; // Guard cleans up active_downloads automatically
 
         let registry = manager::get_model_registry().await;
@@ -647,8 +660,8 @@ pub(crate) async fn cancel_download(
         tasks.remove(&id)
     };
 
-    if let Some(task) = download_task {
-        task.abort();
+    if let Some((cancel_tx, task)) = download_task {
+        let _ = cancel_tx.send(());
         let _ = task.await; // Wait for the task to finish cancelling
         info!("Aborted active download task for model {}", id);
     } else {
@@ -710,8 +723,8 @@ pub(crate) async fn delete_model(
         tasks.remove(&id)
     };
 
-    if let Some(task) = download_task {
-        task.abort();
+    if let Some((cancel_tx, task)) = download_task {
+        let _ = cancel_tx.send(());
         let _ = task.await; // Wait for the task to finish cancelling
         info!("Aborted active download task for model {}", id);
 
@@ -2938,16 +2951,24 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
         // 2. Insert dummy tasks into the queue/active state
-        let task1 = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let (tx1, mut rx1) = tokio::sync::broadcast::channel(1);
+        let (tx2, mut rx2) = tokio::sync::broadcast::channel(1);
+        let task1 = tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                _ = rx1.recv() => {}
+            }
         });
-        let task2 = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let task2 = tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                _ = rx2.recv() => {}
+            }
         });
         {
             let mut tasks = state.download_tasks.lock().unwrap();
-            tasks.insert("model1".to_string(), task1);
-            tasks.insert("model2".to_string(), task2);
+            tasks.insert("model1".to_string(), (tx1, task1));
+            tasks.insert("model2".to_string(), (tx2, task2));
         }
 
         // 3. Admin request should successfully cancel and drain all tasks
@@ -2965,14 +2986,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_shutdown_signal_flushes_download_metadata() {
+        // Initialize a logger to capture output from the mock server and downloader
+        // This will only show up if the test fails.
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
         use axum::Router;
-        use axum::routing::get;
         use tokio_stream::wrappers::ReceiverStream;
 
         // 1. Create a mock server that slowly streams data
         let mock_app = Router::new().route(
             "/{*path}",
-            get(|| async {
+            axum::routing::any(|req: axum::extract::Request| async move {
+                tracing::info!(
+                    "Mock server received {} request to {}",
+                    req.method(),
+                    req.uri()
+                );
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
                 tokio::spawn(async move {
                     for _ in 0..100 {
@@ -2984,6 +3012,7 @@ mod tests {
                             .await
                             .is_err()
                         {
+                            tracing::info!("Mock server: client disconnected");
                             break;
                         }
                     }
@@ -3058,20 +3087,51 @@ mod tests {
         // 3. Spawn the model downloader
         let state_clone = state.clone();
         let task = tokio::spawn(async move {
+            let (_cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(1);
             downloader::perform_model_download(
                 state_clone,
                 "test-model".to_string(),
                 "test/repo".to_string(),
                 "model.safetensors".to_string(),
                 shutdown_rx,
+                cancel_rx,
             )
             .await;
         });
 
-        // Let it connect and download a chunk or two
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // Let it connect and download a chunk or two, using a polling loop to avoid race conditions
+        let tmp_path =
+            manager::types::resolve_absolute_path("test_downloads_shutdown/model.safetensors.tmp");
+        let mut downloaded_bytes = 0;
+        for i in 0..50 {
+            if let Ok(meta) = tokio::fs::metadata(&tmp_path).await {
+                if meta.len() > 0 {
+                    downloaded_bytes = meta.len();
+                    tracing::info!(
+                        "Test: tmp file created and has {} bytes. Breaking loop.",
+                        downloaded_bytes
+                    );
+                    // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    break;
+                }
+            }
+            if i % 10 == 0 {
+                tracing::info!(
+                    "Test: waiting for tmp file to receive bytes... (attempt {})",
+                    i
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            downloaded_bytes > 0,
+            "Test timed out waiting for the download to start receiving bytes."
+        );
 
         // 4. Fire shutdown signal!
+        tracing::info!("Test: Firing shutdown signal.");
         let _ = shutdown_tx.send(());
 
         // Wait for cancellation to forcibly exit the task
@@ -3105,5 +3165,187 @@ mod tests {
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all("test_downloads_shutdown").await;
+    }
+
+    #[tokio::test]
+    async fn test_cancel_download_flushes_metadata() {
+        // Initialize a logger to capture output from the mock server and downloader
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        use axum::Router;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        // 1. Create a mock server that slowly streams data
+        let mock_app = Router::new().route(
+            "/{*path}",
+            axum::routing::any(|req: axum::extract::Request| async move {
+                tracing::info!(
+                    "Mock server received {} request to {}",
+                    req.method(),
+                    req.uri()
+                );
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move {
+                    for _ in 0..100 {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        if tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 1024],
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            tracing::info!("Mock server: client disconnected");
+                            break;
+                        }
+                    }
+                });
+                axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "102400")
+                    .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+                    .expect("Failed to build mock response")
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener
+            .local_addr()
+            .expect("Failed to get local address")
+            .port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        // 2. Setup isolated AppState configured to point to our mock server
+        let config = AppConfig {
+            hf_base_url: format!("http://127.0.0.1:{}", port),
+            downloads_directory: "test_downloads_cancel".to_string(),
+            ..Default::default()
+        };
+        let _ = tokio::fs::create_dir_all(&config.downloads_directory).await;
+
+        let (queue_tx, _) = mpsc::channel(1);
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select test namespace and DB");
+        let (_, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
+
+        let oauth_client = oauth2::basic::BasicClient::new(
+            oauth2::ClientId::new("dummy".to_string()),
+            None,
+            oauth2::AuthUrl::new("http://localhost".to_string())
+                .expect("Failed to parse dummy AuthUrl"),
+            None,
+        );
+
+        let state = Arc::new(AppState {
+            queue_tx,
+            engine_status: Arc::new(Mutex::new(EngineStatus::default())),
+            telemetry: Arc::new(Mutex::new(TelemetryStore::default())),
+            auth_store: Arc::new(Mutex::new(AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client,
+            config: Arc::new(config),
+            log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle,
+            current_log_level: Arc::new(Mutex::new("info".to_string())),
+            active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            db,
+            shutdown_tx: shutdown_tx.clone(),
+        });
+
+        // 3. Spawn the model downloader
+        let state_clone = state.clone();
+        let (cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(16);
+        let task = tokio::spawn(async move {
+            downloader::perform_model_download(
+                state_clone,
+                "test-model-cancel".to_string(),
+                "test/repo-cancel".to_string(),
+                "model.safetensors".to_string(),
+                shutdown_rx,
+                cancel_rx,
+            )
+            .await;
+        });
+
+        // Let it connect and download a chunk or two, using a polling loop to avoid race conditions
+        let tmp_path =
+            manager::types::resolve_absolute_path("test_downloads_cancel/model.safetensors.tmp");
+        let mut downloaded_bytes = 0;
+        for i in 0..50 {
+            if let Ok(meta) = tokio::fs::metadata(&tmp_path).await {
+                if meta.len() > 0 {
+                    downloaded_bytes = meta.len();
+                    tracing::info!(
+                        "Test: tmp file created and has {} bytes. Breaking loop.",
+                        downloaded_bytes
+                    );
+                    // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    break;
+                }
+            }
+            if i % 10 == 0 {
+                tracing::info!(
+                    "Test: waiting for tmp file to receive bytes... (attempt {})",
+                    i
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            downloaded_bytes > 0,
+            "Test timed out waiting for the download to start receiving bytes."
+        );
+
+        // 4. Fire cancel signal!
+        tracing::info!("Test: Firing cancel signal.");
+        let _ = cancel_tx.send(());
+
+        // Wait for cancellation to forcibly exit the task
+        let _ = task.await;
+
+        // 5. Verify the metadata file was saved right before exiting
+        let meta_path =
+            manager::types::resolve_absolute_path("test_downloads_cancel/model.safetensors.meta");
+        let meta_content = tokio::fs::read_to_string(&meta_path)
+            .await
+            .expect("Meta file should exist after graceful abort");
+
+        let meta_json: serde_json::Value =
+            serde_json::from_str(&meta_content).expect("Metadata content should be valid JSON");
+        let downloaded = meta_json["checkpoints"]
+            .as_array()
+            .expect("Metadata should contain a checkpoints array")
+            .last()
+            .expect("Checkpoints array should not be empty")["downloaded_bytes"]
+            .as_u64()
+            .expect("Downloaded bytes should be a valid u64");
+
+        assert!(
+            downloaded > 0,
+            "Should have downloaded at least some bytes before shutting down"
+        );
+        assert!(
+            downloaded < 100 * 1024,
+            "Should have aborted before reaching the full file size"
+        );
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all("test_downloads_cancel").await;
     }
 }

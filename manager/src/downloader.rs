@@ -82,6 +82,7 @@ pub async fn perform_model_download(
     repo: String,
     filename: String,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    mut cancel_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let _guard = DownloadCleanupGuard {
         state: state.clone(),
@@ -99,6 +100,7 @@ pub async fn perform_model_download(
     let shared_downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let grand_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let active_streams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let session_downloaded = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let download_client = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -169,6 +171,10 @@ pub async fn perform_model_download(
                                 info!("Shutdown signal received during metadata fetch backoff. Aborting.");
                                 return;
                             }
+                            _ = cancel_rx.recv() => {
+                                info!("Cancel signal received during metadata fetch backoff. Aborting.");
+                                return;
+                            }
                         }
                         backoff = (backoff * 2).min(30);
                         continue;
@@ -235,6 +241,10 @@ pub async fn perform_model_download(
             info!("Shutdown signal received while waiting in queue for {}. Aborting.", id);
             return;
         }
+        _ = cancel_rx.recv() => {
+            info!("Cancel signal received while waiting in queue for {}. Aborting.", id);
+            return;
+        }
     };
 
     update_status_connecting(
@@ -243,7 +253,6 @@ pub async fn perform_model_download(
         shared_downloaded.load(std::sync::atomic::Ordering::Relaxed),
     );
 
-    let initial_shared_downloaded = shared_downloaded.load(std::sync::atomic::Ordering::Relaxed);
     let start_time = std::time::Instant::now();
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -261,12 +270,14 @@ pub async fn perform_model_download(
         let id = id.clone();
         let downloads_dir = downloads_dir.clone();
         let mut shutdown_rx = shutdown_rx.resubscribe();
+        let mut cancel_rx = cancel_rx.resubscribe();
         let shared_downloaded = shared_downloaded.clone();
         let grand_total = grand_total.clone();
         let sem = chunk_semaphore.clone();
         let active_streams = active_streams.clone();
         let hf_token = hf_token.clone();
         let hf_base_url = state.config.hf_base_url.clone();
+        let session_downloaded = session_downloaded.clone();
 
         join_set.spawn(async move {
             let _permit = tokio::select! {
@@ -278,6 +289,10 @@ pub async fn perform_model_download(
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Shutdown signal received while waiting for chunk permit. Aborting.");
+                    return false;
+                }
+                _ = cancel_rx.recv() => {
+                    info!("Cancel signal received while waiting for chunk permit. Aborting.");
                     return false;
                 }
             };
@@ -292,8 +307,9 @@ pub async fn perform_model_download(
                 shared_downloaded,
                 grand_total,
                 shutdown_rx,
+                cancel_rx,
                 start_time,
-                initial_shared_downloaded,
+                session_downloaded,
                 chunk_size,
                 active_streams,
                 hf_token,
@@ -343,8 +359,9 @@ async fn download_chunk(
     shared_downloaded: Arc<std::sync::atomic::AtomicU64>,
     grand_total: Arc<std::sync::atomic::AtomicU64>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    mut cancel_rx: tokio::sync::broadcast::Receiver<()>,
     start_time: std::time::Instant,
-    initial_shared_downloaded: u64,
+    session_downloaded: Arc<std::sync::atomic::AtomicU64>,
     known_chunk_size: u64,
     active_streams: Arc<std::sync::atomic::AtomicUsize>,
     hf_token: Option<String>,
@@ -360,6 +377,7 @@ async fn download_chunk(
     let (mut existing_size, mut expected_hash, mut is_sha256, mut initial_hasher, mut checkpoints) =
         check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path, &remote_sha256).await;
 
+    let original_existing_size = existing_size;
     shared_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
 
     let (mut res, final_url) = match initiate_request(
@@ -369,6 +387,7 @@ async fn download_chunk(
         &mut existing_size,
         &active_streams,
         &mut shutdown_rx,
+        &mut cancel_rx,
         hf_token.as_deref(),
         &hf_base_url,
     )
@@ -397,8 +416,13 @@ async fn download_chunk(
 
     let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     if !is_partial && existing_size > 0 {
-        shared_downloaded.fetch_sub(existing_size, std::sync::atomic::Ordering::Relaxed);
         existing_size = 0;
+    }
+    if existing_size < original_existing_size {
+        shared_downloaded.fetch_sub(
+            original_existing_size - existing_size,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     if known_chunk_size == 0
@@ -436,10 +460,11 @@ async fn download_chunk(
         is_sha256,
         checkpoints,
         &mut shutdown_rx,
+        &mut cancel_rx,
         shared_downloaded,
         grand_total,
         start_time,
-        initial_shared_downloaded,
+        session_downloaded,
         active_streams,
     )
     .await;
@@ -614,6 +639,7 @@ async fn initiate_request(
     existing_size: &mut u64,
     active_streams: &Arc<std::sync::atomic::AtomicUsize>,
     shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    cancel_rx: &mut tokio::sync::broadcast::Receiver<()>,
     hf_token: Option<&str>,
     hf_base_url: &str,
 ) -> Option<(reqwest::Response, String)> {
@@ -662,6 +688,10 @@ async fn initiate_request(
                                 info!("Shutdown signal received during request backoff for {}. Aborting.", id);
                                 return None;
                             }
+                            _ = cancel_rx.recv() => {
+                                info!("Cancel signal received during request backoff for {}. Aborting.", id);
+                                return None;
+                            }
                         }
                         backoff = (backoff * 2).min(60);
                         continue;
@@ -682,6 +712,10 @@ async fn initiate_request(
                             _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => {}
                             _ = shutdown_rx.recv() => {
                                 info!("Shutdown signal received during request backoff for {}. Aborting.", id);
+                                return None;
+                            }
+                            _ = cancel_rx.recv() => {
+                                info!("Cancel signal received during request backoff for {}. Aborting.", id);
                                 return None;
                             }
                         }
@@ -858,10 +892,11 @@ async fn process_download_stream(
     is_sha256: bool,
     mut checkpoints: Vec<Checkpoint>,
     shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    cancel_rx: &mut tokio::sync::broadcast::Receiver<()>,
     shared_downloaded: Arc<std::sync::atomic::AtomicU64>,
     grand_total: Arc<std::sync::atomic::AtomicU64>,
     start_time: std::time::Instant,
-    initial_shared_downloaded: u64,
+    session_downloaded: Arc<std::sync::atomic::AtomicU64>,
     active_streams: Arc<std::sync::atomic::AtomicUsize>,
 ) -> (bool, u64) {
     let _active_guard = ActiveStreamGuard::new(active_streams);
@@ -897,13 +932,14 @@ async fn process_download_stream(
                 bytes_since_last_ui_update += chunk_len;
 
                 let total_transferred = shared_downloaded.fetch_add(chunk_len, std::sync::atomic::Ordering::Relaxed) + chunk_len;
+                let current_session_bytes = session_downloaded.fetch_add(chunk_len, std::sync::atomic::Ordering::Relaxed) + chunk_len;
 
                 if last_ui_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS
                     || bytes_since_last_ui_update >= UPDATE_BYTES_THRESHOLD
                 {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let speed = if elapsed > 0.0 {
-                        (total_transferred.saturating_sub(initial_shared_downloaded)) as f64 / elapsed
+                        current_session_bytes as f64 / elapsed
                     } else {
                         0.0
                     };
@@ -938,6 +974,19 @@ async fn process_download_stream(
             }
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received. Flushing metadata for {}...", id);
+                let state_hex = serialize_hasher(hasher);
+                checkpoints.push(Checkpoint {
+                    downloaded_bytes: downloaded,
+                    hasher_state: state_hex,
+                });
+                if checkpoints.len() > 5 {
+                    checkpoints.remove(0);
+                }
+                save_metadata(meta_file_path, expected_hash, is_sha256, &checkpoints).await;
+                return (true, downloaded);
+            }
+            _ = cancel_rx.recv() => {
+                info!("Cancel signal received. Flushing metadata for {}...", id);
                 let state_hex = serialize_hasher(hasher);
                 checkpoints.push(Checkpoint {
                     downloaded_bytes: downloaded,
