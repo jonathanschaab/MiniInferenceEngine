@@ -355,6 +355,21 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
             warn!("Failed to init HF API. Offline mode fallback active.");
         }
 
+        let shared_reqwest_client = match reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .pool_idle_timeout(std::time::Duration::from_secs(55))
+            .build()
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!("Failed to build reqwest client for model registry: {}", e);
+                None
+            }
+        };
+
+        let hf_token = std::env::var("HF_TOKEN").ok();
+
         let registrations = vec![
             ModelRegistration {
                 id: "llama-3.1-8b",
@@ -687,6 +702,8 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
 
         for reg in registrations {
             let api_opt = api_opt.clone();
+            let reqwest_client = shared_reqwest_client.clone();
+            let hf_token = hf_token.clone();
             let hf_cache = hf_cache.clone();
             let downloads_dir = downloads_dir.clone();
             let hf_base_url = hf_base_url.clone();
@@ -755,46 +772,38 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                     if all_found && total_bytes > 0 {
                         size_on_disk_gb = Some(total_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
                         provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
+                    } else if let Some(client) = &reqwest_client {
+                        let mut remote_bytes = 0;
+                        let mut remote_found = true;
+
+                        for fname in &filenames {
+                            let url = format!("{}/{}/resolve/main/{}", hf_base_url.trim_end_matches('/'), repo, fname);
+                            let mut req = client.head(&url);
+                            if let Some(token) = &hf_token {
+                                req = req.bearer_auth(token);
+                            }
+                            if let Ok(res) = req.send().await {
+                                let size_header = res.headers().get("X-Linked-Size").or_else(|| res.headers().get(reqwest::header::CONTENT_LENGTH));
+                                if let Some(cl) = size_header
+                                    && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
+                                {
+                                    remote_bytes += s;
+                                } else {
+                                    remote_found = false;
+                                    break;
+                                }
+                            } else {
+                                remote_found = false;
+                                break;
+                            }
+                        }
+
+                        if remote_found && remote_bytes > 0 {
+                            size_on_disk_gb = Some(remote_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
+                            provenance.insert("size_on_disk_gb".to_string(), "api".to_string());
+                        }
                     } else {
-                        let mut client_builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-                        if let Ok(token) = std::env::var("HF_TOKEN") {
-                            let mut headers = reqwest::header::HeaderMap::new();
-                            if let Ok(auth_val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
-                                headers.insert(reqwest::header::AUTHORIZATION, auth_val);
-                            }
-                            client_builder = client_builder.default_headers(headers);
-                        }
-
-                        match client_builder.build() {
-                            Ok(client) => {
-                                let mut remote_bytes = 0;
-                                let mut remote_found = true;
-
-                                for fname in &filenames {
-                                    let url = format!("{}/{}/resolve/main/{}", hf_base_url.trim_end_matches('/'), repo, fname);
-                                    if let Ok(res) = client.head(&url).send().await {
-                                        let size_header = res.headers().get("X-Linked-Size").or_else(|| res.headers().get(reqwest::header::CONTENT_LENGTH));
-                                        if let Some(cl) = size_header
-                                            && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
-                                        {
-                                            remote_bytes += s;
-                                        } else {
-                                            remote_found = false;
-                                            break;
-                                        }
-                                    } else {
-                                        remote_found = false;
-                                        break;
-                                    }
-                                }
-
-                                if remote_found && remote_bytes > 0 {
-                                    size_on_disk_gb = Some(remote_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
-                                    provenance.insert("size_on_disk_gb".to_string(), "api".to_string());
-                                }
-                            }
-                            Err(e) => warn!("Failed to build reqwest client for size check of {}: {}", reg.id, e),
-                        }
+                        warn!("Reqwest client unavailable, skipping remote size check for {}", reg.id);
                     }
                 }
 

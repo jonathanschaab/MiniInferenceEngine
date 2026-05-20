@@ -601,6 +601,17 @@ pub(crate) async fn cancel_all_downloads(
                 let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
                 let _ = tokio::fs::remove_file(&tmp_file_path).await;
                 let _ = tokio::fs::remove_file(&meta_file_path).await;
+
+                let mut current_dir = tmp_file_path.parent();
+                while let Some(parent) = current_dir {
+                    if parent == downloads_dir {
+                        break;
+                    }
+                    if tokio::fs::remove_dir(parent).await.is_err() {
+                        break; // Stop if directory is not empty or on other errors
+                    }
+                    current_dir = parent.parent();
+                }
             }
         }
     }
@@ -660,6 +671,17 @@ pub(crate) async fn cancel_download(
             let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
             let _ = tokio::fs::remove_file(&tmp_file_path).await;
             let _ = tokio::fs::remove_file(&meta_file_path).await;
+
+            let mut current_dir = tmp_file_path.parent();
+            while let Some(parent) = current_dir {
+                if parent == downloads_dir {
+                    break;
+                }
+                if tokio::fs::remove_dir(parent).await.is_err() {
+                    break;
+                }
+                current_dir = parent.parent();
+            }
         }
     }
 
@@ -741,6 +763,17 @@ pub(crate) async fn delete_model(
         let _ = tokio::fs::remove_file(&tmp_file_path).await;
         let _ = tokio::fs::remove_file(&meta_file_path).await;
         let _ = tokio::fs::remove_file(&corrupted_path).await;
+
+        let mut current_dir = file_path.parent();
+        while let Some(parent) = current_dir {
+            if parent == downloads_dir {
+                break;
+            }
+            if tokio::fs::remove_dir(parent).await.is_err() {
+                break;
+            }
+            current_dir = parent.parent();
+        }
     }
 
     {
@@ -1800,50 +1833,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
         loop {
             interval.tick().await;
-            match tokio::fs::read_dir(&downloads_dir_for_cleanup).await {
-                Ok(mut entries) => {
-                    let registry = manager::get_model_registry().await;
-                    let active_keys: std::collections::HashSet<String> = {
-                        let active = active_downloads_for_cleanup
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        active.keys().cloned().collect()
-                    };
-                    while let Ok(Some(entry)) = entries.next_entry().await {
-                        let path = entry.path();
-                        if let Some(ext) = path.extension()
-                            && (ext == "tmp"
-                                || ext == "meta"
-                                || ext == "corrupted"
-                                || ext == "copy_tmp")
-                            && let Ok(metadata) = entry.metadata().await
-                            && let Ok(modified) = metadata.modified()
-                            && let Ok(age) = modified.elapsed()
-                            && age.as_secs() > TEMP_FILE_EXPIRY_AGE_SECS
-                        {
-                            let mut is_active = false;
-                            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                                for model in &registry {
-                                    if active_keys.contains(&model.id)
-                                        && file_name.starts_with(&model.filename)
-                                    {
-                                        is_active = true;
-                                        break;
+
+            let registry = manager::get_model_registry().await;
+            let active_keys: std::collections::HashSet<String> = {
+                let active = active_downloads_for_cleanup
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                active.keys().cloned().collect()
+            };
+
+            let mut dirs_to_visit = vec![downloads_dir_for_cleanup.clone()];
+
+            while let Some(current_dir) = dirs_to_visit.pop() {
+                match tokio::fs::read_dir(&current_dir).await {
+                    Ok(mut entries) => {
+                        while let Ok(Some(entry)) = entries.next_entry().await {
+                            let path = entry.path();
+
+                            if let Ok(file_type) = entry.file_type().await
+                                && file_type.is_dir()
+                            {
+                                dirs_to_visit.push(path);
+                                continue;
+                            }
+
+                            if let Some(ext) = path.extension()
+                                && (ext == "tmp"
+                                    || ext == "meta"
+                                    || ext == "corrupted"
+                                    || ext == "copy_tmp")
+                                && let Ok(metadata) = entry.metadata().await
+                                && let Ok(modified) = metadata.modified()
+                                && let Ok(age) = modified.elapsed()
+                                && age.as_secs() > TEMP_FILE_EXPIRY_AGE_SECS
+                            {
+                                let mut is_active = false;
+                                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                                    for model in &registry {
+                                        if active_keys.contains(&model.id) {
+                                            let expected_names =
+                                                manager::get_split_filenames(&model.filename);
+                                            if expected_names.iter().any(|expected| {
+                                                let expected_base = std::path::Path::new(expected)
+                                                    .file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or_default();
+                                                file_name.starts_with(expected_base)
+                                            }) {
+                                                is_active = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !is_active {
+                                    // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
+                                    let _ = tokio::fs::remove_file(&path).await;
+                                    info!("Cleaned up abandoned file: {:?}", path);
+
+                                    let mut current_dir = path.parent();
+                                    while let Some(parent) = current_dir {
+                                        if parent == downloads_dir_for_cleanup {
+                                            break;
+                                        }
+                                        if tokio::fs::remove_dir(parent).await.is_err() {
+                                            break;
+                                        }
+                                        current_dir = parent.parent();
                                     }
                                 }
                             }
-
-                            if !is_active {
-                                // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
-                                let _ = tokio::fs::remove_file(&path).await;
-                                info!("Cleaned up abandoned file: {:?}", path);
-                            }
                         }
                     }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    error!("Failed to read downloads directory for cleanup: {}", e);
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        error!(
+                            "Failed to read directory for cleanup {:?}: {}",
+                            current_dir, e
+                        );
+                    }
                 }
             }
         }
@@ -1958,7 +2027,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_store = Arc::new(Mutex::new(store));
 
     // Initialize global pooled clients once!
-    let mut reqwest_client_builder = reqwest::Client::builder();
+    let mut reqwest_client_builder = reqwest::Client::builder()
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(55));
     if let Ok(token) = std::env::var("HF_TOKEN") {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Ok(auth_value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))

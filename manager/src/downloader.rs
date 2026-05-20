@@ -100,19 +100,13 @@ pub async fn perform_model_download(
     let grand_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let active_streams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let mut client_builder = reqwest::Client::builder()
+    let download_client = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(10));
-
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(auth_val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)) {
-            headers.insert(reqwest::header::AUTHORIZATION, auth_val);
-        }
-        client_builder = client_builder.default_headers(headers);
-    }
-
-    let download_client = match client_builder.build() {
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(55))
+        .build()
+    {
         Ok(client) => Arc::new(client),
         Err(e) => {
             error!(
@@ -122,6 +116,8 @@ pub async fn perform_model_download(
             return;
         }
     };
+
+    let hf_token = std::env::var("HF_TOKEN").ok();
 
     let mut chunk_infos = Vec::new();
 
@@ -148,7 +144,11 @@ pub async fn perform_model_download(
         let mut retries = 0;
         const MAX_RETRIES: usize = 5;
         loop {
-            match download_client.head(&url).send().await {
+            let mut req = download_client.head(&url);
+            if let Some(token) = &hf_token {
+                req = req.bearer_auth(token);
+            }
+            match req.send().await {
                 Ok(head_res) => {
                     if head_res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         retries += 1;
@@ -265,6 +265,8 @@ pub async fn perform_model_download(
         let grand_total = grand_total.clone();
         let sem = chunk_semaphore.clone();
         let active_streams = active_streams.clone();
+        let hf_token = hf_token.clone();
+        let hf_base_url = state.config.hf_base_url.clone();
 
         join_set.spawn(async move {
             let _permit = tokio::select! {
@@ -294,6 +296,8 @@ pub async fn perform_model_download(
                 initial_shared_downloaded,
                 chunk_size,
                 active_streams,
+                hf_token,
+                hf_base_url,
             )
             .await
         });
@@ -343,6 +347,8 @@ async fn download_chunk(
     initial_shared_downloaded: u64,
     known_chunk_size: u64,
     active_streams: Arc<std::sync::atomic::AtomicUsize>,
+    hf_token: Option<String>,
+    hf_base_url: String,
 ) -> bool {
     let tmp_file_path = downloads_dir.join(format!("{}.tmp", filename));
     let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
@@ -363,6 +369,8 @@ async fn download_chunk(
         &mut existing_size,
         &active_streams,
         &mut shutdown_rx,
+        hf_token.as_deref(),
+        &hf_base_url,
     )
     .await
     {
@@ -378,6 +386,8 @@ async fn download_chunk(
         &mut existing_size,
         &mut expected_hash,
         &mut is_sha256,
+        hf_token.as_deref(),
+        &hf_base_url,
     )
     .await
     .is_err()
@@ -596,6 +606,7 @@ fn update_status_connecting(state: &Arc<AppState>, id: &str, existing_size: u64)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn initiate_request(
     client: &reqwest::Client,
     url: &str,
@@ -603,6 +614,8 @@ async fn initiate_request(
     existing_size: &mut u64,
     active_streams: &Arc<std::sync::atomic::AtomicUsize>,
     shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    hf_token: Option<&str>,
+    hf_base_url: &str,
 ) -> Option<(reqwest::Response, String)> {
     let mut current_url = url.to_string();
     let mut backoff = 5;
@@ -615,6 +628,11 @@ async fn initiate_request(
         let mut req = client.get(&current_url);
         if *existing_size > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_size));
+        }
+        if current_url.starts_with(hf_base_url.trim_end_matches('/'))
+            && let Some(token) = hf_token
+        {
+            req = req.bearer_auth(token);
         }
 
         match req.send().await {
@@ -690,6 +708,7 @@ async fn initiate_request(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn verify_and_update_etag(
     client: &reqwest::Client,
     url: &str, // This is now the final URL
@@ -698,6 +717,8 @@ async fn verify_and_update_etag(
     existing_size: &mut u64,
     expected_hash: &mut Option<String>,
     is_sha256: &mut bool,
+    hf_token: Option<&str>,
+    hf_base_url: &str,
 ) -> Result<(), ()> {
     info!("Inspecting HTTP Headers for {}:", id);
     for (k, v) in res.headers() {
@@ -761,7 +782,13 @@ async fn verify_and_update_etag(
         *expected_hash = new_etag.clone();
         *is_sha256 = x_linked_found;
 
-        if let Ok(r) = client.get(url).send().await {
+        let mut req = client.get(url);
+        if url.starts_with(hf_base_url.trim_end_matches('/'))
+            && let Some(token) = hf_token
+        {
+            req = req.bearer_auth(token);
+        }
+        if let Ok(r) = req.send().await {
             if r.status().is_success() {
                 *res = r;
             } else {
