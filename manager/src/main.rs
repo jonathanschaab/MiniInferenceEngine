@@ -453,11 +453,7 @@ pub(crate) async fn trigger_download(
         // Without this check, a re-download would be allowed, and attempting to overwrite the active memory-mapped file
         // would cause a "Text file busy" error or a segmentation fault crashing the entire engine.
         let status = lock_status(&state.engine_status);
-        if status.models_vram.iter().any(|m| m.id == id)
-            || status.active_chat_model_id.as_deref() == Some(&id)
-            || status.last_compressor_model_id.as_deref() == Some(&id)
-            || status.loading_model_id.as_deref() == Some(&id)
-        {
+        if status.is_model_in_use(&id) {
             return (
                 StatusCode::CONFLICT,
                 "Cannot download a model that is currently loaded or being loaded in VRAM. Please load a different model first.",
@@ -749,11 +745,7 @@ pub(crate) async fn delete_model(
 
     {
         let status = lock_status(&state.engine_status);
-        if status.models_vram.iter().any(|m| m.id == id)
-            || status.active_chat_model_id.as_deref() == Some(&id)
-            || status.last_compressor_model_id.as_deref() == Some(&id)
-            || status.loading_model_id.as_deref() == Some(&id)
-        {
+        if status.is_model_in_use(&id) {
             return (StatusCode::CONFLICT, "Cannot delete a model while it is loaded or being loaded in memory. Please load a different model first to free the VRAM.").into_response();
         }
     }
@@ -912,13 +904,7 @@ pub(crate) async fn trigger_benchmark(
         info!("🌱 Verifying benchmark prompt files...");
 
         let tokenizer_result = async {
-            let api =
-                hf_hub::api::tokio::Api::new().map_err(|e| format!("API Init Error: {}", e))?;
-            let path = api
-                .model("Qwen/Qwen2.5-1.5B-Instruct".to_string())
-                .get("tokenizer.json")
-                .await
-                .map_err(|e| format!("Tokenizer Download Error: {}", e))?;
+            let path = manager::fetch_tokenizer_path("Qwen/Qwen2.5-1.5B-Instruct").await?;
 
             tokio::task::spawn_blocking(move || {
                 Tokenizer::from_file(path).map_err(|e| format!("Tokenizer Parse Error: {}", e))
@@ -1426,33 +1412,67 @@ pub struct MessageQuery {
     pub offset: Option<usize>,
 }
 
-pub(crate) async fn get_chat_session(
-    user: auth::CurrentUser,
-    Path(id): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<MessageQuery>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<manager::ChatSession>, StatusCode> {
-    let mut response = state
-        .db
+async fn fetch_session_record(
+    db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+    session_id: &str,
+) -> Result<Option<manager::ChatSessionRecord>, StatusCode> {
+    let mut response = db
         .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
-        .bind(("id", id.clone()))
+        .bind(("id", session_id.to_string()))
         .await
         .map_err(|e| {
             error!("DB Query Error: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let session_record: Option<manager::ChatSessionRecord> = response.take(0).map_err(|e| {
+    response.take(0).map_err(|e| {
         error!("DB Take Error: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    })
+}
 
-    match session_record {
-        Some(s) if s.email == user.email => {
-            let limit = query.limit.unwrap_or(50);
-            let offset = query.offset.unwrap_or(0);
+async fn verify_session_ownership(
+    db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+    session_id: &str,
+    user_email: &str,
+) -> Result<manager::ChatSessionRecord, StatusCode> {
+    match fetch_session_record(db, session_id).await? {
+        Some(s) if s.email == user_email => Ok(s),
+        Some(_) => Err(StatusCode::FORBIDDEN),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
 
-            let mut response = state
+async fn touch_session_updated_at(
+    db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+    session_id: &str,
+) {
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Err(e) = db
+        .query("UPDATE type::thing('chat_sessions', $id) SET updated_at = $time")
+        .bind(("id", session_id.to_string()))
+        .bind(("time", updated_at))
+        .await
+    {
+        error!("DB Update Error (chat_sessions timestamp): {}", e);
+    }
+}
+
+pub(crate) async fn get_chat_session(
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MessageQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<manager::ChatSession>, StatusCode> {
+    let s = verify_session_ownership(&state.db, &id, &user.email).await?;
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+
+    let mut response = state
                 .db
                 // Order DESC to get the latest messages first, then we'll reverse them
                 .query("SELECT role, content, message_index FROM chat_messages WHERE session_id = $session_id ORDER BY message_index DESC LIMIT $limit START $offset")
@@ -1465,20 +1485,16 @@ pub(crate) async fn get_chat_session(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            let mut db_messages: Vec<manager::Message> = response.take(0).unwrap_or_default();
-            db_messages.reverse(); // Reverse back to chronological order
+    let mut db_messages: Vec<manager::Message> = response.take(0).unwrap_or_default();
+    db_messages.reverse(); // Reverse back to chronological order
 
-            Ok(Json(manager::ChatSession {
-                id: s.id,
-                email: s.email,
-                updated_at: s.updated_at,
-                title: s.title,
-                messages: db_messages,
-            }))
-        }
-        Some(_) => Err(StatusCode::FORBIDDEN),
-        None => Err(StatusCode::NOT_FOUND),
-    }
+    Ok(Json(manager::ChatSession {
+        id: s.id,
+        email: s.email,
+        updated_at: s.updated_at,
+        title: s.title,
+        messages: db_messages,
+    }))
 }
 
 pub(crate) async fn save_chat_session(
@@ -1513,14 +1529,7 @@ pub(crate) async fn save_chat_session(
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        let mut response = state
-            .db
-            .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
-            .bind(("id", payload.id.clone()))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let existing: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
-        if let Some(s) = existing
+        if let Some(s) = fetch_session_record(&state.db, &payload.id).await?
             && s.email != user.email
         {
             return Err(StatusCode::FORBIDDEN);
@@ -1562,21 +1571,7 @@ pub(crate) async fn append_chat_message(
     State(state): State<Arc<AppState>>,
     Json(mut payload): Json<manager::ChatMessageRecord>,
 ) -> Result<StatusCode, StatusCode> {
-    let mut response = state
-        .db
-        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
-        .bind(("id", id.clone()))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let session: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
-
-    if let Some(s) = session {
-        if s.email != user.email {
-            return Err(StatusCode::FORBIDDEN);
-        }
-    } else {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    verify_session_ownership(&state.db, &id, &user.email).await?;
 
     let mut last_msg_response = state
         .db
@@ -1612,20 +1607,7 @@ pub(crate) async fn append_chat_message(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let updated_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    if let Err(e) = state
-        .db
-        .query("UPDATE type::thing('chat_sessions', $id) SET updated_at = $time")
-        .bind(("id", id.clone()))
-        .bind(("time", updated_at))
-        .await
-    {
-        error!("DB Update Error (chat_sessions timestamp): {}", e);
-    }
+    touch_session_updated_at(&state.db, &id).await;
 
     Ok(StatusCode::OK)
 }
@@ -1635,21 +1617,7 @@ pub(crate) async fn truncate_chat_messages(
     Path((id, index)): Path<(String, usize)>,
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
-    let mut response = state
-        .db
-        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
-        .bind(("id", id.clone()))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let session: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
-
-    if let Some(s) = session {
-        if s.email != user.email {
-            return Err(StatusCode::FORBIDDEN);
-        }
-    } else {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    verify_session_ownership(&state.db, &id, &user.email).await?;
 
     if let Err(e) = state
         .db
@@ -1664,23 +1632,7 @@ pub(crate) async fn truncate_chat_messages(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let updated_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    if let Err(e) = state
-        .db
-        .query("UPDATE type::thing('chat_sessions', $id) SET updated_at = $time")
-        .bind(("id", id.clone()))
-        .bind(("time", updated_at))
-        .await
-    {
-        error!(
-            "DB Update Error (chat_sessions timestamp on truncate): {}",
-            e
-        );
-    }
+    touch_session_updated_at(&state.db, &id).await;
 
     Ok(StatusCode::OK)
 }
@@ -1690,38 +1642,26 @@ pub(crate) async fn delete_chat_session(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
-    let mut response = state
+    verify_session_ownership(&state.db, &id, &user.email).await?;
+
+    if let Err(e) = state
         .db
-        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
+        .query("DELETE type::thing('chat_sessions', $id)")
         .bind(("id", id.clone()))
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let session: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
-    if let Some(s) = session {
-        if s.email != user.email {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        if let Err(e) = state
-            .db
-            .query("DELETE type::thing('chat_sessions', $id)")
-            .bind(("id", id.clone()))
-            .await
-        {
-            error!("DB Delete Error (chat_sessions): {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-        if let Err(e) = state
-            .db
-            .query("DELETE FROM chat_messages WHERE session_id = $session_id")
-            .bind(("session_id", id.clone()))
-            .await
-        {
-            error!("DB Delete Error (chat_messages): {}", e);
-        }
-        Ok(StatusCode::OK)
-    } else {
-        Err(StatusCode::NOT_FOUND)
+    {
+        error!("DB Delete Error (chat_sessions): {}", e);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    if let Err(e) = state
+        .db
+        .query("DELETE FROM chat_messages WHERE session_id = $session_id")
+        .bind(("session_id", id.clone()))
+        .await
+    {
+        error!("DB Delete Error (chat_messages): {}", e);
+    }
+    Ok(StatusCode::OK)
 }
 
 pub(crate) async fn get_console_loglevel(

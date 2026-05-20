@@ -56,6 +56,25 @@ impl Drop for ActiveStreamGuard {
     }
 }
 
+async fn save_download_checkpoint(
+    hasher: &Sha256,
+    downloaded: u64,
+    checkpoints: &mut Vec<Checkpoint>,
+    meta_file_path: &Path,
+    expected_hash: &Option<String>,
+    is_sha256: bool,
+) {
+    let state_hex = serialize_hasher(hasher);
+    checkpoints.push(Checkpoint {
+        downloaded_bytes: downloaded,
+        hasher_state: state_hex,
+    });
+    if checkpoints.len() > 5 {
+        checkpoints.remove(0);
+    }
+    save_metadata(meta_file_path, expected_hash, is_sha256, checkpoints).await;
+}
+
 pub struct DownloadCleanupGuard {
     state: Arc<AppState>,
     id: String,
@@ -960,42 +979,18 @@ async fn process_download_stream(
                 }
 
                 if last_meta_save.elapsed().as_secs() >= META_SAVE_INTERVAL_SECS {
-                    let state_hex = serialize_hasher(hasher);
-                    checkpoints.push(Checkpoint {
-                        downloaded_bytes: downloaded,
-                        hasher_state: state_hex,
-                    });
-                    if checkpoints.len() > 5 {
-                        checkpoints.remove(0);
-                    }
-                    save_metadata(meta_file_path, expected_hash, is_sha256, &checkpoints).await;
+                    save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
                     last_meta_save = std::time::Instant::now();
                 }
             }
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received. Flushing metadata for {}...", id);
-                let state_hex = serialize_hasher(hasher);
-                checkpoints.push(Checkpoint {
-                    downloaded_bytes: downloaded,
-                    hasher_state: state_hex,
-                });
-                if checkpoints.len() > 5 {
-                    checkpoints.remove(0);
-                }
-                save_metadata(meta_file_path, expected_hash, is_sha256, &checkpoints).await;
+                save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
                 return (true, downloaded);
             }
             _ = cancel_rx.recv() => {
                 info!("Cancel signal received. Flushing metadata for {}...", id);
-                let state_hex = serialize_hasher(hasher);
-                checkpoints.push(Checkpoint {
-                    downloaded_bytes: downloaded,
-                    hasher_state: state_hex,
-                });
-                if checkpoints.len() > 5 {
-                    checkpoints.remove(0);
-                }
-                save_metadata(meta_file_path, expected_hash, is_sha256, &checkpoints).await;
+                save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
                 return (true, downloaded);
             }
         }

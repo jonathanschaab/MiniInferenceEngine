@@ -90,17 +90,7 @@ pub async fn load_engine(
                 .await
                 .map_err(|e| format!("Missing config.json: {}", e))?
         };
-        let tokenizer_path = if let Some(p) = cache
-            .repo(hf_hub::Repo::model(config.tokenizer_repo.clone()))
-            .get("tokenizer.json")
-        {
-            p
-        } else {
-            api.model(config.tokenizer_repo.clone())
-                .get("tokenizer.json")
-                .await
-                .map_err(|e| format!("Missing tokenizer: {}", e))?
-        };
+        let tokenizer_path = crate::fetch_tokenizer_path(&config.tokenizer_repo).await?;
 
         let config_str = tokio::fs::read_to_string(config_path)
             .await
@@ -156,18 +146,7 @@ pub async fn load_engine(
         first_cached_path.unwrap()
     };
 
-    let cache = hf_hub::Cache::default();
-    let tokenizer_path = if let Some(p) = cache
-        .repo(hf_hub::Repo::model(config.tokenizer_repo.clone()))
-        .get("tokenizer.json")
-    {
-        p
-    } else {
-        api.model(config.tokenizer_repo.clone())
-            .get("tokenizer.json")
-            .await
-            .map_err(|e| e.to_string())?
-    };
+    let tokenizer_path = crate::fetch_tokenizer_path(&config.tokenizer_repo).await?;
 
     let config_arch = config.arch;
     let config_id = config.id.clone();

@@ -51,6 +51,21 @@ pub fn get_engine_process_vram(nvml: Option<&Nvml>, device_index: u32) -> Option
     None
 }
 
+pub async fn fetch_tokenizer_path(repo: &str) -> Result<std::path::PathBuf, String> {
+    let cache = hf_hub::Cache::default();
+    if let Some(p) = cache
+        .repo(hf_hub::Repo::model(repo.to_string()))
+        .get("tokenizer.json")
+    {
+        return Ok(p);
+    }
+    let api = hf_hub::api::tokio::Api::new().map_err(|e| e.to_string())?;
+    api.model(repo.to_string())
+        .get("tokenizer.json")
+        .await
+        .map_err(|e| e.to_string())
+}
+
 pub async fn wait_for_vram_release(
     nvml: Option<&Nvml>,
     device_index: u32,
@@ -92,6 +107,34 @@ fn get_exact_token_count(prompt: &str, tokenizer: &Tokenizer) -> usize {
         .encode(prompt, true)
         .map(|enc| enc.get_ids().len())
         .unwrap_or_else(|_| prompt.len() / 4)
+}
+
+pub fn free_model_vram(
+    status: &Arc<Mutex<EngineStatus>>,
+    model_id: &str,
+    offload_pct: f32,
+    nvml: Option<&Nvml>,
+    gpu_device_index: u32,
+) {
+    let mut s = lock_status(status);
+    if offload_pct > 0.0 {
+        s.log_ram(
+            "Free",
+            "Orchestrator",
+            &format!("Released offloaded layers for {}", model_id),
+            0,
+        );
+    }
+    s.remove_model_vram(model_id);
+    s.log_vram(
+        "Free",
+        "Orchestrator",
+        &format!("Released {} from VRAM", model_id),
+        0,
+    );
+    if let Some((used, total, free)) = get_vram_info(nvml, gpu_device_index) {
+        s.update_nvml(total, used, free, None);
+    }
 }
 
 pub enum ActiveBackend {
@@ -277,19 +320,7 @@ pub async fn run_batcher_loop(
             None => {
                 let repo = config_for_prompt.tokenizer_repo.clone();
                 let tok_res = async move {
-                    let cache = hf_hub::Cache::default();
-                    let path = if let Some(p) = cache
-                        .repo(hf_hub::Repo::model(repo.clone()))
-                        .get("tokenizer.json")
-                    {
-                        p
-                    } else {
-                        let api = hf_hub::api::tokio::Api::new().map_err(|e| e.to_string())?;
-                        api.model(repo)
-                            .get("tokenizer.json")
-                            .await
-                            .map_err(|e| e.to_string())?
-                    };
+                    let path = crate::fetch_tokenizer_path(&repo).await?;
 
                     tokio::task::spawn_blocking(move || {
                         Tokenizer::from_file(path).map_err(|e| e.to_string())
@@ -426,25 +457,13 @@ pub async fn run_batcher_loop(
                 )
                 .await;
 
-                let mut s = lock_status(&status);
-                if offload_pct > 0.0 {
-                    s.log_ram(
-                        "Free",
-                        "Orchestrator",
-                        &format!("Released offloaded layers for {}", active_model_id),
-                        0,
-                    );
-                }
-                s.remove_model_vram(&active_model_id);
-                s.log_vram(
-                    "Free",
-                    "Orchestrator",
-                    &format!("Released {} from VRAM", active_model_id),
-                    0,
+                free_model_vram(
+                    &status,
+                    &active_model_id,
+                    offload_pct,
+                    nvml.as_ref(),
+                    gpu_device_index,
                 );
-                if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), gpu_device_index) {
-                    s.update_nvml(total, used, free, None);
-                }
             }
 
             // wipe the ID and config so a failed load doesn't leave a poison state
@@ -899,29 +918,16 @@ pub async fn run_batcher_loop(
             )
             .await;
 
+            free_model_vram(
+                &status,
+                &request.compressor_model_id,
+                comp_offload_pct,
+                nvml.as_ref(),
+                gpu_device_index,
+            );
+
             {
                 let mut s = lock_status(&status);
-                if comp_offload_pct > 0.0 {
-                    s.log_ram(
-                        "Free",
-                        "Orchestrator",
-                        &format!(
-                            "Released offloaded layers for {}",
-                            request.compressor_model_id
-                        ),
-                        0,
-                    );
-                }
-                s.remove_model_vram(&request.compressor_model_id);
-                s.log_vram(
-                    "Free",
-                    "Orchestrator",
-                    &format!("Released {} from VRAM", request.compressor_model_id),
-                    0,
-                );
-                if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), gpu_device_index) {
-                    s.update_nvml(total, used, free, None);
-                }
                 // Mark the main chat model as active again now that the compressor is gone
                 s.set_model_status(&active_model_id, "Active");
             }

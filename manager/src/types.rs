@@ -73,6 +73,13 @@ impl EngineStatus {
             .sum()
     }
 
+    pub fn is_model_in_use(&self, id: &str) -> bool {
+        self.models_vram.iter().any(|m| m.id == id)
+            || self.active_chat_model_id.as_deref() == Some(id)
+            || self.last_compressor_model_id.as_deref() == Some(id)
+            || self.loading_model_id.as_deref() == Some(id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn set_model_vram(
         &mut self,

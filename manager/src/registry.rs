@@ -310,6 +310,116 @@ struct PartialConfig {
     hf_base_url: Option<String>,
 }
 
+impl PartialConfig {
+    async fn load() -> Self {
+        if let Ok(data) =
+            tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.toml")).await
+            && let Ok(config) = toml::from_str::<PartialConfig>(&data)
+        {
+            return config;
+        }
+        if let Ok(data) =
+            tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.json")).await
+            && let Ok(config) = serde_json::from_str::<PartialConfig>(&data)
+        {
+            return config;
+        }
+        PartialConfig {
+            downloads_directory: None,
+            hf_base_url: None,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_model_size(
+    filenames: &[String],
+    downloads_dir: &std::path::Path,
+    hf_cache: &hf_hub::Cache,
+    repo: &str,
+    reqwest_client: Option<&reqwest::Client>,
+    hf_base_url: &str,
+    hf_token: Option<&String>,
+    reg_id: &str,
+) -> Option<(f32, String)> {
+    let mut total_bytes = 0;
+    let mut all_found = true;
+
+    for fname in filenames {
+        let local_path = downloads_dir.join(fname);
+        if let Ok(meta) = tokio::fs::metadata(&local_path).await {
+            total_bytes += meta.len();
+        } else if let Some(gguf_path) = hf_cache
+            .repo(hf_hub::Repo::model(repo.to_string()))
+            .get(fname)
+        {
+            if let Ok(meta) = tokio::fs::metadata(&gguf_path).await {
+                total_bytes += meta.len();
+            } else {
+                all_found = false;
+            }
+        } else {
+            all_found = false;
+        }
+    }
+
+    if all_found && total_bytes > 0 {
+        return Some((
+            total_bytes as f32 / 1024.0 / 1024.0 / 1024.0,
+            "disk".to_string(),
+        ));
+    }
+
+    if let Some(client) = reqwest_client {
+        let mut remote_bytes = 0;
+        let mut remote_found = true;
+
+        for fname in filenames {
+            let url = format!(
+                "{}/{}/resolve/main/{}",
+                hf_base_url.trim_end_matches('/'),
+                repo,
+                fname
+            );
+            let mut req = client.head(&url);
+            if let Some(token) = hf_token {
+                req = req.bearer_auth(token);
+            }
+            if let Ok(res) = req.send().await {
+                let size_header = res
+                    .headers()
+                    .get("X-Linked-Size")
+                    .or_else(|| res.headers().get(reqwest::header::CONTENT_LENGTH));
+                if let Some(cl) = size_header
+                    && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
+                {
+                    remote_bytes += s;
+                } else {
+                    remote_found = false;
+                    break;
+                }
+            } else {
+                remote_found = false;
+                break;
+            }
+        }
+
+        if remote_found && remote_bytes > 0 {
+            return Some((
+                remote_bytes as f32 / 1024.0 / 1024.0 / 1024.0,
+                "api".to_string(),
+            ));
+        }
+    } else {
+        warn!(
+            "Reqwest client unavailable, skipping remote size check for {}",
+            reg_id
+        );
+    }
+
+    None
+}
+
 // Expose the registry so the web server can send it to the UI
 pub async fn get_model_registry() -> Vec<ModelConfig> {
     let registry_lock = REGISTRY.get_or_init(|| async {
@@ -318,24 +428,12 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
         let mut downloads_dir = crate::types::resolve_absolute_path("downloads");
         let mut hf_base_url = "https://huggingface.co".to_string();
 
-        if let Ok(data) = tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.toml")).await
-            && let Ok(config) = toml::from_str::<PartialConfig>(&data)
-        {
-            if let Some(dir) = config.downloads_directory {
-                downloads_dir = crate::types::resolve_absolute_path(dir);
-            }
-            if let Some(url) = config.hf_base_url {
-                hf_base_url = url;
-            }
-        } else if let Ok(data) = tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.json")).await
-            && let Ok(config) = serde_json::from_str::<PartialConfig>(&data)
-        {
-            if let Some(dir) = config.downloads_directory {
-                downloads_dir = crate::types::resolve_absolute_path(dir);
-            }
-            if let Some(url) = config.hf_base_url {
-                hf_base_url = url;
-            }
+        let config = PartialConfig::load().await;
+        if let Some(dir) = config.downloads_directory {
+            downloads_dir = crate::types::resolve_absolute_path(dir);
+        }
+        if let Some(url) = config.hf_base_url {
+            hf_base_url = url;
         }
 
         let mut builder = hf_hub::api::tokio::ApiBuilder::new().with_endpoint(hf_base_url.clone());
@@ -755,55 +853,20 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
 
                 if size_on_disk_gb.is_none() {
                     let filenames = get_split_filenames(filename);
-                    let mut total_bytes = 0;
-                    let mut all_found = true;
-
-                    for fname in &filenames {
-                        let local_path = downloads_dir.join(fname);
-                        if let Ok(meta) = tokio::fs::metadata(&local_path).await {
-                            total_bytes += meta.len();
-                        } else if let Some(gguf_path) = hf_cache.repo(hf_hub::Repo::model(repo.to_string())).get(fname) {
-                            if let Ok(meta) = tokio::fs::metadata(&gguf_path).await {
-                                total_bytes += meta.len();
-                            } else { all_found = false; }
-                        } else { all_found = false; }
-                    }
-
-                    if all_found && total_bytes > 0 {
-                        size_on_disk_gb = Some(total_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
-                        provenance.insert("size_on_disk_gb".to_string(), "disk".to_string());
-                    } else if let Some(client) = &reqwest_client {
-                        let mut remote_bytes = 0;
-                        let mut remote_found = true;
-
-                        for fname in &filenames {
-                            let url = format!("{}/{}/resolve/main/{}", hf_base_url.trim_end_matches('/'), repo, fname);
-                            let mut req = client.head(&url);
-                            if let Some(token) = &hf_token {
-                                req = req.bearer_auth(token);
-                            }
-                            if let Ok(res) = req.send().await {
-                                let size_header = res.headers().get("X-Linked-Size").or_else(|| res.headers().get(reqwest::header::CONTENT_LENGTH));
-                                if let Some(cl) = size_header
-                                    && let Ok(s) = cl.to_str().unwrap_or("0").parse::<u64>()
-                                {
-                                    remote_bytes += s;
-                                } else {
-                                    remote_found = false;
-                                    break;
-                                }
-                            } else {
-                                remote_found = false;
-                                break;
-                            }
-                        }
-
-                        if remote_found && remote_bytes > 0 {
-                            size_on_disk_gb = Some(remote_bytes as f32 / 1024.0 / 1024.0 / 1024.0);
-                            provenance.insert("size_on_disk_gb".to_string(), "api".to_string());
-                        }
-                    } else {
-                        warn!("Reqwest client unavailable, skipping remote size check for {}", reg.id);
+                    if let Some((size, source)) = resolve_model_size(
+                        &filenames,
+                        &downloads_dir,
+                        &hf_cache,
+                        repo,
+                        reqwest_client.as_ref(),
+                        &hf_base_url,
+                        hf_token.as_ref(),
+                        reg.id,
+                    )
+                    .await
+                    {
+                        size_on_disk_gb = Some(size);
+                        provenance.insert("size_on_disk_gb".to_string(), source);
                     }
                 }
 
