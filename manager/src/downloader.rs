@@ -1,6 +1,6 @@
 use crate::AppState;
 use crypto_common::hazmat::SerializableState;
-use manager::lock_status;
+use manager::{lock_mutex, lock_status};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
@@ -82,16 +82,8 @@ pub struct DownloadCleanupGuard {
 
 impl Drop for DownloadCleanupGuard {
     fn drop(&mut self) {
-        self.state
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
-        self.state
-            .download_tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
+        lock_mutex(&self.state.active_downloads).remove(&self.id);
+        lock_mutex(&self.state.download_tasks).remove(&self.id);
     }
 }
 
@@ -343,11 +335,18 @@ pub async fn perform_model_download(
     // HTTP byte-resumes, letting sibling chunk tasks finish (even if one fails
     // due to a network hiccup) saves the user significant bandwidth when they retry.
     let mut hash_mismatch_occurred = false;
+    let mut task_failed = false;
     while let Some(res) = join_set.join_next().await {
-        if let Ok(chunk_mismatch) = res
-            && chunk_mismatch
-        {
-            hash_mismatch_occurred = true;
+        match res {
+            Ok(chunk_mismatch) => {
+                if chunk_mismatch {
+                    hash_mismatch_occurred = true;
+                }
+            }
+            Err(e) => {
+                error!("A chunk download task failed or panicked: {}", e);
+                task_failed = true;
+            }
         }
     }
 
@@ -355,7 +354,7 @@ pub async fn perform_model_download(
     let mut status = lock_status(&state.engine_status);
     if hash_mismatch_occurred {
         status.corrupted_models.insert(id.clone());
-    } else {
+    } else if !task_failed {
         let mut all_exist = true;
         for f in &files {
             if !downloads_dir.join(f).exists() {
@@ -620,10 +619,7 @@ async fn check_existing_metadata(
                 id
             );
             {
-                let mut dl = state
-                    .active_downloads
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut dl = lock_mutex(&state.active_downloads);
                 if let Some(status) = dl.get_mut(id) {
                     status.state = "Corrupted metadata. Restarting...".to_string();
                 }
@@ -644,10 +640,7 @@ async fn check_existing_metadata(
 }
 
 fn update_status_connecting(state: &Arc<AppState>, id: &str, existing_size: u64) {
-    let mut dl = state
-        .active_downloads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut dl = lock_mutex(&state.active_downloads);
     if let Some(status) = dl.get_mut(id) {
         status.bytes_transferred = existing_size;
         status.state = "Connecting...".to_string();
@@ -969,7 +962,7 @@ async fn process_download_stream(
 
                     let current_grand_total = grand_total.load(std::sync::atomic::Ordering::Relaxed);
                     {
-                        let mut dl = state.active_downloads.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut dl = lock_mutex(&state.active_downloads);
                         if let Some(status) = dl.get_mut(id) {
                             status.bytes_transferred = total_transferred;
                             status.total_bytes = current_grand_total;

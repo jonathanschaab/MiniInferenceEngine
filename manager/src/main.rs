@@ -24,8 +24,8 @@ use tracing_subscriber::EnvFilter;
 
 use manager::{
     ApiRequest, BenchmarkRequest, DownloadStatus, EngineStatus, Message, ModelArch, ModelConfig,
-    ModelRole, StreamEvent, TelemetryStore, UserRequest, get_model_registry, lock_status,
-    run_batcher_loop,
+    ModelRole, StreamEvent, TelemetryStore, UserRequest, get_model_registry, lock_mutex,
+    lock_status, run_batcher_loop,
 };
 
 // --- CONSTANTS ---
@@ -170,45 +170,14 @@ impl AppConfig {
     pub async fn load() -> Self {
         let toml_path = manager::types::resolve_absolute_path("config.toml");
         let json_path = manager::types::resolve_absolute_path("config.json");
-        let mut config = if let Ok(data) = tokio::fs::read_to_string(&toml_path).await {
-            toml::from_str(&data).unwrap_or_default()
+        let (mut config, needs_save) = if let Ok(data) = tokio::fs::read_to_string(&toml_path).await
+        {
+            (toml::from_str(&data).unwrap_or_default(), false)
         } else if let Ok(data) = tokio::fs::read_to_string(&json_path).await {
             // Fallback for backwards compatibility, but save as TOML going forward
-            let mut config: Self = serde_json::from_str(&data).unwrap_or_default();
-            if config.max_concurrent_downloads == 0 {
-                warn!("max_concurrent_downloads cannot be 0. Enforcing minimum value of 1.");
-                config.max_concurrent_downloads = 1;
-            }
-            if config.max_concurrent_chunk_downloads == 0 {
-                warn!("max_concurrent_chunk_downloads cannot be 0. Enforcing minimum value of 1.");
-                config.max_concurrent_chunk_downloads = 1;
-            }
-            match toml::to_string_pretty(&config) {
-                Ok(toml_str) => {
-                    if let Err(e) = tokio::fs::write(&toml_path, toml_str).await {
-                        warn!("Failed to write migrated config.toml: {}", e);
-                    }
-                }
-                Err(e) => warn!("Failed to serialize configuration to TOML: {}", e),
-            }
-            config
+            (serde_json::from_str(&data).unwrap_or_default(), true)
         } else {
-            let mut config = Self::default();
-            if config.max_concurrent_downloads == 0 {
-                config.max_concurrent_downloads = 1;
-            }
-            if config.max_concurrent_chunk_downloads == 0 {
-                config.max_concurrent_chunk_downloads = 1;
-            }
-            match toml::to_string_pretty(&config) {
-                Ok(toml_str) => {
-                    if let Err(e) = tokio::fs::write(&toml_path, toml_str).await {
-                        warn!("Failed to write default config.toml: {}", e);
-                    }
-                }
-                Err(e) => warn!("Failed to serialize default configuration to TOML: {}", e),
-            }
-            config
+            (Self::default(), true)
         };
 
         if config.max_concurrent_downloads == 0 {
@@ -218,6 +187,17 @@ impl AppConfig {
         if config.max_concurrent_chunk_downloads == 0 {
             warn!("max_concurrent_chunk_downloads cannot be 0. Enforcing minimum value of 1.");
             config.max_concurrent_chunk_downloads = 1;
+        }
+
+        if needs_save {
+            match toml::to_string_pretty(&config) {
+                Ok(toml_str) => {
+                    if let Err(e) = tokio::fs::write(&toml_path, toml_str).await {
+                        warn!("Failed to write config.toml: {}", e);
+                    }
+                }
+                Err(e) => warn!("Failed to serialize configuration to TOML: {}", e),
+            }
         }
 
         config
@@ -252,7 +232,7 @@ impl Drop for SharedLogWriter {
         let s = String::from_utf8_lossy(&self.local_buf);
         let trimmed = s.trim_end();
         if !trimmed.is_empty() {
-            let mut guard = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = lock_mutex(&self.buffer);
             guard.1.push_back(trimmed.to_string());
             guard.0 += 1; // Increment the global cursor counter
             if guard.1.len() > 1000 {
@@ -311,47 +291,52 @@ async fn csp_middleware(req: Request, next: Next) -> Response {
     response
 }
 
-pub(crate) async fn serve_ui(
-    session: tower_sessions::Session,
-) -> Result<Html<&'static str>, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
-    }
-    Ok(Html(include_str!("../web/index.html")))
+macro_rules! require_admin {
+    ($user:expr, $msg:expr) => {
+        if !$user.is_admin {
+            return (StatusCode::FORBIDDEN, $msg).into_response();
+        }
+    };
 }
 
-pub(crate) async fn serve_queue_ui(
-    session: tower_sessions::Session,
-) -> Result<Html<&'static str>, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
-    }
-    Ok(Html(include_str!("../web/queue.html")))
+macro_rules! serve_html {
+    ($name:ident, $path:expr) => {
+        pub(crate) async fn $name(
+            session: tower_sessions::Session,
+        ) -> Result<Html<&'static str>, Redirect> {
+            if require_session(session).await.is_err() {
+                return Err(Redirect::to("/auth/login"));
+            }
+            Ok(Html(include_str!($path)))
+        }
+    };
 }
 
-pub(crate) async fn serve_queue_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../web/queue.js"),
-    )
+macro_rules! serve_static {
+    ($name:ident, $content_type:expr, $path:expr) => {
+        pub(crate) async fn $name() -> impl IntoResponse {
+            ([(header::CONTENT_TYPE, $content_type)], include_str!($path))
+        }
+    };
+}
+
+serve_html!(serve_ui, "../web/index.html");
+serve_html!(serve_queue_ui, "../web/queue.html");
+serve_static!(serve_queue_js, "application/javascript", "../web/queue.js");
+
+fn apply_model_status_flags(model: &mut ModelConfig, status: &EngineStatus) {
+    model.is_downloaded = status.downloaded_models.contains(&model.id);
+    model.is_in_hf_cache = status.cached_models.contains(&model.id);
+    model.is_corrupted = status.corrupted_models.contains(&model.id);
 }
 
 // Send the model roster to the Javascript dropdowns
 pub(crate) async fn get_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelConfig>> {
     let mut models = get_model_registry().await;
-    let (downloaded_ids, cached_ids, corrupted_ids) = {
-        let status = lock_status(&state.engine_status);
-        (
-            status.downloaded_models.clone(),
-            status.cached_models.clone(),
-            status.corrupted_models.clone(),
-        )
-    };
+    let status = lock_status(&state.engine_status);
 
     for model in &mut models {
-        model.is_downloaded = downloaded_ids.contains(&model.id);
-        model.is_in_hf_cache = cached_ids.contains(&model.id);
-        model.is_corrupted = corrupted_ids.contains(&model.id);
+        apply_model_status_flags(model, &status);
     }
 
     Json(models)
@@ -360,7 +345,7 @@ pub(crate) async fn get_models(State(state): State<Arc<AppState>>) -> Json<Vec<M
 // Fetch a single model by ID
 pub(crate) async fn get_model(
     State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    Path(id): Path<String>,
 ) -> Result<Json<ModelConfig>, StatusCode> {
     let models = get_model_registry().await;
     let mut model = models
@@ -368,18 +353,8 @@ pub(crate) async fn get_model(
         .find(|m| m.id == id)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let (downloaded_ids, cached_ids, corrupted_ids) = {
-        let status = lock_status(&state.engine_status);
-        (
-            status.downloaded_models.clone(),
-            status.cached_models.clone(),
-            status.corrupted_models.clone(),
-        )
-    };
-
-    model.is_downloaded = downloaded_ids.contains(&model.id);
-    model.is_in_hf_cache = cached_ids.contains(&model.id);
-    model.is_corrupted = corrupted_ids.contains(&model.id);
+    let status = lock_status(&state.engine_status);
+    apply_model_status_flags(&mut model, &status);
 
     Ok(Json(model))
 }
@@ -429,11 +404,7 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>) -> Json<Engin
 pub(crate) async fn get_download_progress(
     State(state): State<Arc<AppState>>,
 ) -> Json<std::collections::HashMap<String, DownloadStatus>> {
-    let downloads = state
-        .active_downloads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let downloads = lock_mutex(&state.active_downloads).clone();
     Json(downloads)
 }
 
@@ -448,13 +419,7 @@ pub(crate) async fn trigger_download(
     user: auth::CurrentUser,
     Json(payload): Json<DownloadRequest>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (
-            StatusCode::FORBIDDEN,
-            "Admin access required for downloading",
-        )
-            .into_response();
-    }
+    require_admin!(user, "Admin access required for downloading");
 
     let id = payload.model_id;
 
@@ -500,10 +465,7 @@ pub(crate) async fn trigger_download(
     }
 
     {
-        let mut downloads = state
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut downloads = lock_mutex(&state.active_downloads);
         if downloads.contains_key(&id) {
             return (StatusCode::CONFLICT, "Download already in progress").into_response();
         }
@@ -541,11 +503,7 @@ pub(crate) async fn trigger_download(
         .await;
     });
 
-    state
-        .download_tasks
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(id.clone(), (cancel_tx, task));
+    lock_mutex(&state.download_tasks).insert(id.clone(), (cancel_tx, task));
 
     (StatusCode::ACCEPTED, format!("Download started for {}", id)).into_response()
 }
@@ -556,35 +514,79 @@ pub(crate) async fn pause_download(
     user: auth::CurrentUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (
-            StatusCode::FORBIDDEN,
-            "Admin access required for pausing downloads",
-        )
-            .into_response();
-    }
+    require_admin!(user, "Admin access required for pausing downloads");
 
-    let download_task = {
-        let mut tasks = state
-            .download_tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        tasks.remove(&id)
-    };
-
-    if let Some((cancel_tx, task)) = download_task {
-        let _ = cancel_tx.send(()); // Trigger graceful checkpoint and exit
-        let _ = task.await; // Wait for the task to finish cancelling
+    if abort_download_task(&state, &id).await {
         info!("Aborted active download task for model {} (Paused)", id);
-
-        let mut dl = state
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        dl.remove(&id);
         (StatusCode::OK, "Download paused").into_response()
     } else {
         (StatusCode::NOT_FOUND, "No active download to pause").into_response()
+    }
+}
+
+async fn cleanup_empty_parents(path: &std::path::Path, limit_dir: &std::path::Path) {
+    let mut current_dir = path.parent();
+    while let Some(parent) = current_dir {
+        if parent == limit_dir {
+            break;
+        }
+        if tokio::fs::remove_dir(parent).await.is_err() {
+            break; // Stop if directory is not empty or on other errors
+        }
+        current_dir = parent.parent();
+    }
+}
+
+async fn cleanup_model_files(
+    downloads_dir: &std::path::Path,
+    filename: &str,
+    delete_completed: bool,
+) {
+    let filenames = manager::get_split_filenames(filename);
+    for fname in filenames {
+        let tmp_file_path = downloads_dir.join(format!("{}.tmp", fname));
+        let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
+        let _ = tokio::fs::remove_file(&tmp_file_path).await;
+        let _ = tokio::fs::remove_file(&meta_file_path).await;
+
+        if delete_completed {
+            let file_path = downloads_dir.join(&fname);
+            let corrupted_path = downloads_dir.join(format!("{}.corrupted", fname));
+            let _ = tokio::fs::remove_file(&file_path).await;
+            let _ = tokio::fs::remove_file(&corrupted_path).await;
+            cleanup_empty_parents(&file_path, downloads_dir).await;
+        } else {
+            cleanup_empty_parents(&tmp_file_path, downloads_dir).await;
+        }
+    }
+}
+
+async fn abort_download_task(state: &AppState, id: &str) -> bool {
+    let download_task = {
+        let mut tasks = lock_mutex(&state.download_tasks);
+        tasks.remove(id)
+    };
+
+    if let Some((cancel_tx, task)) = download_task {
+        let _ = cancel_tx.send(());
+        let _ = task.await; // Wait for the task to finish cancelling
+        let mut dl = lock_mutex(&state.active_downloads);
+        dl.remove(id);
+        true
+    } else {
+        false
+    }
+}
+
+async fn cleanup_model_by_id(state: &AppState, id: &str, delete_completed: bool) -> bool {
+    let registry = manager::get_model_registry().await;
+    if let Some(model) = registry.into_iter().find(|m| m.id == id) {
+        let downloads_dir =
+            manager::types::resolve_absolute_path(&state.config.downloads_directory);
+        cleanup_model_files(&downloads_dir, &model.filename, delete_completed).await;
+        true
+    } else {
+        false
     }
 }
 
@@ -593,55 +595,20 @@ pub(crate) async fn cancel_all_downloads(
     State(state): State<Arc<AppState>>,
     user: auth::CurrentUser,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (
-            StatusCode::FORBIDDEN,
-            "Admin access required for cancelling downloads",
-        )
-            .into_response();
-    }
+    require_admin!(user, "Admin access required for cancelling downloads");
 
     let tasks_to_abort: Vec<_> = {
-        let mut tasks = state
-            .download_tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut tasks = lock_mutex(&state.download_tasks);
         tasks.drain().collect()
     };
 
     for (id, (cancel_tx, task)) in tasks_to_abort {
         let _ = cancel_tx.send(());
         let _ = task.await; // Guard cleans up active_downloads automatically
-
-        let registry = manager::get_model_registry().await;
-        if let Some(model) = registry.into_iter().find(|m| m.id == id) {
-            let downloads_dir =
-                manager::types::resolve_absolute_path(&state.config.downloads_directory);
-            let filenames = manager::get_split_filenames(&model.filename);
-            for fname in filenames {
-                let tmp_file_path = downloads_dir.join(format!("{}.tmp", fname));
-                let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
-                let _ = tokio::fs::remove_file(&tmp_file_path).await;
-                let _ = tokio::fs::remove_file(&meta_file_path).await;
-
-                let mut current_dir = tmp_file_path.parent();
-                while let Some(parent) = current_dir {
-                    if parent == downloads_dir {
-                        break;
-                    }
-                    if tokio::fs::remove_dir(parent).await.is_err() {
-                        break; // Stop if directory is not empty or on other errors
-                    }
-                    current_dir = parent.parent();
-                }
-            }
-        }
+        cleanup_model_by_id(&state, &id, false).await;
     }
 
-    let mut dl = state
-        .active_downloads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut dl = lock_mutex(&state.active_downloads);
     dl.clear();
 
     (StatusCode::OK, "All downloads cancelled").into_response()
@@ -653,59 +620,18 @@ pub(crate) async fn cancel_download(
     user: auth::CurrentUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (
-            StatusCode::FORBIDDEN,
-            "Admin access required for cancelling downloads",
-        )
-            .into_response();
-    }
+    require_admin!(user, "Admin access required for cancelling downloads");
 
-    let download_task = {
-        let mut tasks = state
-            .download_tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        tasks.remove(&id)
-    };
-
-    if let Some((cancel_tx, task)) = download_task {
-        let _ = cancel_tx.send(());
-        let _ = task.await; // Wait for the task to finish cancelling
+    if abort_download_task(&state, &id).await {
         info!("Aborted active download task for model {}", id);
     } else {
-        let mut dl = state
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut dl = lock_mutex(&state.active_downloads);
         if dl.remove(&id).is_none() {
             return (StatusCode::NOT_FOUND, "No active download to cancel").into_response();
         }
     }
 
-    let registry = manager::get_model_registry().await;
-    if let Some(model) = registry.into_iter().find(|m| m.id == id) {
-        let downloads_dir =
-            manager::types::resolve_absolute_path(&state.config.downloads_directory);
-        let filenames = manager::get_split_filenames(&model.filename);
-        for fname in filenames {
-            let tmp_file_path = downloads_dir.join(format!("{}.tmp", fname));
-            let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
-            let _ = tokio::fs::remove_file(&tmp_file_path).await;
-            let _ = tokio::fs::remove_file(&meta_file_path).await;
-
-            let mut current_dir = tmp_file_path.parent();
-            while let Some(parent) = current_dir {
-                if parent == downloads_dir {
-                    break;
-                }
-                if tokio::fs::remove_dir(parent).await.is_err() {
-                    break;
-                }
-                current_dir = parent.parent();
-            }
-        }
-    }
+    cleanup_model_by_id(&state, &id, false).await;
 
     (StatusCode::OK, "Download cancelled").into_response()
 }
@@ -716,37 +642,12 @@ pub(crate) async fn delete_model(
     user: auth::CurrentUser,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (
-            StatusCode::FORBIDDEN,
-            "Admin access required for deleting models",
-        )
-            .into_response();
-    }
+    require_admin!(user, "Admin access required for deleting models");
 
-    let download_task = {
-        let mut tasks = state
-            .download_tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        tasks.remove(&id)
-    };
-
-    if let Some((cancel_tx, task)) = download_task {
-        let _ = cancel_tx.send(());
-        let _ = task.await; // Wait for the task to finish cancelling
+    if abort_download_task(&state, &id).await {
         info!("Aborted active download task for model {}", id);
-
-        let mut dl = state
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        dl.remove(&id);
     } else {
-        let downloads = state
-            .active_downloads
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let downloads = lock_mutex(&state.active_downloads);
         if downloads.contains_key(&id) {
             return (
                 StatusCode::CONFLICT,
@@ -763,35 +664,8 @@ pub(crate) async fn delete_model(
         }
     }
 
-    let registry = get_model_registry().await;
-    let model = match registry.into_iter().find(|m| m.id == id) {
-        Some(m) => m,
-        None => return (StatusCode::NOT_FOUND, "Model not found").into_response(),
-    };
-
-    let downloads_dir = manager::types::resolve_absolute_path(&state.config.downloads_directory);
-    let filenames = manager::get_split_filenames(&model.filename);
-    for fname in filenames {
-        let file_path = downloads_dir.join(&fname);
-        let tmp_file_path = downloads_dir.join(format!("{}.tmp", fname));
-        let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
-        let corrupted_path = downloads_dir.join(format!("{}.corrupted", fname));
-
-        let _ = tokio::fs::remove_file(&file_path).await;
-        let _ = tokio::fs::remove_file(&tmp_file_path).await;
-        let _ = tokio::fs::remove_file(&meta_file_path).await;
-        let _ = tokio::fs::remove_file(&corrupted_path).await;
-
-        let mut current_dir = file_path.parent();
-        while let Some(parent) = current_dir {
-            if parent == downloads_dir {
-                break;
-            }
-            if tokio::fs::remove_dir(parent).await.is_err() {
-                break;
-            }
-            current_dir = parent.parent();
-        }
+    if !cleanup_model_by_id(&state, &id, true).await {
+        return (StatusCode::NOT_FOUND, "Model not found").into_response();
     }
 
     {
@@ -1307,12 +1181,11 @@ pub(crate) async fn serve_console_ui(
     Ok(Html(include_str!("../web/console.html")))
 }
 
-pub(crate) async fn serve_console_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../web/console.js"),
-    )
-}
+serve_static!(
+    serve_console_js,
+    "application/javascript",
+    "../web/console.js"
+);
 
 #[derive(Deserialize)]
 pub struct LogQuery {
@@ -1330,10 +1203,8 @@ pub(crate) async fn get_console_logs(
     axum::extract::Query(query): axum::extract::Query<LogQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
-    }
-    let guard = state.log_buffer.0.lock().unwrap_or_else(|e| e.into_inner());
+    require_admin!(user, "Admin access required");
+    let guard = lock_mutex(&state.log_buffer.0);
 
     let total_emitted = guard.0;
     let buffer = &guard.1;
@@ -1360,10 +1231,8 @@ pub(crate) async fn clear_console_logs(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
-    }
-    let mut guard = state.log_buffer.0.lock().unwrap_or_else(|e| e.into_inner());
+    require_admin!(user, "Admin access required");
+    let mut guard = lock_mutex(&state.log_buffer.0);
     guard.1.clear();
     guard.0 = 0;
     StatusCode::OK.into_response()
@@ -1379,9 +1248,7 @@ pub(crate) async fn set_console_loglevel(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LogLevelRequest>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
-    }
+    require_admin!(user, "Admin access required");
     let new_filter = match EnvFilter::try_new(&payload.level) {
         Ok(filter) => filter,
         Err(e) => {
@@ -1395,10 +1262,7 @@ pub(crate) async fn set_console_loglevel(
         )
             .into_response();
     }
-    *state
-        .current_log_level
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = payload.level.clone();
+    *lock_mutex(&state.current_log_level) = payload.level.clone();
     (StatusCode::OK, "Log level updated").into_response()
 }
 
@@ -1681,73 +1545,38 @@ pub(crate) async fn get_console_loglevel(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
-    }
-    let level = state
-        .current_log_level
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    require_admin!(user, "Admin access required");
+    let level = lock_mutex(&state.current_log_level).clone();
     Json(LogLevelRequest { level }).into_response()
 }
 
-pub(crate) async fn serve_chat_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../web/chat.js"),
-    )
-}
-
-pub(crate) async fn serve_stats_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../web/stats.js"),
-    )
-}
-
-pub(crate) async fn serve_models_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../web/models.js"),
-    )
-}
-
-pub(crate) async fn serve_settings_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../web/settings.js"),
-    )
-}
-
-pub(crate) async fn serve_memory_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../web/memory.js"),
-    )
-}
-
-pub(crate) async fn serve_common_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../web/common.js"),
-    )
-}
-
-pub(crate) async fn serve_common_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css")],
-        include_str!("../web/common.css"),
-    )
-}
+serve_static!(serve_chat_js, "application/javascript", "../web/chat.js");
+serve_static!(serve_stats_js, "application/javascript", "../web/stats.js");
+serve_static!(
+    serve_models_js,
+    "application/javascript",
+    "../web/models.js"
+);
+serve_static!(
+    serve_settings_js,
+    "application/javascript",
+    "../web/settings.js"
+);
+serve_static!(
+    serve_memory_js,
+    "application/javascript",
+    "../web/memory.js"
+);
+serve_static!(
+    serve_common_js,
+    "application/javascript",
+    "../web/common.js"
+);
+serve_static!(serve_common_css, "text/css", "../web/common.css");
 
 // Route: Serve the Telemetry JSON
 pub(crate) async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetryStore> {
-    let current_data = state
-        .telemetry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+    let current_data = lock_mutex(&state.telemetry).clone();
     Json(current_data)
 }
 
@@ -1802,11 +1631,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let registry = manager::get_model_registry().await;
             let active_keys: std::collections::HashSet<String> = {
-                let active = active_downloads_for_cleanup
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let active = lock_mutex(&active_downloads_for_cleanup);
                 active.keys().cloned().collect()
             };
+
+            let mut active_expected_bases = std::collections::HashSet::new();
+            for model in &registry {
+                if active_keys.contains(&model.id) {
+                    let expected_names = manager::get_split_filenames(&model.filename);
+                    for expected in expected_names {
+                        if let Some(expected_base) = std::path::Path::new(&expected)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                        {
+                            active_expected_bases.insert(expected_base.to_string());
+                        }
+                    }
+                }
+            }
 
             let mut dirs_to_visit = vec![downloads_dir_for_cleanup.clone()];
 
@@ -1840,40 +1682,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 && age.as_secs() > TEMP_FILE_EXPIRY_AGE_SECS
                             {
                                 let mut is_active = false;
-                                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                                    for model in &registry {
-                                        if active_keys.contains(&model.id) {
-                                            let expected_names =
-                                                manager::get_split_filenames(&model.filename);
-                                            if expected_names.iter().any(|expected| {
-                                                let expected_base = std::path::Path::new(expected)
-                                                    .file_name()
-                                                    .and_then(|n| n.to_str())
-                                                    .unwrap_or_default();
-                                                file_name.starts_with(expected_base)
-                                            }) {
-                                                is_active = true;
-                                                break;
-                                            }
-                                        }
-                                    }
+                                if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str())
+                                    && active_expected_bases.contains(file_stem)
+                                {
+                                    is_active = true;
                                 }
 
                                 if !is_active {
                                     // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
                                     let _ = tokio::fs::remove_file(&path).await;
                                     info!("Cleaned up abandoned file: {:?}", path);
-
-                                    let mut current_dir = path.parent();
-                                    while let Some(parent) = current_dir {
-                                        if parent == downloads_dir_for_cleanup {
-                                            break;
-                                        }
-                                        if tokio::fs::remove_dir(parent).await.is_err() {
-                                            break;
-                                        }
-                                        current_dir = parent.parent();
-                                    }
+                                    cleanup_empty_parents(&path, &downloads_dir_for_cleanup).await;
                                 }
                             }
                         }
@@ -2302,10 +2121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn shutdown_signal(
-    force_tx: tokio::sync::oneshot::Sender<()>,
-    shutdown_tx: tokio::sync::broadcast::Sender<()>,
-) {
+async fn wait_for_termination_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -2327,31 +2143,20 @@ async fn shutdown_signal(
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+}
+
+async fn shutdown_signal(
+    force_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+) {
+    wait_for_termination_signal().await;
     info!("Received termination signal, starting graceful shutdown...");
     let _ = shutdown_tx.send(());
 
     // Force shutdown if graceful shutdown takes longer than 30 seconds, or if a second signal is received
     tokio::spawn(async move {
-        let ctrl_c = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
-        };
-
-        #[cfg(unix)]
-        let terminate = async {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler")
-                .recv()
-                .await;
-        };
-
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
         tokio::select! {
-            _ = ctrl_c => { error!("Received second termination signal. Forcing immediate exit."); },
-            _ = terminate => { error!("Received second termination signal. Forcing immediate exit."); },
+            _ = wait_for_termination_signal() => { error!("Received second termination signal. Forcing immediate exit."); },
             _ = tokio::time::sleep(std::time::Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS)) => { error!("Graceful shutdown timed out after {} seconds. Forcing exit.", GRACEFUL_SHUTDOWN_TIMEOUT_SECS); },
         }
         let _ = force_tx.send(());
@@ -3064,17 +2869,17 @@ mod tests {
             manager::types::resolve_absolute_path("test_downloads_shutdown/model.safetensors.tmp");
         let mut downloaded_bytes = 0;
         for i in 0..50 {
-            if let Ok(meta) = tokio::fs::metadata(&tmp_path).await {
-                if meta.len() > 0 {
-                    downloaded_bytes = meta.len();
-                    tracing::info!(
-                        "Test: tmp file created and has {} bytes. Breaking loop.",
-                        downloaded_bytes
-                    );
-                    // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    break;
-                }
+            if let Ok(meta) = tokio::fs::metadata(&tmp_path).await
+                && meta.len() > 0
+            {
+                downloaded_bytes = meta.len();
+                tracing::info!(
+                    "Test: tmp file created and has {} bytes. Breaking loop.",
+                    downloaded_bytes
+                );
+                // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                break;
             }
             if i % 10 == 0 {
                 tracing::info!(
@@ -3246,17 +3051,17 @@ mod tests {
             manager::types::resolve_absolute_path("test_downloads_cancel/model.safetensors.tmp");
         let mut downloaded_bytes = 0;
         for i in 0..50 {
-            if let Ok(meta) = tokio::fs::metadata(&tmp_path).await {
-                if meta.len() > 0 {
-                    downloaded_bytes = meta.len();
-                    tracing::info!(
-                        "Test: tmp file created and has {} bytes. Breaking loop.",
-                        downloaded_bytes
-                    );
-                    // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    break;
-                }
+            if let Ok(meta) = tokio::fs::metadata(&tmp_path).await
+                && meta.len() > 0
+            {
+                downloaded_bytes = meta.len();
+                tracing::info!(
+                    "Test: tmp file created and has {} bytes. Breaking loop.",
+                    downloaded_bytes
+                );
+                // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                break;
             }
             if i % 10 == 0 {
                 tracing::info!(

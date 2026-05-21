@@ -797,6 +797,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
 
         let mut handles = Vec::new();
         let hf_cache = hf_hub::Cache::default();
+        let init_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
 
         for reg in registrations {
             let api_opt = api_opt.clone();
@@ -805,8 +806,11 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
             let hf_cache = hf_cache.clone();
             let downloads_dir = downloads_dir.clone();
             let hf_base_url = hf_base_url.clone();
+            let sem_clone = init_semaphore.clone();
 
             handles.push(tokio::spawn(async move {
+                let _permit = sem_clone.acquire().await;
+
                 let mut provenance = std::collections::HashMap::new();
 
                 let mut arch = reg.overrides.arch;
