@@ -597,34 +597,15 @@ pub async fn run_batcher_loop(
 
         let static_alloc = active_backend.as_ref().unwrap().is_statically_allocated();
 
-        if static_alloc {
+        let mut warning_msg = "Prompt + Max Tokens exceeds KV Cache! Triggering compression.";
+        let effective_limit = if static_alloc {
             info!(
                 "MEMORY CHECK: Statically allocated up to {} tokens.",
                 active_max_context
             );
-            if token_count + requested_max_tokens > active_max_context {
-                warn!("Prompt + Max Tokens exceeds KV Cache! Triggering compression.");
-                trigger_compression = true;
-                dynamic_target_budget = active_max_context
-                    .saturating_sub(requested_max_tokens)
-                    .max(256);
-            } else if token_count > (active_max_context as f32 * 0.80) as usize {
-                trigger_compression = true;
-                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(active_max_context);
-            } else if request.force_compression {
-                info!("Benchmarking: Forcing compression execution.");
-                trigger_compression = true;
-                dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(active_max_context);
-            }
+            active_max_context
         } else if let Some((_, _, free_vram)) = vram_info {
-            // This rough heuristic is only for the Candle backend's dynamic memory check.
-            // Llama.cpp calculates this precisely during its static allocation.
             let bytes_per_token = config.estimate_kv_bytes_per_token();
-            // Candle backend uses a hardcoded prefill_chunk_size of 256
             let compute_margin = config.estimate_compute_margin_bytes(256);
             let safe_free_vram = free_vram.saturating_sub(compute_margin);
             let absolute_max_tokens =
@@ -634,45 +615,29 @@ pub async fn run_batcher_loop(
                 "MEMORY CHECK: Free VRAM can hold ~{} tokens.",
                 absolute_max_tokens
             );
-
-            if token_count + requested_max_tokens > absolute_max_tokens {
-                warn!("Prompt exceeds physical VRAM limits! Triggering dynamic compression.");
-                trigger_compression = true;
-                dynamic_target_budget = absolute_max_tokens
-                    .saturating_sub(requested_max_tokens)
-                    .max(256);
-            } else if token_count > (active_max_context as f32 * 0.80) as usize {
-                trigger_compression = true;
-                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(absolute_max_tokens);
-            } else if request.force_compression {
-                info!("Benchmarking: Forcing compression execution.");
-                trigger_compression = true;
-                dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(absolute_max_tokens);
-            }
+            warning_msg = "Prompt exceeds physical VRAM limits! Triggering dynamic compression.";
+            absolute_max_tokens
         } else {
-            // CPU fallback
-            if token_count + requested_max_tokens > active_max_context {
-                warn!("Prompt + Max Tokens exceeds KV Cache! Triggering compression.");
-                trigger_compression = true;
-                dynamic_target_budget = active_max_context
-                    .saturating_sub(requested_max_tokens)
-                    .max(256);
-            } else if token_count > (active_max_context as f32 * 0.80) as usize {
-                trigger_compression = true;
-                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(active_max_context);
-            } else if request.force_compression {
-                info!("Benchmarking: Forcing compression execution.");
-                trigger_compression = true;
-                dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(active_max_context);
-            }
+            active_max_context
+        };
+
+        if token_count + requested_max_tokens > effective_limit {
+            warn!("{}", warning_msg);
+            trigger_compression = true;
+            dynamic_target_budget = effective_limit
+                .saturating_sub(requested_max_tokens)
+                .max(256);
+        } else if token_count > (active_max_context as f32 * 0.80) as usize {
+            trigger_compression = true;
+            dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize)
+                .max(256)
+                .min(effective_limit);
+        } else if request.force_compression {
+            info!("Benchmarking: Forcing compression execution.");
+            trigger_compression = true;
+            dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
+                .max(256)
+                .min(effective_limit);
         }
 
         if trigger_compression {

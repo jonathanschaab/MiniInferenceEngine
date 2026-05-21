@@ -11,6 +11,7 @@ const UPDATE_INTERVAL_MS: u128 = 500;
 const UPDATE_BYTES_THRESHOLD: u64 = 1024 * 1024;
 const META_SAVE_INTERVAL_SECS: u64 = 5;
 const CORRUPT_RESTART_DELAY_SECS: u64 = 3;
+const HASHER_STATE_VERSION: u32 = 1;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Checkpoint {
@@ -24,6 +25,8 @@ pub struct DownloadMetadata {
     pub is_sha256: bool,
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
+    #[serde(default)]
+    pub hasher_version: u32,
 }
 
 // Safely extract the internal state of the Sha256 struct into a hex string
@@ -53,6 +56,18 @@ impl Drop for ActiveStreamGuard {
     fn drop(&mut self) {
         self.counter
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+async fn wait_for_backoff(
+    backoff: u64,
+    shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    cancel_rx: &mut tokio::sync::broadcast::Receiver<()>,
+) -> Option<&'static str> {
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => None,
+        _ = shutdown_rx.recv() => Some("Shutdown"),
+        _ = cancel_rx.recv() => Some("Cancel"),
     }
 }
 
@@ -176,16 +191,14 @@ pub async fn perform_model_download(
                             "429 Too Many Requests during metadata fetch for {}. Retrying ({}/{}) in {} seconds...",
                             fname, retries, MAX_RETRIES, backoff
                         );
-                        tokio::select! {
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => {}
-                            _ = shutdown_rx.recv() => {
-                                info!("Shutdown signal received during metadata fetch backoff. Aborting.");
-                                return;
-                            }
-                            _ = cancel_rx.recv() => {
-                                info!("Cancel signal received during metadata fetch backoff. Aborting.");
-                                return;
-                            }
+                        if let Some(reason) =
+                            wait_for_backoff(backoff, &mut shutdown_rx, &mut cancel_rx).await
+                        {
+                            info!(
+                                "{} signal received during metadata fetch backoff. Aborting.",
+                                reason
+                            );
+                            return;
                         }
                         backoff = (backoff * 2).min(30);
                         continue;
@@ -558,6 +571,7 @@ async fn check_existing_metadata(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
                     checkpoints: cps,
+                    hasher_version: 0,
                 });
             }
         }
@@ -580,6 +594,14 @@ async fn check_existing_metadata(
                 // Fallback to whatever was tracked if we couldn't fetch remote_sha256
                 expected_hash = Some(hash.to_string());
                 is_sha256 = local_is_sha256;
+            }
+
+            if meta.hasher_version != HASHER_STATE_VERSION {
+                warn!(
+                    "Metadata for {} has an incompatible hasher state version. Discarding local partial download.",
+                    id
+                );
+                return (0, expected_hash, is_sha256, initial_hasher, Vec::new());
             }
 
             // Find the most recent valid checkpoint
@@ -698,16 +720,14 @@ async fn initiate_request(
                             "Hugging Face rate limit (429) hit for {}. Other chunks are actively downloading, waiting {} seconds...",
                             id, backoff
                         );
-                        tokio::select! {
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => {}
-                            _ = shutdown_rx.recv() => {
-                                info!("Shutdown signal received during request backoff for {}. Aborting.", id);
-                                return None;
-                            }
-                            _ = cancel_rx.recv() => {
-                                info!("Cancel signal received during request backoff for {}. Aborting.", id);
-                                return None;
-                            }
+                        if let Some(reason) =
+                            wait_for_backoff(backoff, shutdown_rx, cancel_rx).await
+                        {
+                            info!(
+                                "{} signal received during request backoff for {}. Aborting.",
+                                reason, id
+                            );
+                            return None;
                         }
                         backoff = (backoff * 2).min(60);
                         continue;
@@ -724,16 +744,14 @@ async fn initiate_request(
                             "Hugging Face rate limit (429) hit for {}. No active chunks. Retrying ({}/{}) in {} seconds...",
                             id, retries, MAX_RETRIES, backoff
                         );
-                        tokio::select! {
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(backoff)) => {}
-                            _ = shutdown_rx.recv() => {
-                                info!("Shutdown signal received during request backoff for {}. Aborting.", id);
-                                return None;
-                            }
-                            _ = cancel_rx.recv() => {
-                                info!("Cancel signal received during request backoff for {}. Aborting.", id);
-                                return None;
-                            }
+                        if let Some(reason) =
+                            wait_for_backoff(backoff, shutdown_rx, cancel_rx).await
+                        {
+                            info!(
+                                "{} signal received during request backoff for {}. Aborting.",
+                                reason, id
+                            );
+                            return None;
                         }
                         backoff = (backoff * 2).min(60);
                         continue;
@@ -870,6 +888,7 @@ async fn save_metadata(
         expected_hash: expected_hash.clone(),
         is_sha256,
         checkpoints: checkpoints.to_vec(),
+        hasher_version: HASHER_STATE_VERSION,
     };
     let _ = tokio::fs::write(
         meta_file_path,
@@ -1180,5 +1199,92 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&downloads_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_existing_metadata_hasher_version_mismatch() {
+        let temp_dir = std::env::temp_dir().join("test_metadata_version_mismatch");
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+        let tmp_file_path = temp_dir.join("model.tmp");
+        let meta_file_path = temp_dir.join("model.meta");
+
+        let _ = tokio::fs::write(&tmp_file_path, "dummy data").await;
+
+        // Write metadata with an incompatible hasher_version (e.g., 999)
+        let meta_json = serde_json::json!({
+            "expected_hash": "abcdef",
+            "is_sha256": true,
+            "checkpoints": [{
+                "downloaded_bytes": 10,
+                "hasher_state": "dummyhex"
+            }],
+            "hasher_version": 999
+        });
+        let _ = tokio::fs::write(&meta_file_path, meta_json.to_string()).await;
+
+        // Create dummy AppState
+        let (queue_tx, _) = tokio::sync::mpsc::channel(1);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+
+        let state = Arc::new(crate::AppState {
+            queue_tx,
+            engine_status: Arc::new(std::sync::Mutex::new(crate::EngineStatus::default())),
+            telemetry: Arc::new(std::sync::Mutex::new(crate::TelemetryStore::default())),
+            auth_store: Arc::new(std::sync::Mutex::new(crate::auth::AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client: oauth2::basic::BasicClient::new(
+                oauth2::ClientId::new("dummy".to_string()),
+                None,
+                oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+                None,
+            ),
+            config: Arc::new(crate::AppConfig::default()),
+            log_buffer: crate::SharedLogBuffer(Arc::new(std::sync::Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle: tracing_subscriber::reload::Layer::new(
+                tracing_subscriber::EnvFilter::new("info"),
+            )
+            .1,
+            current_log_level: Arc::new(std::sync::Mutex::new("info".to_string())),
+            active_downloads: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            db,
+            shutdown_tx,
+        });
+
+        let remote_sha256 = None;
+        let (existing_size, expected_hash, is_sha256, _hasher, checkpoints) =
+            super::check_existing_metadata(
+                &state,
+                "test-model",
+                &tmp_file_path,
+                &meta_file_path,
+                &remote_sha256,
+            )
+            .await;
+
+        // The mismatch should cause existing_size to reset to 0 and checkpoints to be cleared
+        assert_eq!(
+            existing_size, 0,
+            "Existing size should be reset to 0 due to version mismatch"
+        );
+        assert_eq!(
+            expected_hash,
+            Some("abcdef".to_string()),
+            "Expected hash should be preserved"
+        );
+        assert!(is_sha256, "is_sha256 flag should be preserved");
+        assert!(
+            checkpoints.is_empty(),
+            "Checkpoints should be cleared due to version mismatch"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

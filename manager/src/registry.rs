@@ -59,20 +59,27 @@ impl PromptFormatter for ModelArch {
                             system_prompt.push_str("\n\n");
                         }
                         system_prompt.push_str(&msg.content);
-                    } else if msg.role == "user" {
+                    }
+                }
+
+                let mut first_user = true;
+                let mut has_user = false;
+                for msg in messages {
+                    if msg.role == "user" {
                         prompt.push_str("[INST] ");
-                        if !system_prompt.is_empty() {
+                        if first_user && !system_prompt.is_empty() {
                             prompt.push_str(&system_prompt);
                             prompt.push_str("\n\n");
-                            system_prompt.clear();
+                            first_user = false;
                         }
                         prompt.push_str(&msg.content);
                         prompt.push_str(" [/INST]");
-                    } else {
+                        has_user = true;
+                    } else if msg.role != "system" {
                         prompt.push_str(&format!("{}</s>", msg.content));
                     }
                 }
-                if !system_prompt.is_empty() {
+                if !has_user && !system_prompt.is_empty() {
                     prompt.push_str(&format!("[INST] {} [/INST]", system_prompt));
                 }
             }
@@ -999,56 +1006,28 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
                                                             provenance.insert("original_max_position_embeddings".to_string(), "config.json".to_string());
                                                         }
                                                 }
-                                        if num_layers.is_none()
-                                            && let Some(v) = get_u64("num_hidden_layers") {
-                                                num_layers = Some(v);
-                                                provenance.insert("num_layers".to_string(), "config.json".to_string());
+
+                                        let apply_u64 = |opt: &mut Option<usize>, json_key: &str, prov_key: &str, prov: &mut std::collections::HashMap<String, String>| {
+                                            if opt.is_none() && let Some(v) = get_u64(json_key) {
+                                                *opt = Some(v);
+                                                prov.insert(prov_key.to_string(), "config.json".to_string());
                                             }
-                                        if n_embd.is_none()
-                                            && let Some(v) = get_u64("hidden_size") {
-                                                n_embd = Some(v);
-                                                provenance.insert("n_embd".to_string(), "config.json".to_string());
-                                            }
-                                        if n_head.is_none()
-                                            && let Some(v) = get_u64("num_attention_heads") {
-                                                n_head = Some(v);
-                                                provenance.insert("n_head".to_string(), "config.json".to_string());
-                                            }
+                                        };
+
+                                        apply_u64(&mut num_layers, "num_hidden_layers", "num_layers", &mut provenance);
+                                        apply_u64(&mut n_embd, "hidden_size", "n_embd", &mut provenance);
+                                        apply_u64(&mut n_head, "num_attention_heads", "n_head", &mut provenance);
                                         if n_head_kv.is_none()
                                             && let Some(v) = get_u64("num_key_value_heads").or(n_head) {
                                                 n_head_kv = Some(v);
                                                 provenance.insert("n_head_kv".to_string(), "config.json".to_string());
                                             }
-                                        if head_dim.is_none()
-                                            && let Some(v) = get_u64("head_dim") {
-                                                head_dim = Some(v);
-                                                provenance.insert("head_dim".to_string(), "config.json".to_string());
-                                            }
-                                        if intermediate_size.is_none()
-                                            && let Some(v) = get_u64("intermediate_size") {
-                                                intermediate_size = Some(v);
-                                                provenance.insert("intermediate_size".to_string(), "config.json".to_string());
-                                            }
-                                        if num_local_experts.is_none()
-                                            && let Some(v) = get_u64("num_local_experts") {
-                                                num_local_experts = Some(v);
-                                                provenance.insert("num_local_experts".to_string(), "config.json".to_string());
-                                            }
-                                        if num_experts_per_tok.is_none()
-                                            && let Some(v) = get_u64("num_experts_per_tok") {
-                                                num_experts_per_tok = Some(v);
-                                                provenance.insert("num_experts_per_tok".to_string(), "config.json".to_string());
-                                            }
-                                        if kv_lora_rank.is_none()
-                                            && let Some(v) = get_u64("kv_lora_rank") {
-                                                kv_lora_rank = Some(v);
-                                                provenance.insert("kv_lora_rank".to_string(), "config.json".to_string());
-                                            }
-                                        if qk_rope_head_dim.is_none()
-                                            && let Some(v) = get_u64("qk_rope_head_dim") {
-                                                qk_rope_head_dim = Some(v);
-                                                provenance.insert("qk_rope_head_dim".to_string(), "config.json".to_string());
-                                            }
+                                        apply_u64(&mut head_dim, "head_dim", "head_dim", &mut provenance);
+                                        apply_u64(&mut intermediate_size, "intermediate_size", "intermediate_size", &mut provenance);
+                                        apply_u64(&mut num_local_experts, "num_local_experts", "num_local_experts", &mut provenance);
+                                        apply_u64(&mut num_experts_per_tok, "num_experts_per_tok", "num_experts_per_tok", &mut provenance);
+                                        apply_u64(&mut kv_lora_rank, "kv_lora_rank", "kv_lora_rank", &mut provenance);
+                                        apply_u64(&mut qk_rope_head_dim, "qk_rope_head_dim", "qk_rope_head_dim", &mut provenance);
                                         if kv_cache_dtype.is_none() {
                                             if let Some(dt) = get_str("dtype").or_else(|| get_str("torch_dtype")) {
                                                 kv_cache_dtype = match dt.as_str() {
