@@ -338,6 +338,10 @@ pub async fn perform_model_download(
         });
     }
 
+    // We intentionally drain the entire JoinSet to completion here instead of
+    // aborting early if one chunk fails. Because the downloader supports partial
+    // HTTP byte-resumes, letting sibling chunk tasks finish (even if one fails
+    // due to a network hiccup) saves the user significant bandwidth when they retry.
     let mut hash_mismatch_occurred = false;
     while let Some(res) = join_set.join_next().await {
         if let Ok(chunk_mismatch) = res

@@ -6,25 +6,13 @@
     <title>Model Directory</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
     <link rel="stylesheet" href="/css/common.css">
-    <style>
-        .model-card { background: #181825; padding: 20px; border-radius: 8px; margin-bottom: 20px; border-left: 5px solid #fab387; box-shadow: 0 4px 6px rgba(0,0,0,0.1);}
-        .model-header { display: flex; justify-content: space-between; border-bottom: 1px solid #313244; padding-bottom: 10px; margin-bottom: 15px; }
-        .model-settings { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; }
-        .setting-item { background: #313244; padding: 10px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; }
-        .badge { padding: 3px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: bold; text-transform: uppercase; }
-        .badge-override { background: #f38ba8; color: #11111b; }
-        .badge-json { background: #a6e3a1; color: #11111b; }
-        .badge-fallback { background: #f9e2af; color: #11111b; }
-        .badge-disk { background: #89dceb; color: #11111b; }
-        .setting-moe { border-left: 3px solid #cba6f7; padding-left: 7px; }
-    </style>
 </head>
 <body>
     <header>
         <h1>Registered Models</h1>
     </header>
 
-    <div id="models-container" style="padding: 20px; max-width: 1400px; margin: 0 auto;"></div>
+    <div id="models-container" class="p-20 max-w-1400 mx-auto"></div>
 
     <script src="/js/common.js"></script>
     <script src="/js/models.js"></script>

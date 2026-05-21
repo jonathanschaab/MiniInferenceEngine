@@ -1,5 +1,3 @@
-/* global downloadModel */
-
 const chatContainer = document.getElementById('chat-container');
 const inputField = document.getElementById('prompt-input');
 const sendBtn = document.getElementById('send-btn');
@@ -111,12 +109,13 @@ async function updateStatus() {
         const indicator = document.getElementById('engine-status-indicator');
         if (status.loading_model_id) {
             indicator.textContent = `(Loading...)`;
-            indicator.style.color = '#f9e2af';
+            indicator.className = 'status text-yellow';
         } else if (status.active_backend) {
             indicator.textContent = `(${status.active_backend})`;
-            indicator.style.color = '#a6e3a1';
+            indicator.className = 'status text-green';
         } else {
             indicator.textContent = '';
+            indicator.className = 'status';
         }
     } catch (e) {
         console.warn("Failed to update engine status", e);
@@ -305,10 +304,7 @@ function renderSessionList(sessions) {
     if (hasMoreSessions) {
         const sentinel = document.createElement('div');
         sentinel.id = 'session-sentinel';
-        sentinel.style.padding = '10px';
-        sentinel.style.textAlign = 'center';
-        sentinel.style.color = '#6c7086';
-        sentinel.style.fontSize = '0.85rem';
+        sentinel.className = 'session-sentinel';
         sentinel.textContent = 'Loading more...';
         list.appendChild(sentinel);
         sessionScrollObserver.observe(sentinel);
@@ -472,10 +468,7 @@ function prependMessagesToUI(messages) {
     if (hasMoreMessages) {
         const sentinel = document.createElement('div');
         sentinel.id = 'chat-sentinel';
-        sentinel.style.padding = '10px';
-        sentinel.style.textAlign = 'center';
-        sentinel.style.color = '#6c7086';
-        sentinel.style.fontSize = '0.9rem';
+        sentinel.className = 'chat-sentinel';
         sentinel.textContent = 'Loading older messages...';
         fragment.appendChild(sentinel);
         chatScrollObserver.observe(sentinel);
@@ -491,7 +484,7 @@ function prependMessagesToUI(messages) {
     chatContainer.prepend(fragment);
 }
 
-window.startNewSession = function() {
+function startNewSession() {
     chatScrollObserver.disconnect();
     currentSessionId = "";
     currentSessionTitle = "";
@@ -508,7 +501,7 @@ inputField.addEventListener('input', function() {
     this.style.height = (this.scrollHeight) + 'px';
 });
 
-window.clearChat = async function() {
+async function clearChat() {
     if (chatHistory.length === 0) {
         startNewSession();
         return;
@@ -579,26 +572,60 @@ async function truncateMessagesInDB(fromIndex) {
 async function startChatDownload(modelId, modelName) {
     const div = document.createElement('div');
     div.className = 'message ai-message';
-    div.innerHTML = `
-        <div>Downloading <strong>${DOMPurify.sanitize(modelName)}</strong>...</div>
-        <div class="download-progress-container" style="margin-top: 10px;">
-            <div style="width: 100%; max-width: 300px; background: #313244; border-radius: 4px; overflow: hidden; border: 1px solid #45475a;">
-                <div id="dl-bar-${modelId}" style="width: 0%; height: 8px; background: #a6e3a1; transition: width 0.5s ease-out;"></div>
-            </div>
-                <div style="display: flex; justify-content: space-between; max-width: 300px; align-items: center; margin-top: 5px;">
-                    <div id="dl-stats-${modelId}" style="font-size: 0.75rem; color: #a6adc8;">Starting...</div>
-                    <div style="display: flex; gap: 5px;">
-                        <button id="dl-pause-${modelId}" style="padding: 4px 8px; background: #f9e2af; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Pause</button>
-                        <button id="dl-cancel-${modelId}" style="padding: 4px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Cancel</button>
-                    </div>
-                </div>
-        </div>
-    `;
+
+    const titleDiv = document.createElement('div');
+    titleDiv.textContent = 'Downloading ';
+    const strong = document.createElement('strong');
+    strong.textContent = modelName;
+    titleDiv.appendChild(strong);
+    titleDiv.appendChild(document.createTextNode('...'));
+
+    const containerDiv = document.createElement('div');
+    containerDiv.className = 'download-progress-container';
+    containerDiv.classList.add('mt-10');
+
+    const barWrapper = document.createElement('div');
+    barWrapper.className = 'dl-bar-wrapper';
+    
+    const bar = document.createElement('div');
+    bar.id = `dl-bar-${modelId}`; // Direct property assignment is inherently safe from HTML breakouts
+    bar.className = 'dl-bar';
+    barWrapper.appendChild(bar);
+
+    const statsRow = document.createElement('div');
+    statsRow.className = 'dl-stats-row';
+
+    const statsText = document.createElement('div');
+    statsText.id = `dl-stats-${modelId}`;
+    statsText.className = 'dl-stats-text';
+    statsText.textContent = 'Starting...';
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'dl-btn-row';
+
+    const pauseBtn = document.createElement('button');
+    pauseBtn.id = `dl-pause-${modelId}`;
+    pauseBtn.className = 'dl-pause-btn';
+    pauseBtn.textContent = 'Pause';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.id = `dl-cancel-${modelId}`;
+    cancelBtn.className = 'dl-cancel-btn';
+    cancelBtn.textContent = 'Cancel';
+
+    btnRow.appendChild(pauseBtn);
+    btnRow.appendChild(cancelBtn);
+    statsRow.appendChild(statsText);
+    statsRow.appendChild(btnRow);
+    containerDiv.appendChild(barWrapper);
+    containerDiv.appendChild(statsRow);
+    
+    div.appendChild(titleDiv);
+    div.appendChild(containerDiv);
+
     chatContainer.appendChild(div);
     chatContainer.scrollTop = chatContainer.scrollHeight;
 
-    const cancelBtn = document.getElementById(`dl-cancel-${modelId}`);
-    const pauseBtn = document.getElementById(`dl-pause-${modelId}`);
     const dl = downloadModel(modelId, {
         onProgress: (status, pct, speedMB, transMB, totalMB, etaStr) => {
             const bar = document.getElementById(`dl-bar-${modelId}`);
@@ -606,7 +633,7 @@ async function startChatDownload(modelId, modelName) {
             if (bar) bar.style.width = `${pct}%`;
             if (stats) {
                 if (status.state === 'Queued...') {
-                    stats.innerHTML = `<span style="color:#f9e2af;">Queued...</span> <a href="/queue" style="color:#89b4fa; text-decoration:none; margin-left: 5px;">(View Queue)</a>`;
+                    stats.innerHTML = `<span class="text-yellow">Queued...</span> <a href="/queue" class="text-blue no-underline ml-5">(View Queue)</a>`;
                 } else if (status.state !== 'Downloading...') {
                     stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | ${status.state}`;
                 } else {
@@ -618,7 +645,7 @@ async function startChatDownload(modelId, modelName) {
             const stats = document.getElementById(`dl-stats-${modelId}`);
             if (stats) {
                 if (text === 'Queued...') {
-                    stats.innerHTML = `<span style="color:#f9e2af;">Queued...</span> <a href="/queue" style="color:#89b4fa; text-decoration:none; margin-left: 5px;">(View Queue)</a>`;
+                    stats.innerHTML = `<span class="text-yellow">Queued...</span> <a href="/queue" class="text-blue no-underline ml-5">(View Queue)</a>`;
                 } else {
                     stats.innerText = text;
                 }
@@ -827,3 +854,17 @@ inputField.addEventListener('keydown', (e) => {
 });
 
 setInterval(updateStatus, 2000);
+
+// Bind top-level buttons
+document.getElementById('toggle-parameters-btn')?.addEventListener('click', () => {
+    const panel = document.getElementById('parameters-panel');
+    panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+});
+document.getElementById('clear-chat-btn')?.addEventListener('click', clearChat);
+document.getElementById('param-temp')?.addEventListener('input', function() {
+    document.getElementById('val-temp').innerText = this.value;
+});
+document.getElementById('param-top-p')?.addEventListener('input', function() {
+    document.getElementById('val-top-p').innerText = this.value;
+});
+document.getElementById('new-chat-btn')?.addEventListener('click', startNewSession);

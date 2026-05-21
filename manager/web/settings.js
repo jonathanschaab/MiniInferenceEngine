@@ -10,34 +10,52 @@ async function loadKeys() {
     const keys = await res.json();
     
     const tbody = document.getElementById('keys-tbody');
-    let tbodyHtml = '';
+    tbody.innerHTML = '';
+
     keys.forEach(record => {
-        const shortHash = record.hash.substring(0, 16) + '...';
-        const desc = record.description ? DOMPurify.sanitize(record.description) : '<span style="color: #6c7086; font-style: italic;">None</span>';
-        tbodyHtml += `
-            <tr>
-                <td style="font-weight: bold;">${DOMPurify.sanitize(record.name)}</td>
-                <td>${desc}</td>
-                <td class="hash-text">${shortHash}</td>
-                <td><button class="btn-danger" onclick="deleteKey('${DOMPurify.sanitize(record.hash)}')">Revoke</button></td>
-            </tr>
-        `;
+        const tr = document.createElement('tr');
+        
+        const tdName = document.createElement('td');
+        tdName.style.fontWeight = 'bold';
+        tdName.textContent = record.name; // Natively escapes HTML and quotes!
+        
+        const tdDesc = document.createElement('td');
+        if (record.description) {
+            tdDesc.textContent = record.description;
+        } else {
+            tdDesc.innerHTML = '<span class="text-overlay0 font-italic">None</span>';
+        }
+        
+        const tdHash = document.createElement('td');
+        tdHash.className = 'hash-text';
+        tdHash.textContent = record.hash.substring(0, 16) + '...';
+        
+        const tdAction = document.createElement('td');
+        const btn = document.createElement('button');
+        btn.className = 'btn-danger';
+        btn.textContent = 'Revoke';
+        btn.onclick = () => deleteKey(record.hash); // Safely keeps the hash inside a JS closure
+        tdAction.appendChild(btn);
+        
+        tr.appendChild(tdName);
+        tr.appendChild(tdDesc);
+        tr.appendChild(tdHash);
+        tr.appendChild(tdAction);
+        
+        tbody.appendChild(tr);
     });
-    tbody.innerHTML = tbodyHtml;
 }
 
-/* eslint-disable-next-line no-unused-vars -- Called by: settings.html button onclick="openKeyModal()" */
 function openKeyModal() {
     document.getElementById('new-key-name').value = '';
     document.getElementById('new-key-desc').value = '';
     document.getElementById('new-key-modal').style.display = 'flex';
-}
+};
 
 function closeKeyModal() {
     document.getElementById('new-key-modal').style.display = 'none';
-}
+};
 
-/* eslint-disable-next-line no-unused-vars -- Called by: settings.html modal button onclick="submitNewKey()" */
 async function submitNewKey() {
     const name = document.getElementById('new-key-name').value.trim();
     const desc = document.getElementById('new-key-desc').value.trim();
@@ -87,7 +105,6 @@ function showDeleteKeyModal() {
     });
 }
 
-/* eslint-disable-next-line no-unused-vars -- Called by: settings.html button onclick="deleteKey('${hash}')" */
 async function deleteKey(hash) {
     const confirmed = await showDeleteKeyModal();
     if (confirmed) {
@@ -101,4 +118,10 @@ async function deleteKey(hash) {
     }
 }
 
-window.onload = loadKeys;
+window.onload = () => {
+    loadKeys();
+    
+    document.getElementById('open-key-modal-btn')?.addEventListener('click', openKeyModal);
+    document.getElementById('new-key-cancel-btn')?.addEventListener('click', closeKeyModal);
+    document.getElementById('create-key-btn')?.addEventListener('click', submitNewKey);
+};

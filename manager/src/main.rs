@@ -3,10 +3,11 @@ use axum::{
     Json,
     body::Body,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::StatusCode,
     http::header,
-    response::{Html, IntoResponse, Redirect},
+    middleware::Next,
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use oauth2::basic::BasicClient;
 use serde::{Deserialize, Serialize};
@@ -296,6 +297,18 @@ pub struct AppState {
     pub download_semaphore: Arc<tokio::sync::Semaphore>,
     pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
     pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
+}
+
+async fn csp_middleware(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    // Strict CSP: Disallows inline scripts and styles, preventing XSS.
+    let csp = "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:;";
+    if let Ok(val) = axum::http::HeaderValue::from_str(csp) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, val);
+    }
+    response
 }
 
 pub(crate) async fn serve_ui(
@@ -1798,9 +1811,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut dirs_to_visit = vec![downloads_dir_for_cleanup.clone()];
 
             while let Some(current_dir) = dirs_to_visit.pop() {
+                // Throttle directory traversal to prevent sudden I/O spikes
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
                 match tokio::fs::read_dir(&current_dir).await {
                     Ok(mut entries) => {
                         while let Ok(Some(entry)) = entries.next_entry().await {
+                            // Yield to the executor to avoid starving other tasks if a directory is huge
+                            tokio::task::yield_now().await;
+
                             let path = entry.path();
 
                             if let Ok(file_type) = entry.file_type().await
@@ -2261,7 +2280,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = web_routes
         .merge(engine_api_routes)
         .with_state(shared_state)
-        .layer(session_layer);
+        .layer(session_layer)
+        .layer(axum::middleware::from_fn(csp_middleware));
 
     // Start listening on port 3000
     let listener = tokio::net::TcpListener::bind(&config.bind_address)

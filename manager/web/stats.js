@@ -1,6 +1,5 @@
 const colorPalette = ['#89b4fa', '#f38ba8', '#a6e3a1', '#f9e2af', '#cba6f7', '#94e2d5'];
 
-/* eslint-disable-next-line no-unused-vars -- Called by: stats.html button onclick="openBenchmarkModal()" */
 async function openBenchmarkModal() {
     if (isBenchmarking) {
         alert("A benchmark is already running!");
@@ -22,7 +21,7 @@ async function openBenchmarkModal() {
                 <label class="model-item">
                     <input type="checkbox" class="model-cb" value="${DOMPurify.sanitize(m.id)}" data-backends="${backendsStr}" checked>
                     ${DOMPurify.sanitize(m.name)} <span style="color: #6c7086; margin-left: 5px;">(${DOMPurify.sanitize(m.arch)})</span>
-                    <span class="incompatible-warning" style="display: none; color: #f38ba8; margin-left: auto; font-size: 0.85em; font-style: italic;">(Incompatible)</span>
+                    <span class="incompatible-warning">(Incompatible)</span>
                 </label>
             `;
             m.supported_backends.forEach(b => allBackends.add(b));
@@ -75,7 +74,6 @@ function closeModal() {
     document.getElementById('benchmark-modal').style.display = 'none';
 }
 
-/* eslint-disable-next-line no-unused-vars -- Called by: stats.html modal button onclick="submitBenchmark()" */
 async function submitBenchmark() {
     // Gather all checked boxes that are currently compatible (not disabled)
     const checkboxes = document.querySelectorAll('#model-checkbox-list input:checked:not(:disabled)');
@@ -182,7 +180,7 @@ function populateTable(models, loads) {
             if (loadAverages[m.id] && loadAverages[m.id][b]) {
                 rowHTML += `<td>${Math.round(loadAverages[m.id][b].sum / loadAverages[m.id][b].count)} ms</td>`;
             } else {
-                rowHTML += `<td><span style="color:#6c7086;">-</span></td>`;
+                rowHTML += `<td><span class="text-overlay0">-</span></td>`;
             }
         });
         rowHTML += `</tr>`;
@@ -395,4 +393,14 @@ setInterval(checkStatus, 2000);
 window.onload = () => {
     loadDashboard();
     checkStatus();
+    
+    document.getElementById('btn-run-benchmark')?.addEventListener('click', openBenchmarkModal);
+    document.getElementById('toggle-parameters-btn')?.addEventListener('click', () => {
+        const panel = document.getElementById('parameters-panel');
+        panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+    });
+    document.getElementById('close-benchmark-btn')?.addEventListener('click', closeModal);
+    document.getElementById('submit-benchmark-btn')?.addEventListener('click', submitBenchmark);
+    document.getElementById('param-temp')?.addEventListener('input', function() { document.getElementById('val-temp').innerText = this.value; });
+    document.getElementById('param-top-p')?.addEventListener('input', function() { document.getElementById('val-top-p').innerText = this.value; });
 };

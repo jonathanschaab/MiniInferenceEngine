@@ -10,12 +10,11 @@ function formatTime(millis) {
     return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
 }
 
-/* eslint-disable-next-line no-unused-vars -- Called by: memory.html tab buttons onclick="switchTab('tabName')" */
 function switchTab(tabName) {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
 
-    const activeTab = document.querySelector(`.tab[onclick="switchTab('${tabName}')"]`);
+    const activeTab = document.getElementById(`tab-${tabName}`);
     const activeContent = document.getElementById(`${tabName}-view`);
     if (activeTab) activeTab.classList.add('active');
     if (activeContent) activeContent.classList.add('active');
@@ -42,9 +41,9 @@ async function updateDashboard() {
 
         if (status.loading_model_id) {
             modelsHtml += `
-                <div class="model-card" style="border-left-color: #f9e2af; opacity: 0.8;">
-                    <h3>${DOMPurify.sanitize(status.loading_model_id)} <span style="color:#f9e2af; font-size:0.8rem;">(Initializing)</span></h3>
-                    <div class="model-stat"><span>Status:</span> <span style="color:#f9e2af; font-weight:bold; font-style:italic;">Loading into VRAM...</span></div>
+                <div class="model-card model-card-loading">
+                    <h3>${DOMPurify.sanitize(status.loading_model_id)} <span class="text-yellow text-sm">(Initializing)</span></h3>
+                    <div class="model-stat"><span>Status:</span> <span class="text-yellow font-bold font-italic">Loading into VRAM...</span></div>
                 </div>
             `;
         }
@@ -57,12 +56,12 @@ async function updateDashboard() {
             const statusClass = m.status === 'Active' ? 'status-active' : 'status-idle';
             modelsHtml += `
                 <div class="model-card">
-                    <h3>${DOMPurify.sanitize(m.id)} <span style="color:#a6adc8; font-size:0.8rem;">(${DOMPurify.sanitize(m.backend)})</span></h3>
-                    <div class="model-stat"><span>Weights:</span> <span style="color:#89b4fa; font-weight:bold;">${formatMB(m.weights)}</span></div>
-                    <div class="model-stat"><span>KV Cache Context:</span> <span style="color:#a6e3a1; font-weight:bold;">${formatMB(m.kv_cache)}</span></div>
-                    <div class="model-stat"><span>Compute Buffer:</span> <span style="color:#f9e2af; font-weight:bold;">${formatMB(m.compute)}</span></div>
+                    <h3>${DOMPurify.sanitize(m.id)} <span class="text-subtext0 text-sm">(${DOMPurify.sanitize(m.backend)})</span></h3>
+                    <div class="model-stat"><span>Weights:</span> <span class="text-blue font-bold">${formatMB(m.weights)}</span></div>
+                    <div class="model-stat"><span>KV Cache Context:</span> <span class="text-green font-bold">${formatMB(m.kv_cache)}</span></div>
+                    <div class="model-stat"><span>Compute Buffer:</span> <span class="text-yellow font-bold">${formatMB(m.compute)}</span></div>
                     <div class="model-stat"><span>Status:</span> <span class="${statusClass}">${DOMPurify.sanitize(m.status)}</span></div>
-                    <div class="model-stat" style="margin-top:10px; border-top:1px solid #45475a; padding-top:8px;"><span>Total Impact:</span> <span style="color:#cdd6f4; font-weight:bold;">${formatMB(m.weights + m.kv_cache + m.compute)}</span></div>
+                    <div class="model-stat mt-10 border-t pt-8"><span>Total Impact:</span> <span class="text-text font-bold">${formatMB(m.weights + m.kv_cache + m.compute)}</span></div>
                 </div>
             `;
         });
@@ -91,9 +90,9 @@ async function updateDashboard() {
         let colorClass = ev.action === "Allocate" ? "log-allocate" : (ev.action === "Free" ? "log-free" : (ev.action === "Fail" ? "log-fail" : "log-measure"));
         vramTbodyHtml += `
             <tr>
-                <td style="color: #6c7086;">${formatTime(ev.timestamp)}</td>
+                <td class="text-overlay0">${formatTime(ev.timestamp)}</td>
                 <td class="${colorClass}">${DOMPurify.sanitize(ev.action)}</td>
-                <td style="color: #cba6f7;">${DOMPurify.sanitize(ev.subsystem)}</td>
+                <td class="text-mauve">${DOMPurify.sanitize(ev.subsystem)}</td>
                 <td>${DOMPurify.sanitize(ev.description)}</td>
                 <td>${formatMB(ev.bytes)}</td>
             </tr>`;
@@ -121,9 +120,9 @@ async function updateDashboard() {
         let colorClass = ev.action === "Allocate" ? "log-allocate" : (ev.action === "Free" ? "log-free" : (ev.action === "Fail" ? "log-fail" : "log-measure"));
         ramTbodyHtml += `
             <tr>
-                <td style="color: #6c7086;">${formatTime(ev.timestamp)}</td>
+                <td class="text-overlay0">${formatTime(ev.timestamp)}</td>
                 <td class="${colorClass}">${DOMPurify.sanitize(ev.action)}</td>
-                <td style="color: #cba6f7;">${DOMPurify.sanitize(ev.subsystem)}</td>
+                <td class="text-mauve">${DOMPurify.sanitize(ev.subsystem)}</td>
                 <td>${DOMPurify.sanitize(ev.description)}</td>
                 <td>${formatMB(ev.bytes)}</td>
             </tr>`;
@@ -131,4 +130,9 @@ async function updateDashboard() {
     ramTbody.innerHTML = ramTbodyHtml;
 }
 setInterval(updateDashboard, 1000);
-window.onload = updateDashboard;
+window.onload = () => {
+    updateDashboard();
+    
+    document.getElementById('tab-vram')?.addEventListener('click', () => switchTab('vram'));
+    document.getElementById('tab-ram')?.addEventListener('click', () => switchTab('ram'));
+};

@@ -7,12 +7,6 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
     <link rel="stylesheet" href="/css/common.css">
-    <style>
-        .chart-container { background: #181825; padding: 20px; border-radius: 8px; margin-bottom: 30px; height: 400px; }
-        .model-list { max-height: 300px; overflow-y: auto; margin-bottom: 20px; background: #11111b; padding: 10px; border-radius: 4px; }
-        .model-item { display: flex; align-items: center; margin-bottom: 8px; font-size: 0.95em; }
-        .model-item input { margin-right: 10px; transform: scale(1.2); }
-    </style>
 </head>
 <body>
     <header>
@@ -20,49 +14,49 @@
     </header>
 
     <!-- Session Control Bar -->
-    <div style="background: #181825; padding: 10px 20px; border-bottom: 1px solid #313244; display: flex; gap: 15px; align-items: center; justify-content: space-between;">
-        <div style="display: flex; gap: 15px; align-items: center;">
-            <button id="btn-run-benchmark" onclick="openBenchmarkModal()" style="background: #89b4fa; height: 30px; padding: 0 10px;">▶ Run Benchmark</button>
+    <div class="control-bar">
+        <div class="control-group">
+            <button id="btn-run-benchmark" class="btn-nav bg-blue">▶ Run Benchmark</button>
         </div>
-        <div style="display: flex; gap: 15px; align-items: center;">
-            <button onclick="document.getElementById('parameters-panel').style.display = document.getElementById('parameters-panel').style.display === 'none' ? 'flex' : 'none'" style="background: #89dceb; height: 30px; padding: 0 10px;">🎛️ Parameters</button>
+        <div class="control-group">
+            <button id="toggle-parameters-btn" class="btn-nav bg-sky">🎛️ Parameters</button>
         </div>
     </div>
 
-    <div id="parameters-panel" style="display: none; background: #181825; padding: 15px 20px; border-bottom: 1px solid #313244; gap: 20px; flex-wrap: wrap; align-items: center; font-size: 0.9rem;">
+    <div id="parameters-panel" class="parameters-panel">
         <div class="param-group">
             <label for="param-temp">Temperature: <span id="val-temp">0.7</span></label>
-            <input type="range" id="param-temp" min="0" max="2" step="0.1" value="0.7" oninput="document.getElementById('val-temp').innerText=this.value">
+            <input type="range" id="param-temp" min="0" max="2" step="0.1" value="0.7">
         </div>
         <div class="param-group">
             <label for="param-top-p">Top-P: <span id="val-top-p">0.95</span></label>
-            <input type="range" id="param-top-p" min="0" max="1" step="0.05" value="0.95" oninput="document.getElementById('val-top-p').innerText=this.value">
+            <input type="range" id="param-top-p" min="0" max="1" step="0.05" value="0.95">
         </div>
         <div class="param-group">
             <label for="param-top-k">Top-K:</label>
-            <input type="number" id="param-top-k" min="1" max="100" value="40" style="width: 60px;">
+            <input type="number" id="param-top-k" min="1" max="100" value="40" class="input-number-sm">
         </div>
         <div class="param-group">
             <label for="param-max-tokens">Max Tokens:</label>
-            <input type="number" id="param-max-tokens" min="1" max="8192" value="500" style="width: 80px;">
+            <input type="number" id="param-max-tokens" min="1" max="8192" value="500" class="input-number-md">
         </div>
         <div class="param-group">
             <label for="param-seed">Seed (Optional):</label>
-            <input type="number" id="param-seed" placeholder="Random" style="width: 100px;">
+            <input type="number" id="param-seed" placeholder="Random" class="input-number-lg">
         </div>
         <div class="param-group">
             <label for="param-context-buffer">Ctx Buffer:</label>
-            <input type="number" id="param-context-buffer" min="0" max="128000" value="1024" style="width: 80px;">
+            <input type="number" id="param-context-buffer" min="0" max="128000" value="1024" class="input-number-md">
         </div>
         <div class="param-group">
             <label for="param-yarn-enabled">YaRN Extension:</label>
-            <input type="checkbox" id="param-yarn-enabled" checked style="width: 20px; height: 20px; cursor: pointer;">
+            <input type="checkbox" id="param-yarn-enabled" checked class="checkbox-lg">
         </div>
     </div>
 
-    <div style="padding: 20px;">
+    <div class="p-20">
 
-        <div id="benchmark-banner" style="display: none; background: #f38ba8; color: #11111b; padding: 12px; text-align: center; border-radius: 8px; margin-bottom: 20px; font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
+        <div id="benchmark-banner" class="benchmark-banner">
             ⚠️ An automated benchmark suite is currently running. The GPU is heavily utilized and chat responses will be delayed.
         </div>
 
@@ -99,8 +93,8 @@
                 <div id="model-checkbox-list" class="model-list" style="margin-bottom: 20px;">
                 </div>
                 <div class="modal-actions">
-                    <button class="btn-cancel" onclick="closeModal()">Cancel</button>
-                    <button class="btn-run" onclick="submitBenchmark()">Run Selected</button>
+                    <button id="close-benchmark-btn" class="btn-cancel">Cancel</button>
+                    <button id="submit-benchmark-btn" class="btn-run">Run Selected</button>
                 </div>
             </div>
         </div>

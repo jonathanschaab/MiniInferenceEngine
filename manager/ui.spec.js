@@ -125,8 +125,14 @@ async function mockEngineApis(page) {
 
 test.describe('Mini Inference Engine - UI Functionality', () => {
     test.beforeEach(async ({ page }, testInfo) => {
-        // Route browser console logs and uncaught errors directly to the terminal
-        page.on('pageerror', err => console.log(`[Browser Exception]: ${err.message}`));
+        // Fail tests on any Content Security Policy violation or uncaught browser error
+        page.on('pageerror', err => {
+            if (err.message.includes("Content Security Policy")) {
+                throw new Error(`CSP VIOLATION: ${err.message}`);
+            }
+            throw err; // Re-throw other errors to fail the test
+        });
+
         page.on('console', msg => {
             if (msg.type() === 'error' || msg.type() === 'warning') {
                 // Ignore expected intentional errors from network interruption tests
@@ -217,10 +223,47 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         await expect(page.locator('#new-key-modal')).not.toBeVisible();
     });
 
+    test('Settings UI resists XSS payloads in API Key names and descriptions', async ({ page }) => {
+        await page.route('**/api/settings/keys', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: [{
+                        name: '<script>alert("XSS-Name")</script>MaliciousName',
+                        hash: 'abcdef1234567890',
+                        description: '<img src="x" onerror="alert(\'XSS-Desc\')">MaliciousDesc'
+                    }]
+                });
+            } else {
+                route.fallback();
+            }
+        });
+
+        let alertFired = false;
+        page.on('dialog', dialog => {
+            alertFired = true;
+            dialog.dismiss();
+        });
+
+        await page.goto('/settings');
+
+        const tbody = page.locator('#keys-tbody');
+        await expect(tbody).toBeVisible();
+
+        // Because settings.js uses .textContent, the literal HTML tags should be rendered to the screen
+        // safely, rather than being stripped out or executed.
+        await expect(tbody).toContainText('<script>');
+        await expect(tbody).toContainText('alert("XSS-Name")');
+        await expect(tbody).toContainText('<img');
+
+        // Confirm no actual code execution occurred
+        expect(alertFired).toBe(false);
+    });
+
     test('Models Directory renders the model configuration cards', async ({ page }) => {
         await page.goto('/models');
         
-        const modelCards = page.locator('.model-card');
+        const modelCards = page.locator('.model-dir-card');
         await expect(modelCards).toHaveCount(2); // Based on our mock Apis output
         await expect(modelCards.first()).toContainText('Mock Chat Model');
     });
@@ -284,6 +327,63 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         const navigatedSession2 = page.locator('.session-item', { hasText: 'Second Chat Session' });
         await expect(navigatedSession2).toHaveClass(/active/);
         await expect(page.locator('.ai-message').last()).toContainText('Persistent message');
+    });
+
+    test('Chat UI resists XSS payloads in session titles and messages', async ({ page }) => {
+        // Intercept session list to inject XSS in the title
+        await page.route('**/api/chat/sessions?*', async route => {
+            await route.fulfill({
+                status: 200,
+                json: [{ 
+                    id: 'xss-session', 
+                    title: '<script>alert("XSS-Title")</script>', 
+                    updated_at: 1678886400, 
+                    email: 'mock@example.com' 
+                }]
+            });
+        });
+
+        // Intercept session messages to inject XSS in the chat history
+        await page.route('**/api/chat/sessions/xss-session*', async route => {
+            await route.fulfill({
+                status: 200,
+                json: { 
+                    id: 'xss-session', 
+                    title: '<script>alert("XSS-Title")</script>', 
+                    updated_at: 1678886400, 
+                    email: 'mock@example.com', 
+                    messages: [{ 
+                        role: 'assistant', 
+                        content: '<img src="x" onerror="alert(\'XSS-Message\')">Malicious Message' 
+                    }] 
+                }
+            });
+        });
+
+        let alertFired = false;
+        page.on('dialog', dialog => {
+            alertFired = true;
+            dialog.dismiss();
+        });
+
+        await page.goto('/');
+
+        // Wait for the session to load in the sidebar
+        const sessionItem = page.locator('.session-item[data-id="xss-session"]');
+        await expect(sessionItem).toBeVisible();
+        
+        // Check that the literal text is visible (proving it wasn't parsed as HTML tags)
+        await expect(sessionItem.locator('.session-title')).toContainText('<script>');
+        
+        // Click the session to load the messages
+        await sessionItem.click();
+        
+        const aiMessage = page.locator('.ai-message').last();
+        await expect(aiMessage).toBeVisible();
+        await expect(aiMessage).toContainText('<img src="x" onerror="alert(\'XSS-Message\')">Malicious Message');
+
+        // Confirm no alerts fired
+        expect(alertFired).toBe(false);
     });
 
     test('Chat UI restores last session from localStorage even if not in initial API results', async ({ page }) => {
@@ -719,6 +819,50 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         // Test Clear All
         await page.locator('#clear-all-btn').click();
         expect(clearAllCalled).toBe(true);
+    });
+
+    test('Queue UI sanitizes malicious XSS payloads in model IDs and status', async ({ page }) => {
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        // Inject XSS payload into the Model ID
+                        '<img src="x" onerror="alert(\'XSS-ID\')">malicious-model': { 
+                            bytes_transferred: 50, 
+                            total_bytes: 100, 
+                            current_speed_bps: 10, 
+                            start_time: 0, 
+                            // Inject XSS payload into the Status string
+                            state: '<script>alert("XSS-STATUS")</script>Downloading...' 
+                        }
+                    }
+                });
+            } else { 
+                route.fallback(); 
+            }
+        });
+
+        // Listen for browser dialogs. If an alert fires, the XSS attack succeeded!
+        let alertFired = false;
+        page.on('dialog', dialog => {
+            alertFired = true;
+            dialog.dismiss();
+        });
+
+        await page.goto('/queue');
+
+        const tbody = page.locator('#queue-tbody');
+        
+        // Wait for the table to render the stripped text
+        await expect(tbody).toContainText('malicious-model');
+        await expect(tbody).toContainText('Downloading...');
+
+        // Explicitly verify the malicious tags were completely purged from the inner HTML
+        const rowHtml = await tbody.innerHTML();
+        expect(rowHtml).not.toContain('<img');
+        expect(rowHtml).not.toContain('<script');
+        expect(alertFired).toBe(false);
     });
 
     test('SharedDownloadProgress prevents redundant API requests', async ({ page }) => {

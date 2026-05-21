@@ -6,15 +6,6 @@
     <title>Account Settings</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
     <link rel="stylesheet" href="/css/common.css">
-    <style>
-        .key-container { background: #181825; padding: 20px; border-radius: 8px; margin-bottom: 30px; }
-        table { margin-top: 15px; margin-bottom: 0; }
-        .btn-danger { background: #f38ba8; padding: 6px 12px; }
-        .btn-danger:hover { background: #fca4b7; }
-        .hash-text { font-family: monospace; color: #a6adc8; }
-
-        .input-field { width: 95%; padding: 10px; margin-top: 5px; background: #313244; color: white; border: 1px solid #45475a; border-radius: 4px; }
-    </style>
 </head>
 <body>
     <header>
@@ -22,13 +13,13 @@
     </header>
 
     <div class="key-container">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
+        <div class="flex-between-center">
             <h2>API Keys</h2>
-            <button onclick="openKeyModal()" style="background: #a6e3a1;">+ Create New Key</button>
+            <button id="open-key-modal-btn" class="btn-run bg-green text-base">+ Create New Key</button>
         </div>
-        <p style="color: #a6adc8; font-size: 0.9rem;">Keys are mathematically hashed using SHA-256 before being stored on our servers. For your security, we cannot show you a key after it is generated.</p>
+        <p class="text-subtext0 text-09">Keys are mathematically hashed using SHA-256 before being stored on our servers. For your security, we cannot show you a key after it is generated.</p>
         
-        <table>
+        <table class="settings-table">
             <thead><tr><th>Name</th><th>Description</th><th>Key Hash Prefix</th><th>Action</th></tr></thead>
             <tbody id="keys-tbody"></tbody>
         </table>
@@ -37,17 +28,17 @@
     <div id="new-key-modal" class="modal-overlay">
         <div class="modal-content">
             <h2>Create API Key</h2>
-            <div style="margin-bottom: 15px;">
+            <div class="mb-15">
                 <label>Name (required)</label><br>
                 <input type="text" id="new-key-name" class="input-field" placeholder="e.g. Python Script">
             </div>
-            <div style="margin-bottom: 15px;">
+            <div class="mb-15">
                 <label>Description (optional)</label><br>
                 <input type="text" id="new-key-desc" class="input-field" placeholder="e.g. Used for nightly cron job">
             </div>
             <div class="modal-actions">
-                <button class="btn-cancel" onclick="closeKeyModal()">Cancel</button>
-                <button class="btn-run" onclick="submitNewKey()">Generate Key</button>
+                <button id="new-key-cancel-btn" class="btn-cancel">Cancel</button>
+                <button id="create-key-btn" class="btn-run">Generate Key</button>
             </div>
         </div>
     </div>
@@ -55,10 +46,10 @@
     <div id="delete-key-modal" class="modal-overlay">
         <div class="modal-content">
             <h2>Revoke API Key</h2>
-            <p style="margin-bottom: 20px;">Are you sure you want to permanently revoke this key? External apps using it will instantly fail.</p>
+            <p class="mb-20">Are you sure you want to permanently revoke this key? External apps using it will instantly fail.</p>
             <div class="modal-actions">
-                <button class="btn-cancel" id="delete-key-cancel-btn" onclick="document.getElementById('delete-key-modal').style.display='none'">Cancel</button>
-                <button class="btn-run" id="delete-key-confirm-btn" style="background: #f38ba8; color: #11111b;">Revoke</button>
+                <button class="btn-cancel" id="delete-key-cancel-btn">Cancel</button>
+                <button class="btn-run bg-red text-base" id="delete-key-confirm-btn">Revoke</button>
             </div>
         </div>
     </div>

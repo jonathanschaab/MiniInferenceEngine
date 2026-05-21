@@ -1,5 +1,3 @@
-/* global downloadModel */
-
 let isAdmin = false;
 
 async function checkAdmin() {
@@ -30,11 +28,11 @@ async function loadModels() {
                 if (source === 'config.json') return '<span class="badge badge-json">config.json</span>';
                 if (source === 'fallback') return '<span class="badge badge-fallback">Fallback</span>';
                 if (source === 'disk') return '<span class="badge badge-disk">Disk Search</span>';
-                return `<span class="badge" style="background: #45475a;">${source || 'Unknown'}</span>`;
+                return `<span class="badge bg-surface1">${source || 'Unknown'}</span>`;
             };
 
             const card = document.createElement('div');
-            card.className = `model-card ${model.is_downloaded ? '' : 'model-undownloaded'}`;
+            card.className = `model-dir-card ${model.is_downloaded ? '' : 'model-undownloaded'}`;
             card.id = `model-card-${model.id}`;
 
             const rolesStr = model.roles.join(', ');
@@ -42,25 +40,25 @@ async function loadModels() {
 
             let healthBadge = '';
             if (model.id === engineStatus.loading_model_id) {
-                healthBadge = `<span class="badge" style="background: #f9e2af; color: #11111b; margin-left: 10px;" title="Currently loading into VRAM">⏳ Loading</span>`;
+                healthBadge = `<span class="badge bg-yellow text-base ml-10" title="Currently loading into VRAM">⏳ Loading</span>`;
             } else if (healthMap[model.id] === true) {
-                healthBadge = `<span class="badge" style="background: #a6e3a1; color: #11111b; margin-left: 10px;" title="Last run succeeded">✅ Passed</span>`;
+                healthBadge = `<span class="badge bg-green text-base ml-10" title="Last run succeeded">✅ Passed</span>`;
             } else if (healthMap[model.id] === false) {
-                healthBadge = `<span class="badge" style="background: #f38ba8; color: #11111b; margin-left: 10px;" title="Last run failed">❌ Failed</span>`;
+                healthBadge = `<span class="badge bg-red text-base ml-10" title="Last run failed">❌ Failed</span>`;
             }
 
-            const corruptedBadge = model.is_corrupted ? `<span class="badge" style="background: #f38ba8; color: #11111b; margin-left: 10px;" title="A corrupted download file was detected. Please delete to clear it.">⚠️ Corrupted</span>` : '';
+            const corruptedBadge = model.is_corrupted ? `<span class="badge bg-red text-base ml-10" title="A corrupted download file was detected. Please delete to clear it.">⚠️ Corrupted</span>` : '';
 
             let adminDeleteBtn = '';
             if (isAdmin) {
-                adminDeleteBtn = `<button class="btn-delete btn-cancel" style="padding: 5px 10px; font-size: 0.85rem;">🗑️ Delete</button>`;
+                adminDeleteBtn = `<button class="btn-delete btn-cancel p-5-10 text-085">🗑️ Delete</button>`;
             }
 
-            const cacheBadge = model.is_in_hf_cache ? `<span class="badge" style="background: #cba6f7; color: #11111b;" title="This model is also present in the global Hugging Face cache.">HF Cache</span>` : '';
+            const cacheBadge = model.is_in_hf_cache ? `<span class="badge bg-mauve text-base" title="This model is also present in the global Hugging Face cache.">HF Cache</span>` : '';
 
             const downloadBtnHtml = model.is_downloaded
-                ? `<div style="display: flex; gap: 8px; align-items: center;">${adminDeleteBtn}<span class="badge badge-json" style="padding: 5px 10px;">Ready</span>${cacheBadge}</div>`
-                : `<div style="display: flex; gap: 8px; align-items: center;">${adminDeleteBtn}<button class="btn-download">Download Model</button></div>`;
+                ? `<div class="flex-gap-8-center">${adminDeleteBtn}<span class="badge badge-json p-5-10">Ready</span>${cacheBadge}</div>`
+                : `<div class="flex-gap-8-center">${adminDeleteBtn}<button class="btn-download">Download Model</button></div>`;
 
             const moeHtml = (model.num_local_experts != null && model.num_experts_per_tok != null)
                 ? `<div class="setting-item setting-moe"><span>MoE Routing</span> <span>${model.num_experts_per_tok} / ${model.num_local_experts} Active ${getBadge(model.provenance.num_local_experts)}</span></div>`
@@ -69,13 +67,13 @@ async function loadModels() {
             const cardHtml = `
                 <div class="model-header">
                     <div>
-                        <h2 style="margin:0; color: ${model.is_downloaded ? '#fab387' : '#6c7086'}; display: flex; align-items: center;">${model.name} ${healthBadge}${corruptedBadge}</h2>
-                        <p style="margin: 5px 0 0 0; color: #a6adc8; font-size: 0.9rem;">ID: ${model.id} | Repo: <a href="https://huggingface.co/${model.repo}" target="_blank" style="color: #89b4fa;">${model.repo}</a></p>
+                        <h2 class="model-title ${model.is_downloaded ? 'text-peach' : 'text-overlay0'}">${model.name} ${healthBadge}${corruptedBadge}</h2>
+                        <p class="model-subtitle">ID: ${model.id} | Repo: <a href="https://huggingface.co/${model.repo}" target="_blank" class="text-blue">${model.repo}</a></p>
                     </div>
-                    <div style="text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">
+                    <div class="model-actions-col">
                         ${downloadBtnHtml}
-                        <div style="font-size: 0.85rem; color: #cba6f7; margin-bottom: 4px;"><strong>Roles:</strong> ${rolesStr}</div>
-                        <div style="font-size: 0.85rem; color: #a6e3a1;"><strong>Backends:</strong> ${backendsStr}</div>
+                        <div class="text-085 text-mauve mb-4"><strong>Roles:</strong> ${rolesStr}</div>
+                        <div class="text-085 text-green"><strong>Backends:</strong> ${backendsStr}</div>
                     </div>
                 </div>
                 <div class="model-settings">
@@ -162,14 +160,14 @@ async function startDownload(modelId) {
             progressDiv = document.createElement('div');
             progressDiv.className = 'download-progress-container';
             progressDiv.innerHTML = `
-                <div style="width: 250px; background: #313244; border-radius: 4px; overflow: hidden; margin-bottom: 4px; border: 1px solid #45475a;">
-                    <div class="download-progress-bar" style="width: 0%; height: 8px; background: #a6e3a1; transition: width 0.5s ease-out;"></div>
+                <div class="dl-bar-wrapper-sm">
+                    <div class="download-progress-bar dl-bar"></div>
                 </div>
-                <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <div class="download-stats" style="font-size: 0.75rem; color: #a6adc8; text-align: left; white-space: nowrap;">Starting...</div>
-                    <div style="display: flex; gap: 5px;">
-                        <button class="dl-pause-btn" style="padding: 3px 8px; background: #f9e2af; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Pause</button>
-                        <button class="dl-cancel-btn" style="padding: 3px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold;">Cancel</button>
+                <div class="flex-between-center">
+                    <div class="download-stats dl-stats-text text-left whitespace-nowrap">Starting...</div>
+                    <div class="dl-btn-row">
+                        <button class="dl-pause-btn dl-pause-btn-sm">Pause</button>
+                        <button class="dl-cancel-btn dl-cancel-btn-sm">Cancel</button>
                     </div>
                 </div>
             `;
@@ -191,7 +189,7 @@ async function startDownload(modelId) {
             if (bar) bar.style.width = `${pct}%`;
             if (stats) {
                 if (status.state === 'Queued...') {
-                    stats.innerHTML = `<span style="color:#f9e2af;">Queued...</span> <a href="/queue" style="color:#89b4fa; text-decoration:none; margin-left: 5px;">(View Queue)</a>`;
+                    stats.innerHTML = `<span class="text-yellow">Queued...</span> <a href="/queue" class="text-blue no-underline ml-5">(View Queue)</a>`;
                 } else if (status.state !== 'Downloading...') {
                     stats.innerHTML = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | ${DOMPurify.sanitize(status.state)}`;
                 } else {
@@ -205,7 +203,7 @@ async function startDownload(modelId) {
             const stats = card.querySelector('.download-stats');
             if (stats) {
                 if (text === 'Queued...') {
-                    stats.innerHTML = `<span style="color:#f9e2af;">Queued...</span> <a href="/queue" style="color:#89b4fa; text-decoration:none; margin-left: 5px;">(View Queue)</a>`;
+                    stats.innerHTML = `<span class="text-yellow">Queued...</span> <a href="/queue" class="text-blue no-underline ml-5">(View Queue)</a>`;
                 } else {
                     stats.innerText = text;
                 }

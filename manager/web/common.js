@@ -237,25 +237,33 @@ function injectNavbar() {
     if (!header) return;
 
     const navDiv = document.createElement('div');
-    navDiv.style.display = 'flex';
-    navDiv.style.gap = '15px';
-    navDiv.style.alignItems = 'center';
+    navDiv.className = 'navbar-container';
 
-    navDiv.innerHTML = `
-        <button onclick="window.location.href='/'" style="background: #89b4fa; height: 30px; padding: 0 10px;">💬 Chat</button>
-        <button onclick="window.location.href='/models'" style="background: #fab387; height: 30px; padding: 0 10px;">🤖 Models</button>
-        <button onclick="window.location.href='/queue'" style="background: #94e2d5; height: 30px; padding: 0 10px;">⬇️ Queue</button>
-        <button onclick="window.location.href='/memory'" style="background: #f9e2af; height: 30px; padding: 0 10px;">💾 Memory</button>
-        <button onclick="window.location.href='/stats'" style="background: #cba6f7; height: 30px; padding: 0 10px;">📊 Stats</button>
-        <button id="nav-console-btn" onclick="window.location.href='/console'" style="background: #89dceb; height: 30px; padding: 0 10px; display: none;">🖥️ Console</button>
-        <button onclick="window.location.href='/settings'" style="background: #a6e3a1; height: 30px; padding: 0 10px;">⚙️ Settings</button>
-        <button onclick="window.location.href='/auth/logout'" style="background: #45475a; color: white; height: 30px; padding: 0 10px;">Logout</button>
-    `;
+    const buttons = [
+        { text: '💬 Chat', href: '/', class: 'bg-blue' },
+        { text: '🤖 Models', href: '/models', class: 'bg-peach' },
+        { text: '⬇️ Queue', href: '/queue', class: 'bg-teal' },
+        { text: '💾 Memory', href: '/memory', class: 'bg-yellow' },
+        { text: '📊 Stats', href: '/stats', class: 'bg-mauve' },
+        { text: '🖥️ Console', href: '/console', class: 'bg-sky', id: 'nav-console-btn', hidden: true },
+        { text: '⚙️ Settings', href: '/settings', class: 'bg-green' },
+        { text: 'Logout', href: '/auth/logout', class: 'bg-surface1' }
+    ];
+
+    buttons.forEach(b => {
+        const btn = document.createElement('button');
+        btn.textContent = b.text;
+        btn.className = `btn-nav ${b.class}`;
+        if (b.id) btn.id = b.id;
+        if (b.hidden) btn.classList.add('hidden');
+        btn.addEventListener('click', () => { window.location.href = b.href; });
+        navDiv.appendChild(btn);
+    });
 
     header.appendChild(navDiv);
 
     fetch('/api/console/loglevel')
-        .then(res => { if (res.ok) document.getElementById('nav-console-btn').style.display = 'inline-flex'; })
+        .then(res => { if (res.ok) document.getElementById('nav-console-btn').classList.remove('hidden'); })
         .catch(e => console.debug("Console authorization check failed", e));
 }
 

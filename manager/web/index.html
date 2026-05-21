@@ -105,59 +105,59 @@
     </header>
     
     <!-- Session Control Bar -->
-    <div style="background: #181825; padding: 10px 20px; border-bottom: 1px solid #313244; display: flex; gap: 15px; align-items: center; justify-content: space-between;">
-        <div style="display: flex; gap: 15px; align-items: center;">
-            <select id="chat-model-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
-            <select id="compressor-model-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
-            <select id="backend-select" style="background: #313244; color: white; border: none; padding: 5px; border-radius: 4px;"></select>
+    <div class="control-bar">
+        <div class="control-group">
+            <select id="chat-model-select" class="control-select"></select>
+            <select id="compressor-model-select" class="control-select"></select>
+            <select id="backend-select" class="control-select"></select>
         </div>
-        <div style="display: flex; gap: 15px; align-items: center;">
-            <button onclick="document.getElementById('parameters-panel').style.display = document.getElementById('parameters-panel').style.display === 'none' ? 'flex' : 'none'" style="background: #89dceb; height: 30px; padding: 0 10px;">🎛️ Parameters</button>
-            <button onclick="clearChat()" style="background: #f38ba8; height: 30px; padding: 0 10px;">🗑️ Clear Chat</button>
+        <div class="control-group">
+            <button id="toggle-parameters-btn" class="btn-nav bg-sky">🎛️ Parameters</button>
+            <button id="clear-chat-btn" class="btn-nav bg-red">🗑️ Clear Chat</button>
         </div>
     </div>
 
-    <div id="parameters-panel" style="display: none; background: #181825; padding: 15px 20px; border-bottom: 1px solid #313244; gap: 20px; flex-wrap: wrap; align-items: center; font-size: 0.9rem;">
+    <div id="parameters-panel" class="parameters-panel">
         <div class="param-group">
             <label for="param-temp">Temperature: <span id="val-temp">0.7</span></label>
-            <input type="range" id="param-temp" min="0" max="2" step="0.1" value="0.7" oninput="document.getElementById('val-temp').innerText=this.value">
+            <input type="range" id="param-temp" min="0" max="2" step="0.1" value="0.7">
         </div>
         <div class="param-group">
             <label for="param-top-p">Top-P: <span id="val-top-p">0.95</span></label>
-            <input type="range" id="param-top-p" min="0" max="1" step="0.05" value="0.95" oninput="document.getElementById('val-top-p').innerText=this.value">
+            <input type="range" id="param-top-p" min="0" max="1" step="0.05" value="0.95">
         </div>
         <div class="param-group">
             <label for="param-top-k">Top-K:</label>
-            <input type="number" id="param-top-k" min="1" max="100" value="40" style="width: 60px;">
+            <input type="number" id="param-top-k" min="1" max="100" value="40" class="input-number-sm">
         </div>
         <div class="param-group">
             <label for="param-max-tokens">Max Tokens:</label>
-            <input type="number" id="param-max-tokens" min="1" max="8192" value="500" style="width: 80px;">
+            <input type="number" id="param-max-tokens" min="1" max="8192" value="500" class="input-number-md">
         </div>
         <div class="param-group">
             <label for="param-seed">Seed (Optional):</label>
-            <input type="number" id="param-seed" placeholder="Random" style="width: 100px;">
+            <input type="number" id="param-seed" placeholder="Random" class="input-number-lg">
         </div>
         <div class="param-group">
             <label for="param-context-buffer">Ctx Buffer:</label>
-            <input type="number" id="param-context-buffer" min="0" max="128000" value="1024" style="width: 80px;">
+            <input type="number" id="param-context-buffer" min="0" max="128000" value="1024" class="input-number-md">
         </div>
         <div class="param-group">
             <label for="param-memory-strategy">Llama.cpp Strategy:</label>
-            <select id="param-memory-strategy" style="background: #313244; color: white; border: 1px solid #45475a; padding: 5px; border-radius: 4px;">
+            <select id="param-memory-strategy" class="control-select-bordered">
                 <option value="offload">CPU Offload (Max Context)</option>
                 <option value="compress">Compression (Max Speed)</option>
             </select>
         </div>
         <div class="param-group">
             <label for="param-yarn-enabled">YaRN Extension:</label>
-            <input type="checkbox" id="param-yarn-enabled" checked style="width: 20px; height: 20px; cursor: pointer;">
+            <input type="checkbox" id="param-yarn-enabled" checked class="checkbox-lg">
         </div>
     </div>
 
     <div id="main-wrapper">
         <div id="sidebar">
-            <button id="new-chat-btn" onclick="startNewSession()">+ New Chat</button>
+            <button id="new-chat-btn">+ New Chat</button>
             <div id="session-list"></div>
         </div>
         
@@ -165,7 +165,7 @@
             <div id="chat-container">
                 <div class="message ai-message">System: Engine ready. How can I help you?</div>
             </div>
-            <div id="typing-indicator" class="typing" style="padding: 0 20px;">Thinking...</div>
+            <div id="typing-indicator" class="typing px-20">Thinking...</div>
             
             <div id="input-container">
                 <textarea id="prompt-input" placeholder="Message the AI... (Shift + Enter for new line)" rows="1"></textarea>
@@ -180,7 +180,7 @@
     <div id="rename-modal" class="modal-overlay">
         <div class="modal-content">
             <h2>Rename Chat</h2>
-            <input type="text" id="rename-input" style="width: 100%; box-sizing: border-box; background: #313244; color: white; border: 1px solid #45475a; padding: 8px; border-radius: 4px; margin-bottom: 20px;" autocomplete="off">
+            <input type="text" id="rename-input" class="modal-input" autocomplete="off">
             <div class="modal-actions">
                 <button class="btn-cancel" id="rename-cancel-btn">Cancel</button>
                 <button class="btn-run" id="rename-confirm-btn">Rename</button>
@@ -191,10 +191,10 @@
     <div id="delete-modal" class="modal-overlay">
         <div class="modal-content">
             <h2>Delete Chat</h2>
-            <p style="margin-bottom: 20px;">Are you sure you want to delete this chat session?</p>
+            <p class="mb-20">Are you sure you want to delete this chat session?</p>
             <div class="modal-actions">
                 <button class="btn-cancel" id="delete-cancel-btn">Cancel</button>
-                <button class="btn-run" id="delete-confirm-btn" style="background: #f38ba8; color: #11111b;">Delete</button>
+                <button class="btn-run bg-red text-base" id="delete-confirm-btn">Delete</button>
             </div>
         </div>
     </div>
