@@ -461,7 +461,7 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
         }
 
         let shared_reqwest_client = match reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::default())
             .tcp_keepalive(std::time::Duration::from_secs(60))
             .pool_idle_timeout(std::time::Duration::from_secs(55))
             .build()

@@ -31,7 +31,6 @@ use manager::{
 // --- CONSTANTS ---
 const TELEMETRY_CLEANUP_INTERVAL_SECS: u64 = 24 * 3600;
 const TEMP_FILE_CLEANUP_INTERVAL_SECS: u64 = 12 * 3600;
-const TEMP_FILE_EXPIRY_AGE_SECS: u64 = 3 * 24 * 3600;
 const VRAM_TRACKER_INTERVAL_SECS: u64 = 1;
 const WATCHER_DEBOUNCE_INTERVAL_MILLIS: u64 = 1000;
 const WATCHER_REFRESH_INTERVAL_SECS: u64 = 300;
@@ -82,6 +81,8 @@ pub struct AppConfig {
     pub max_concurrent_chunk_downloads: usize,
     #[serde(default = "default_telemetry_retention_days")]
     pub telemetry_retention_days: u64,
+    #[serde(default = "default_temp_file_retention_days")]
+    pub temp_file_retention_days: u64,
     #[serde(default = "default_log_level_console")]
     pub log_level_console: String,
     #[serde(default = "default_log_level_file")]
@@ -131,6 +132,9 @@ fn default_max_concurrent_chunk_downloads() -> usize {
 fn default_telemetry_retention_days() -> u64 {
     30
 }
+fn default_temp_file_retention_days() -> u64 {
+    3
+}
 
 fn default_downloads_directory() -> String {
     "downloads".to_string()
@@ -155,6 +159,7 @@ impl Default for AppConfig {
             max_concurrent_downloads: default_max_concurrent_downloads(),
             max_concurrent_chunk_downloads: default_max_concurrent_chunk_downloads(),
             telemetry_retention_days: default_telemetry_retention_days(),
+            temp_file_retention_days: default_temp_file_retention_days(),
             log_level_console: default_log_level_console(),
             log_level_file: default_log_level_file(),
             log_level_memory: default_log_level_memory(),
@@ -1621,6 +1626,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let downloads_dir_for_cleanup =
         manager::types::resolve_absolute_path(&config.downloads_directory);
     let active_downloads_for_cleanup = active_downloads.clone();
+    let temp_file_retention_secs = config.temp_file_retention_days * 24 * 3600;
     tokio::spawn(async move {
         // Sweep the downloads directory every 12 hours
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -1679,7 +1685,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 && let Ok(metadata) = entry.metadata().await
                                 && let Ok(modified) = metadata.modified()
                                 && let Ok(age) = modified.elapsed()
-                                && age.as_secs() > TEMP_FILE_EXPIRY_AGE_SECS
+                                && age.as_secs() > temp_file_retention_secs
                             {
                                 let mut is_active = false;
                                 if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str())
