@@ -1824,18 +1824,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_store = Arc::new(Mutex::new(store));
 
     // Initialize global pooled clients once!
-    let mut reqwest_client_builder = reqwest::Client::builder()
+    let reqwest_client = reqwest::Client::builder()
         .tcp_keepalive(std::time::Duration::from_secs(60))
-        .pool_idle_timeout(std::time::Duration::from_secs(55));
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(auth_value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
-        {
-            headers.insert(reqwest::header::AUTHORIZATION, auth_value);
-        }
-        reqwest_client_builder = reqwest_client_builder.default_headers(headers);
-    }
-    let reqwest_client = reqwest_client_builder.build()?;
+        .pool_idle_timeout(std::time::Duration::from_secs(55))
+        .build()?;
     let oauth_client = auth::build_oauth_client(
         &config.oauth_redirect_uri,
         &config.oauth_client_secret_path,

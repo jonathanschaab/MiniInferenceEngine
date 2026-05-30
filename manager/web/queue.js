@@ -74,8 +74,7 @@ async function loadQueue() {
                     
                     const pauseBtn = document.createElement('button');
                     pauseBtn.textContent = 'Pause';
-                    pauseBtn.className = 'btn-pause';
-                    pauseBtn.className = 'btn-run bg-yellow text-base mr-5';
+                    pauseBtn.className = 'btn-pause btn-run bg-yellow text-base mr-5';
                     pauseBtn.onclick = () => pauseDownload(id);
                     
                     const cancelBtn = document.createElement('button');
@@ -118,16 +117,16 @@ async function loadQueue() {
 async function cancelDownload(id) {
     if (!confirm(`Are you sure you want to cancel the download for ${id}?`)) return;
     try { await fetchWithAuth(`/api/downloads/${id}`, { method: 'DELETE' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to cancel download:", e); alert("Failed to cancel download."); }
-};
+}
 
 async function pauseDownload(id) {
     try { await fetchWithAuth(`/api/downloads/${id}/pause`, { method: 'POST' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to pause download:", e); alert("Failed to pause download."); }
-};
+}
 
 async function clearAllDownloads() {
     if (!confirm("Are you sure you want to cancel ALL active and queued downloads?")) return;
     try { await fetchWithAuth('/api/downloads', { method: 'DELETE' }); SharedDownloadProgress.clearCache(); loadQueue(); } catch (e) { console.error("Failed to clear downloads:", e); alert("Failed to clear downloads."); }
-};
+}
 
 document.addEventListener('DOMContentLoaded', async () => {
     await checkAdmin();

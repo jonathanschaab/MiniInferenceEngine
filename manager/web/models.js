@@ -245,14 +245,16 @@ async function startDownload(modelId) {
     try {
         await dl.promise;
     } catch (e) {
-        if (e.message !== "Canceled" && e.message !== "Download canceled by user." && e.message !== "Download paused by user.") {
+        if (e.status === 409) {
+            // Gracefully handle conflicts without polluting the console
+        } else if (e.message !== "Canceled" && e.message !== "Download canceled by user." && e.message !== "Download paused by user.") {
             console.error(`Download failed for ${modelId}:`, e);
         }
     } finally {
         activeDownloads.delete(modelId);
         setTimeout(() => loadModels(), 1500);
     }
-};
+}
 
 async function deleteModel(modelId) {
     let warning = `Are you sure you want to permanently delete the weights for ${modelId} from disk?`;
@@ -264,14 +266,14 @@ async function deleteModel(modelId) {
         SharedDownloadProgress.clearCache();
         loadModels();
     } catch (e) {
-        if (e.message && e.message.includes('409')) {
+        if (e.status === 409) {
             alert("Cannot delete a model while it is downloading or loaded in VRAM.");
         } else {
             console.error("Error deleting model:", e);
             alert("Error deleting model. Check console.");
         }
     }
-};
+}
 
 document.addEventListener('DOMContentLoaded', async () => {
     await checkAdmin();

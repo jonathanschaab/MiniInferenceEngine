@@ -628,7 +628,13 @@ async fn check_existing_metadata(
                                 .open(tmp_file_path)
                                 .await
                             {
-                                let _ = f.set_len(existing_size).await;
+                                if let Err(e) = f.set_len(existing_size).await {
+                                    error!("Failed to truncate {} to checkpoint size {}: {}", id, existing_size, e);
+                                    return (0, expected_hash, is_sha256, Sha256::new(), Vec::new());
+                                }
+                            } else {
+                                error!("Failed to open {} for truncation", id);
+                                return (0, expected_hash, is_sha256, Sha256::new(), Vec::new());
                             }
                         }
                         break;

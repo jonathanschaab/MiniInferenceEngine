@@ -302,15 +302,20 @@ impl LlamaCppEngine {
                                 let filenames =
                                     crate::registry::get_split_filenames(&config.filename);
                                 let mut first_cached_path = None;
-                                for fname in filenames {
-                                    let cached_path = repo.get(&fname).map_err(|e| {
+                                for fname in &filenames {
+                                    let cached_path = repo.get(fname).map_err(|e| {
                                         format!("Missing weights ({}): {}", fname, e)
                                     })?;
                                     if first_cached_path.is_none() {
                                         first_cached_path = Some(cached_path);
                                     }
                                 }
-                                first_cached_path.unwrap()
+                                first_cached_path.ok_or_else(|| {
+                                    format!(
+                                        "Could not find any of the files for model {} in the HF cache: {:?}",
+                                        config.id, filenames
+                                    )
+                                })?
                             };
 
                             let available_vram =
