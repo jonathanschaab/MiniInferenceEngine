@@ -425,6 +425,7 @@ async fn download_chunk(
         &mut cancel_rx,
         hf_token.as_deref(),
         &hf_base_url,
+        &state.config,
     )
     .await
     {
@@ -686,11 +687,11 @@ async fn initiate_request(
     cancel_rx: &mut tokio::sync::broadcast::Receiver<()>,
     hf_token: Option<&str>,
     hf_base_url: &str,
+    config: &crate::AppConfig,
 ) -> Option<(reqwest::Response, String)> {
     let mut current_url = url.to_string();
-    let mut backoff = 5;
+    let mut backoff = config.download_retry_backoff_seconds;
     let mut retries = 0;
-    const MAX_RETRIES: usize = 5;
     let mut redirects = 0;
     const MAX_REDIRECTS: usize = 10;
 
@@ -739,7 +740,7 @@ async fn initiate_request(
                         continue;
                     } else {
                         retries += 1;
-                        if retries > MAX_RETRIES {
+                        if retries > config.download_retry_max_attempts {
                             error!(
                                 "Max retries reached for 429 Too Many Requests on {}. Aborting.",
                                 id
@@ -748,7 +749,7 @@ async fn initiate_request(
                         }
                         warn!(
                             "Hugging Face rate limit (429) hit for {}. No active chunks. Retrying ({}/{}) in {} seconds...",
-                            id, retries, MAX_RETRIES, backoff
+                            id, retries, config.download_retry_max_attempts, backoff
                         );
                         if let Some(reason) =
                             wait_for_backoff(backoff, shutdown_rx, cancel_rx).await
@@ -773,8 +774,21 @@ async fn initiate_request(
                 }
             }
             Err(e) => {
-                error!("Download failed for {}: {}", id, e);
-                return None;
+                retries += 1;
+                if retries > config.download_retry_max_attempts {
+                    error!("Max retries reached for network error on {}: {}. Aborting.", id, e);
+                    return None;
+                }
+                warn!(
+                    "Network error for {}: {}. Retrying ({}/{}) in {} seconds...",
+                    id, e, retries, config.download_retry_max_attempts, backoff
+                );
+                if let Some(reason) = wait_for_backoff(backoff, shutdown_rx, cancel_rx).await {
+                    info!("{} signal received during network error backoff for {}. Aborting.", reason, id);
+                    return None;
+                }
+                backoff = (backoff * 2).min(60);
+                continue;
             }
         }
     }

@@ -62,28 +62,29 @@ pub async fn load_engine(
 
     if config.filename.ends_with(".safetensors") {
         let repo = api.model(config.repo.clone());
-        let local_weights = std::path::Path::new(downloads_dir).join(&config.filename);
-        let weights_path = if let Ok(true) = tokio::fs::try_exists(&local_weights).await {
-            local_weights
-        } else {
-            let filenames = crate::registry::get_split_filenames(&config.filename);
-            let mut first_cached_path = None;
-            for fname in &filenames {
+        let filenames = crate::registry::get_split_filenames(&config.filename);
+        let mut weights_paths = Vec::new();
+
+        for fname in &filenames {
+            let local_path = std::path::Path::new(downloads_dir).join(fname);
+            if let Ok(true) = tokio::fs::try_exists(&local_path).await {
+                weights_paths.push(local_path);
+            } else {
                 let cached_path = repo
                     .get(fname)
                     .await
                     .map_err(|e| format!("Missing weights ({}): {}", fname, e))?;
-                if first_cached_path.is_none() {
-                    first_cached_path = Some(cached_path);
-                }
+                weights_paths.push(cached_path);
             }
-            first_cached_path.ok_or_else(|| {
-                format!(
-                    "Could not find any of the files for model {} in the HF cache: {:?}",
-                    config.id, filenames
-                )
-            })?
-        };
+        }
+
+        if weights_paths.is_empty() {
+            return Err(format!(
+                "Could not find any of the files for model {} in the HF cache: {:?}",
+                config.id, filenames
+            ));
+        }
+
         let cache = hf_hub::Cache::default();
         let config_path = if let Some(p) = cache
             .repo(hf_hub::Repo::model(config.repo.clone()))
@@ -116,7 +117,7 @@ pub async fn load_engine(
         let device_clone = device.clone();
         let model = tokio::task::spawn_blocking(move || {
             let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, &device_clone)
+                VarBuilder::from_mmaped_safetensors(&weights_paths, dtype, &device_clone)
                     .map_err(|e| format!("Safetensors Mmap failed: {}", e))?
             };
             ExtractiveCompressor::load(vb, &conf)
@@ -412,7 +413,7 @@ pub async fn compress_text(
     device: &Device,
     target_len: usize,
     max_chunk_size: usize,
-) -> Result<(String, u128), String> {
+    ) -> Result<(String, u128), String> {
     if let DynamicModel::XLMRoberta(m) = model {
         let tok_start = std::time::Instant::now();
         let tokens = tokenizer

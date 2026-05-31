@@ -83,6 +83,10 @@ pub struct AppConfig {
     pub telemetry_retention_days: u64,
     #[serde(default = "default_temp_file_retention_days")]
     pub temp_file_retention_days: u64,
+    #[serde(default = "default_download_retry_max_attempts")]
+    pub download_retry_max_attempts: u32,
+    #[serde(default = "default_download_retry_backoff_seconds")]
+    pub download_retry_backoff_seconds: u64,
     #[serde(default = "default_log_level_console")]
     pub log_level_console: String,
     #[serde(default = "default_log_level_file")]
@@ -135,6 +139,12 @@ fn default_telemetry_retention_days() -> u64 {
 fn default_temp_file_retention_days() -> u64 {
     3
 }
+fn default_download_retry_max_attempts() -> u32 {
+    5
+}
+fn default_download_retry_backoff_seconds() -> u64 {
+    2
+}
 
 fn default_downloads_directory() -> String {
     "downloads".to_string()
@@ -160,6 +170,8 @@ impl Default for AppConfig {
             max_concurrent_chunk_downloads: default_max_concurrent_chunk_downloads(),
             telemetry_retention_days: default_telemetry_retention_days(),
             temp_file_retention_days: default_temp_file_retention_days(),
+            download_retry_max_attempts: default_download_retry_max_attempts(),
+            download_retry_backoff_seconds: default_download_retry_backoff_seconds(),
             log_level_console: default_log_level_console(),
             log_level_file: default_log_level_file(),
             log_level_memory: default_log_level_memory(),

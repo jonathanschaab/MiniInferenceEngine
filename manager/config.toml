@@ -18,6 +18,8 @@ log_file_name = "server.log"
 
 # Optional settings with default values:
 # temp_file_retention_days = 3
+# download_retry_max_attempts = 5
+# download_retry_backoff_seconds = 2
 # downloads_directory = "downloads"
 # hf_base_url = "https://huggingface.co"
 
