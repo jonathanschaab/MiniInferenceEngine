@@ -11,6 +11,7 @@ pub mod backend;
 pub mod backend_candle;
 #[cfg(feature = "backend-llamacpp")]
 pub mod backend_llamacpp;
+pub mod config;
 pub mod registry;
 pub mod telemetry;
 pub mod types;
@@ -20,6 +21,7 @@ pub use backend::*;
 pub use backend_candle::*;
 #[cfg(feature = "backend-llamacpp")]
 pub use backend_llamacpp::*;
+pub use config::AppConfig;
 pub use registry::*;
 pub use telemetry::*;
 pub use types::*;
@@ -281,7 +283,7 @@ pub async fn run_batcher_loop(
 
     info!("ORCHESTRATOR ONLINE: Waiting for requests...");
 
-    let registry = get_model_registry().await;
+    let registry = get_model_registry(&crate::config::AppConfig::default()).await;
 
     'main: while let Some(request) = receiver.recv().await {
         info!("Processing new chat request...");
@@ -587,15 +589,23 @@ pub async fn run_batcher_loop(
         let mut trigger_compression = false;
         let mut dynamic_target_budget = active_max_context;
 
+        let active_backend_ref = match active_backend.as_ref() {
+            Some(b) => b,
+            None => {
+                let _ = request.responder.send(StreamEvent::Error(
+                    "Server Error: Active backend is unexpectedly missing.".to_string(),
+                ));
+                continue 'main;
+            }
+        };
+
         // Use the backend's get_vram_usage if available, otherwise fallback to Orchestrator's NVML
-        let vram_info = active_backend
-            .as_ref()
-            .unwrap()
+        let vram_info = active_backend_ref
             .get_vram_usage()
             .map(|(u, t)| (u, t, t.saturating_sub(u)))
             .or_else(|| get_vram_info(nvml.as_ref(), gpu_device_index));
 
-        let static_alloc = active_backend.as_ref().unwrap().is_statically_allocated();
+        let static_alloc = active_backend_ref.is_statically_allocated();
 
         let mut warning_msg = "Prompt + Max Tokens exceeds KV Cache! Triggering compression.";
         let effective_limit = if static_alloc {
@@ -925,11 +935,17 @@ pub async fn run_batcher_loop(
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
         let responder = request.responder;
 
-        let gen_fut = active_backend.as_mut().unwrap().generate_stream(
-            &formatted_prompt,
-            &request.parameters,
-            inner_tx,
-        );
+        let backend_mut = match active_backend.as_mut() {
+            Some(b) => b,
+            None => {
+                let _ = responder.send(StreamEvent::Error(
+                    "Server Error: Active backend is unexpectedly missing.".to_string(),
+                ));
+                continue 'main;
+            }
+        };
+
+        let gen_fut = backend_mut.generate_stream(&formatted_prompt, &request.parameters, inner_tx);
 
         // Concurrently run the backend generator and dynamically intercept internal stream
         // events like 'TokenizationTime' so they don't leak into the web HTTP chunked response!
@@ -974,7 +990,10 @@ pub async fn run_batcher_loop(
             "Generation completed in {} ms (Tokenization: {} ms)",
             elapsed, tokenization_time_ms
         );
-        let offload_pct = active_backend.as_ref().unwrap().get_offload_pct();
+        let offload_pct = active_backend
+            .as_ref()
+            .map(|b| b.get_offload_pct())
+            .unwrap_or(0.0);
         if let Ok(mut t) = telemetry.lock() {
             t.record_generation(
                 active_model_id.clone(),

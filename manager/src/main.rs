@@ -23,9 +23,9 @@ use tracing::{error, info, warn}; // Ensure this is imported for AppState
 use tracing_subscriber::EnvFilter;
 
 use manager::{
-    ApiRequest, BenchmarkRequest, DownloadStatus, EngineStatus, Message, ModelArch, ModelConfig,
-    ModelRole, StreamEvent, TelemetryStore, UserRequest, get_model_registry, lock_mutex,
-    lock_status, run_batcher_loop,
+    ApiRequest, AppConfig, BenchmarkRequest, DownloadStatus, EngineStatus, Message, ModelArch,
+    ModelConfig, ModelRole, StreamEvent, TelemetryStore, UserRequest, get_model_registry,
+    lock_mutex, lock_status, run_batcher_loop,
 };
 
 // --- CONSTANTS ---
@@ -36,190 +36,6 @@ const WATCHER_DEBOUNCE_INTERVAL_MILLIS: u64 = 1000;
 const WATCHER_REFRESH_INTERVAL_SECS: u64 = 300;
 const FALLBACK_REFRESH_INTERVAL_SECS: u64 = 30;
 const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
-
-// --- CONFIGURATION ---
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct DatabaseConfig {
-    pub url: String,
-    pub jwt_file_path: String,
-    pub namespace: String,
-    pub database: String,
-}
-
-impl Default for DatabaseConfig {
-    fn default() -> Self {
-        Self {
-            url: "ws://localhost:8001".to_string(),
-            jwt_file_path: "database.jwt".to_string(),
-            namespace: "mini_inference_engine".to_string(),
-            database: "main".to_string(),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct AppConfig {
-    pub bind_address: String,
-    pub oauth_redirect_uri: String,
-    #[serde(default = "default_oauth_client_secret_path")]
-    pub oauth_client_secret_path: String,
-    #[serde(default = "default_oauth_auth_url")]
-    pub oauth_auth_url: String,
-    #[serde(default = "default_oauth_token_url")]
-    pub oauth_token_url: String,
-    #[serde(default = "default_oauth_userinfo_url")]
-    pub oauth_userinfo_url: String,
-    pub admin_emails: Vec<String>,
-    pub user_emails: Vec<String>,
-    pub secure_cookies: bool,
-    #[serde(default)]
-    pub gpu_device_index: u32,
-    #[serde(default = "default_max_concurrent_downloads")]
-    pub max_concurrent_downloads: usize,
-    #[serde(default = "default_max_concurrent_chunk_downloads")]
-    pub max_concurrent_chunk_downloads: usize,
-    #[serde(default = "default_telemetry_retention_days")]
-    pub telemetry_retention_days: u64,
-    #[serde(default = "default_temp_file_retention_days")]
-    pub temp_file_retention_days: u64,
-    #[serde(default = "default_download_retry_max_attempts")]
-    pub download_retry_max_attempts: u32,
-    #[serde(default = "default_download_retry_backoff_seconds")]
-    pub download_retry_backoff_seconds: u64,
-    #[serde(default = "default_log_level_console")]
-    pub log_level_console: String,
-    #[serde(default = "default_log_level_file")]
-    pub log_level_file: String,
-    #[serde(default = "default_log_level_memory")]
-    pub log_level_memory: String,
-    #[serde(default = "default_log_file_name")]
-    pub log_file_name: String,
-    #[serde(default = "default_downloads_directory")]
-    pub downloads_directory: String,
-    #[serde(default = "default_hf_base_url")]
-    pub hf_base_url: String,
-    #[serde(default)]
-    pub database: DatabaseConfig,
-}
-
-fn default_log_level_console() -> String {
-    "info".to_string()
-}
-fn default_log_level_file() -> String {
-    "warn".to_string()
-}
-fn default_log_level_memory() -> String {
-    "debug".to_string()
-}
-fn default_log_file_name() -> String {
-    "server.log".to_string()
-}
-fn default_oauth_client_secret_path() -> String {
-    "client_secret.apps.googleusercontent.com.json".to_string()
-}
-fn default_oauth_auth_url() -> String {
-    "https://accounts.google.com/o/oauth2/v2/auth".to_string()
-}
-fn default_oauth_token_url() -> String {
-    "https://oauth2.googleapis.com/token".to_string()
-}
-fn default_oauth_userinfo_url() -> String {
-    "https://www.googleapis.com/oauth2/v2/userinfo".to_string()
-}
-fn default_max_concurrent_downloads() -> usize {
-    2
-}
-fn default_max_concurrent_chunk_downloads() -> usize {
-    8
-}
-fn default_telemetry_retention_days() -> u64 {
-    30
-}
-fn default_temp_file_retention_days() -> u64 {
-    3
-}
-fn default_download_retry_max_attempts() -> u32 {
-    5
-}
-fn default_download_retry_backoff_seconds() -> u64 {
-    2
-}
-
-fn default_downloads_directory() -> String {
-    "downloads".to_string()
-}
-fn default_hf_base_url() -> String {
-    "https://huggingface.co".to_string()
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            bind_address: "127.0.0.1:3000".to_string(), // Secure local default
-            oauth_redirect_uri: "http://localhost:3000/auth/google/callback".to_string(),
-            oauth_client_secret_path: default_oauth_client_secret_path(),
-            oauth_auth_url: default_oauth_auth_url(),
-            oauth_token_url: default_oauth_token_url(),
-            oauth_userinfo_url: default_oauth_userinfo_url(),
-            admin_emails: vec![],
-            user_emails: vec![],
-            secure_cookies: true,
-            gpu_device_index: 0,
-            max_concurrent_downloads: default_max_concurrent_downloads(),
-            max_concurrent_chunk_downloads: default_max_concurrent_chunk_downloads(),
-            telemetry_retention_days: default_telemetry_retention_days(),
-            temp_file_retention_days: default_temp_file_retention_days(),
-            download_retry_max_attempts: default_download_retry_max_attempts(),
-            download_retry_backoff_seconds: default_download_retry_backoff_seconds(),
-            log_level_console: default_log_level_console(),
-            log_level_file: default_log_level_file(),
-            log_level_memory: default_log_level_memory(),
-            log_file_name: default_log_file_name(),
-            downloads_directory: default_downloads_directory(),
-            hf_base_url: default_hf_base_url(),
-            database: DatabaseConfig::default(),
-        }
-    }
-}
-
-impl AppConfig {
-    pub async fn load() -> Self {
-        let toml_path = manager::types::resolve_absolute_path("config.toml");
-        let json_path = manager::types::resolve_absolute_path("config.json");
-        let (mut config, needs_save) = if let Ok(data) = tokio::fs::read_to_string(&toml_path).await
-        {
-            (toml::from_str(&data).unwrap_or_default(), false)
-        } else if let Ok(data) = tokio::fs::read_to_string(&json_path).await {
-            // Fallback for backwards compatibility, but save as TOML going forward
-            (serde_json::from_str(&data).unwrap_or_default(), true)
-        } else {
-            (Self::default(), true)
-        };
-
-        if config.max_concurrent_downloads == 0 {
-            warn!("max_concurrent_downloads cannot be 0. Enforcing minimum value of 1.");
-            config.max_concurrent_downloads = 1;
-        }
-        if config.max_concurrent_chunk_downloads == 0 {
-            warn!("max_concurrent_chunk_downloads cannot be 0. Enforcing minimum value of 1.");
-            config.max_concurrent_chunk_downloads = 1;
-        }
-
-        if needs_save {
-            match toml::to_string_pretty(&config) {
-                Ok(toml_str) => {
-                    if let Err(e) = tokio::fs::write(&toml_path, toml_str).await {
-                        warn!("Failed to write config.toml: {}", e);
-                    }
-                }
-                Err(e) => warn!("Failed to serialize configuration to TOML: {}", e),
-            }
-        }
-
-        config
-    }
-}
 
 pub mod auth;
 pub mod downloader;
@@ -349,7 +165,7 @@ fn apply_model_status_flags(model: &mut ModelConfig, status: &EngineStatus) {
 
 // Send the model roster to the Javascript dropdowns
 pub(crate) async fn get_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelConfig>> {
-    let mut models = get_model_registry().await;
+    let mut models = get_model_registry(&state.config).await;
     let status = lock_status(&state.engine_status);
 
     for model in &mut models {
@@ -364,7 +180,7 @@ pub(crate) async fn get_model(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ModelConfig>, StatusCode> {
-    let models = get_model_registry().await;
+    let models = get_model_registry(&state.config).await;
     let mut model = models
         .into_iter()
         .find(|m| m.id == id)
@@ -457,7 +273,7 @@ pub(crate) async fn trigger_download(
         }
     }
 
-    let registry = get_model_registry().await;
+    let registry = get_model_registry(&state.config).await;
     let model = match registry.into_iter().find(|m| m.id == id) {
         Some(m) => m,
         None => return (StatusCode::NOT_FOUND, "Model not found").into_response(),
@@ -596,7 +412,7 @@ async fn abort_download_task(state: &AppState, id: &str) -> bool {
 }
 
 async fn cleanup_model_by_id(state: &AppState, id: &str, delete_completed: bool) -> bool {
-    let registry = manager::get_model_registry().await;
+    let registry = manager::get_model_registry(&state.config).await;
     if let Some(model) = registry.into_iter().find(|m| m.id == id) {
         let downloads_dir =
             manager::types::resolve_absolute_path(&state.config.downloads_directory);
@@ -729,10 +545,11 @@ pub(crate) async fn trigger_benchmark(
     let queue_tx = state.queue_tx.clone();
     let engine_status = state.engine_status.clone(); // Clone the Arc so the background thread can reset it
     let selected_models = payload.models;
+    let config = state.config.clone();
 
     tokio::spawn(async move {
         info!("🚀 Starting Automated Benchmark Suite...");
-        let full_registry = get_model_registry().await;
+        let full_registry = get_model_registry(&config).await;
 
         let default_compressor = full_registry
             .iter()
@@ -1639,6 +1456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager::types::resolve_absolute_path(&config.downloads_directory);
     let active_downloads_for_cleanup = active_downloads.clone();
     let temp_file_retention_secs = config.temp_file_retention_days * 24 * 3600;
+    let config_for_cleanup = config.clone();
     tokio::spawn(async move {
         // Sweep the downloads directory every 12 hours
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -1647,7 +1465,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
 
-            let registry = manager::get_model_registry().await;
+            let registry = manager::get_model_registry(&config_for_cleanup).await;
             let active_keys: std::collections::HashSet<String> = {
                 let active = lock_mutex(&active_downloads_for_cleanup);
                 active.keys().cloned().collect()
@@ -1689,11 +1507,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
 
-                            if let Some(ext) = path.extension()
-                                && (ext == "tmp"
-                                    || ext == "meta"
-                                    || ext == "corrupted"
-                                    || ext == "copy_tmp")
+                            if let Some(ext) = path.extension().and_then(|s| s.to_str())
+                                && ["tmp", "meta", "meta.tmp", "corrupted", "copy_tmp"]
+                                    .contains(&ext)
                                 && let Ok(metadata) = entry.metadata().await
                                 && let Ok(modified) = metadata.modified()
                                 && let Ok(age) = modified.elapsed()
@@ -1854,6 +1670,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string_lossy()
         .to_string();
     let mut shutdown_rx = shutdown_tx.subscribe();
+    let config_for_registry = config.clone();
     tokio::spawn(async move {
         use notify::Watcher;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<std::path::PathBuf>>();
@@ -1881,7 +1698,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = w.watch(path, notify::RecursiveMode::Recursive);
         }
 
-        let models = manager::get_model_registry().await;
+        let models = manager::get_model_registry(&config_for_registry).await;
         let cache = hf_hub::Cache::default();
 
         for model in &models {
@@ -2187,10 +2004,10 @@ mod tests {
 
     #[test]
     fn test_app_config_log_defaults() {
-        assert_eq!(default_log_level_console(), "info");
-        assert_eq!(default_log_level_file(), "warn");
-        assert_eq!(default_log_level_memory(), "debug");
-        assert_eq!(default_log_file_name(), "server.log");
+        assert_eq!(manager::config::default_log_level_console(), "info");
+        assert_eq!(manager::config::default_log_level_file(), "warn");
+        assert_eq!(manager::config::default_log_level_memory(), "debug");
+        assert_eq!(manager::config::default_log_file_name(), "server.log");
     }
 
     #[test]
@@ -2770,15 +2587,12 @@ mod tests {
         // 1. Create a mock server that slowly streams data
         let mock_app = Router::new().route(
             "/{*path}",
-            axum::routing::any(|req: axum::extract::Request| async move {
-                tracing::info!(
-                    "Mock server received {} request to {}",
-                    req.method(),
-                    req.uri()
-                );
+            axum::routing::get(|req: axum::extract::Request| async move {
+                tracing::info!("Mock server received GET request to {}", req.uri());
+
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
                 tokio::spawn(async move {
-                    for _ in 0..100 {
+                    for _ in 0..500 {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                         if tx
                             .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
@@ -2793,9 +2607,16 @@ mod tests {
                     }
                 });
                 axum::response::Response::builder()
-                    .header(axum::http::header::CONTENT_LENGTH, "102400")
+                    .header(axum::http::header::CONTENT_LENGTH, "512000")
                     .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
                     .expect("Failed to build mock response")
+            })
+            .head(|req: axum::extract::Request| async move {
+                tracing::info!("Mock server received HEAD request to {}", req.uri());
+                axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "512000")
+                    .body(axum::body::Body::empty())
+                    .expect("Failed to build mock HEAD response")
             }),
         );
 
@@ -2816,6 +2637,7 @@ mod tests {
             downloads_directory: "test_downloads_shutdown".to_string(),
             ..Default::default()
         };
+        let _ = tokio::fs::remove_dir_all(&config.downloads_directory).await;
         let _ = tokio::fs::create_dir_all(&config.downloads_directory).await;
 
         let (queue_tx, _) = mpsc::channel(1);
@@ -2860,6 +2682,10 @@ mod tests {
         });
 
         // 3. Spawn the model downloader
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("test-model".to_string(), DownloadStatus::default());
+        }
         let state_clone = state.clone();
         let task = tokio::spawn(async move {
             let (_cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(1);
@@ -2875,25 +2701,30 @@ mod tests {
         });
 
         // Let it connect and download a chunk or two, using a polling loop to avoid race conditions
-        let tmp_path =
-            manager::types::resolve_absolute_path("test_downloads_shutdown/model.safetensors.tmp");
         let mut downloaded_bytes = 0;
         for i in 0..50 {
-            if let Ok(meta) = tokio::fs::metadata(&tmp_path).await
-                && meta.len() > 0
-            {
-                downloaded_bytes = meta.len();
-                tracing::info!(
-                    "Test: tmp file created and has {} bytes. Breaking loop.",
-                    downloaded_bytes
-                );
-                // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let active = {
+                let dl = state.active_downloads.lock().unwrap();
+                dl.get("test-model").cloned()
+            };
+            if let Some(dl) = active {
+                if dl.bytes_transferred > 0 {
+                    downloaded_bytes = dl.bytes_transferred;
+                    tracing::info!(
+                        "Test: downloader registered {} bytes. Breaking loop.",
+                        downloaded_bytes
+                    );
+                    // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    break;
+                }
+            } else {
+                tracing::error!("Test: downloader task disappeared from active_downloads!");
                 break;
             }
             if i % 10 == 0 {
                 tracing::info!(
-                    "Test: waiting for tmp file to receive bytes... (attempt {})",
+                    "Test: waiting for downloader to receive bytes... (attempt {})",
                     i
                 );
             }
@@ -2934,7 +2765,7 @@ mod tests {
             "Should have downloaded at least some bytes before shutting down"
         );
         assert!(
-            downloaded < 100 * 1024,
+            downloaded < 512000,
             "Should have aborted before reaching the full file size"
         );
 
@@ -2952,15 +2783,12 @@ mod tests {
         // 1. Create a mock server that slowly streams data
         let mock_app = Router::new().route(
             "/{*path}",
-            axum::routing::any(|req: axum::extract::Request| async move {
-                tracing::info!(
-                    "Mock server received {} request to {}",
-                    req.method(),
-                    req.uri()
-                );
+            axum::routing::get(|req: axum::extract::Request| async move {
+                tracing::info!("Mock server received GET request to {}", req.uri());
+
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
                 tokio::spawn(async move {
-                    for _ in 0..100 {
+                    for _ in 0..500 {
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                         if tx
                             .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
@@ -2975,9 +2803,16 @@ mod tests {
                     }
                 });
                 axum::response::Response::builder()
-                    .header(axum::http::header::CONTENT_LENGTH, "102400")
+                    .header(axum::http::header::CONTENT_LENGTH, "512000")
                     .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
                     .expect("Failed to build mock response")
+            })
+            .head(|req: axum::extract::Request| async move {
+                tracing::info!("Mock server received HEAD request to {}", req.uri());
+                axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "512000")
+                    .body(axum::body::Body::empty())
+                    .expect("Failed to build mock HEAD response")
             }),
         );
 
@@ -2998,6 +2833,7 @@ mod tests {
             downloads_directory: "test_downloads_cancel".to_string(),
             ..Default::default()
         };
+        let _ = tokio::fs::remove_dir_all(&config.downloads_directory).await;
         let _ = tokio::fs::create_dir_all(&config.downloads_directory).await;
 
         let (queue_tx, _) = mpsc::channel(1);
@@ -3042,6 +2878,10 @@ mod tests {
         });
 
         // 3. Spawn the model downloader
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("test-model-cancel".to_string(), DownloadStatus::default());
+        }
         let state_clone = state.clone();
         let (cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(16);
         let task = tokio::spawn(async move {
@@ -3057,25 +2897,30 @@ mod tests {
         });
 
         // Let it connect and download a chunk or two, using a polling loop to avoid race conditions
-        let tmp_path =
-            manager::types::resolve_absolute_path("test_downloads_cancel/model.safetensors.tmp");
         let mut downloaded_bytes = 0;
         for i in 0..50 {
-            if let Ok(meta) = tokio::fs::metadata(&tmp_path).await
-                && meta.len() > 0
-            {
-                downloaded_bytes = meta.len();
-                tracing::info!(
-                    "Test: tmp file created and has {} bytes. Breaking loop.",
-                    downloaded_bytes
-                );
-                // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let active = {
+                let dl = state.active_downloads.lock().unwrap();
+                dl.get("test-model-cancel").cloned()
+            };
+            if let Some(dl) = active {
+                if dl.bytes_transferred > 0 {
+                    downloaded_bytes = dl.bytes_transferred;
+                    tracing::info!(
+                        "Test: downloader registered {} bytes. Breaking loop.",
+                        downloaded_bytes
+                    );
+                    // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    break;
+                }
+            } else {
+                tracing::error!("Test: downloader task disappeared from active_downloads!");
                 break;
             }
             if i % 10 == 0 {
                 tracing::info!(
-                    "Test: waiting for tmp file to receive bytes... (attempt {})",
+                    "Test: waiting for downloader to receive bytes... (attempt {})",
                     i
                 );
             }
@@ -3116,7 +2961,7 @@ mod tests {
             "Should have downloaded at least some bytes before shutting down"
         );
         assert!(
-            downloaded < 100 * 1024,
+            downloaded < 512000,
             "Should have aborted before reaching the full file size"
         );
 

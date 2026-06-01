@@ -311,33 +311,6 @@ struct ModelRegistration {
 
 static REGISTRY: OnceCell<Arc<RwLock<Vec<ModelConfig>>>> = OnceCell::const_new();
 
-#[derive(Deserialize)]
-struct PartialConfig {
-    downloads_directory: Option<String>,
-    hf_base_url: Option<String>,
-}
-
-impl PartialConfig {
-    async fn load() -> Self {
-        if let Ok(data) =
-            tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.toml")).await
-            && let Ok(config) = toml::from_str::<PartialConfig>(&data)
-        {
-            return config;
-        }
-        if let Ok(data) =
-            tokio::fs::read_to_string(crate::types::resolve_absolute_path("config.json")).await
-            && let Ok(config) = serde_json::from_str::<PartialConfig>(&data)
-        {
-            return config;
-        }
-        PartialConfig {
-            downloads_directory: None,
-            hf_base_url: None,
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn resolve_model_size(
     filenames: &[String],
@@ -428,20 +401,12 @@ async fn resolve_model_size(
 }
 
 // Expose the registry so the web server can send it to the UI
-pub async fn get_model_registry() -> Vec<ModelConfig> {
+pub async fn get_model_registry(config: &crate::config::AppConfig) -> Vec<ModelConfig> {
     let registry_lock = REGISTRY.get_or_init(|| async {
         let lock = Arc::new(RwLock::new(Vec::new()));
 
-        let mut downloads_dir = crate::types::resolve_absolute_path("downloads");
-        let mut hf_base_url = "https://huggingface.co".to_string();
-
-        let config = PartialConfig::load().await;
-        if let Some(dir) = config.downloads_directory {
-            downloads_dir = crate::types::resolve_absolute_path(dir);
-        }
-        if let Some(url) = config.hf_base_url {
-            hf_base_url = url;
-        }
+        let downloads_dir = crate::types::resolve_absolute_path(&config.downloads_directory);
+        let hf_base_url = config.hf_base_url.clone();
 
         let mut builder = hf_hub::api::tokio::ApiBuilder::new().with_endpoint(hf_base_url.clone());
         if let Ok(token) = std::env::var("HF_TOKEN") {
@@ -462,6 +427,8 @@ pub async fn get_model_registry() -> Vec<ModelConfig> {
 
         let shared_reqwest_client = match reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::default())
+            .connect_timeout(std::time::Duration::from_secs(config.registry_connect_timeout_seconds))
+            .timeout(std::time::Duration::from_secs(config.registry_request_timeout_seconds))
             .tcp_keepalive(std::time::Duration::from_secs(60))
             .pool_idle_timeout(std::time::Duration::from_secs(55))
             .build()

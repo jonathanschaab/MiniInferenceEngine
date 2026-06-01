@@ -60,7 +60,7 @@ pub async fn load_engine(
 ) -> Result<(DynamicModel, Tokenizer, Option<std::fs::File>), String> {
     let api = Api::new().map_err(|e| e.to_string())?;
 
-    if config.filename.ends_with(".safetensors") {
+    if config.arch == ModelArch::XLMRoberta {
         let repo = api.model(config.repo.clone());
         let filenames = crate::registry::get_split_filenames(&config.filename);
         let mut weights_paths = Vec::new();
@@ -413,7 +413,7 @@ pub async fn compress_text(
     device: &Device,
     target_len: usize,
     max_chunk_size: usize,
-    ) -> Result<(String, u128), String> {
+) -> Result<(String, u128), String> {
     if let DynamicModel::XLMRoberta(m) = model {
         let tok_start = std::time::Instant::now();
         let tokens = tokenizer

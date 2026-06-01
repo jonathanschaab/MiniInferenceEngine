@@ -409,130 +409,164 @@ async fn download_chunk(
         let _ = tokio::fs::create_dir_all(parent).await;
     }
 
-    let (mut existing_size, mut expected_hash, mut is_sha256, mut initial_hasher, mut checkpoints) =
-        check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path, &remote_sha256).await;
+    let mut retries = 0;
+    let max_retries = state.config.download_retry_max_attempts;
+    let mut backoff = state.config.download_retry_backoff_seconds;
 
-    let original_existing_size = existing_size;
-    shared_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let (
+            mut existing_size,
+            mut expected_hash,
+            mut is_sha256,
+            mut initial_hasher,
+            mut checkpoints,
+        ) = check_existing_metadata(&state, &id, &tmp_file_path, &meta_file_path, &remote_sha256)
+            .await;
 
-    let (mut res, final_url) = match initiate_request(
-        &client,
-        &url,
-        &id,
-        &mut existing_size,
-        &active_streams,
-        &mut shutdown_rx,
-        &mut cancel_rx,
-        hf_token.as_deref(),
-        &hf_base_url,
-        &state.config,
-    )
-    .await
-    {
-        Some(result) => result,
-        None => return false,
-    };
+        let original_existing_size = existing_size;
+        shared_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
 
-    if verify_and_update_etag(
-        &client,
-        &final_url,
-        &id,
-        &mut res,
-        &mut existing_size,
-        &mut expected_hash,
-        &mut is_sha256,
-        hf_token.as_deref(),
-        &hf_base_url,
-    )
-    .await
-    .is_err()
-    {
-        return false;
-    }
+        let (mut res, _final_url) = loop {
+            let (response, final_url) = match initiate_request(
+                &client,
+                &url,
+                &id,
+                &mut existing_size,
+                &active_streams,
+                &mut shutdown_rx,
+                &mut cancel_rx,
+                hf_token.as_deref(),
+                &hf_base_url,
+                &state.config,
+            )
+            .await
+            {
+                Some(result) => result,
+                None => return false,
+            };
 
-    let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-    if !is_partial && existing_size > 0 {
-        existing_size = 0;
-    }
-    if existing_size < original_existing_size {
-        shared_downloaded.fetch_sub(
-            original_existing_size - existing_size,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
+            if verify_and_update_etag(
+                &response,
+                &id,
+                &mut existing_size,
+                &mut expected_hash,
+                &mut is_sha256,
+            )
+            .await
+            {
+                // ETag mismatch, restart needed
+                continue;
+            }
+            break (response, final_url);
+        };
 
-    if known_chunk_size == 0
-        && let Some(content_length) = res.content_length()
-    {
-        let actual_chunk_size = existing_size + content_length;
-        grand_total.fetch_add(actual_chunk_size, std::sync::atomic::Ordering::Relaxed);
-    }
+        let is_partial = res.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        if !is_partial && existing_size > 0 {
+            existing_size = 0;
+        }
+        if existing_size < original_existing_size {
+            shared_downloaded.fetch_sub(
+                original_existing_size - existing_size,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
-    if existing_size == 0 {
-        initial_hasher = Sha256::new();
-        checkpoints.clear();
-    }
+        if known_chunk_size == 0
+            && let Some(content_length) = res.content_length()
+        {
+            let actual_chunk_size = existing_size + content_length;
+            grand_total.fetch_add(actual_chunk_size, std::sync::atomic::Ordering::Relaxed);
+        }
 
-    save_metadata(&meta_file_path, &expected_hash, is_sha256, &checkpoints).await;
+        if existing_size == 0 {
+            initial_hasher = Sha256::new();
+            checkpoints.clear();
+        }
 
-    let mut file = match open_temp_file(&tmp_file_path, is_partial, existing_size).await {
-        Ok(f) => f,
-        Err(e) => {
-            error!("Failed to open file for {}: {}", id, e);
+        save_metadata(&meta_file_path, &expected_hash, is_sha256, &checkpoints).await;
+
+        let mut file = match open_temp_file(&tmp_file_path, is_partial, existing_size).await {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Failed to open file for {}: {}", id, e);
+                return false;
+            }
+        };
+
+        let (stream_error, _, is_aborted) = process_download_stream(
+            &state,
+            &client,
+            &id,
+            &mut res,
+            &mut file,
+            &mut initial_hasher,
+            existing_size,
+            &meta_file_path,
+            &expected_hash,
+            is_sha256,
+            checkpoints,
+            &mut shutdown_rx,
+            &mut cancel_rx,
+            shared_downloaded.clone(),
+            grand_total.clone(),
+            start_time,
+            session_downloaded.clone(),
+            active_streams.clone(),
+        )
+        .await;
+
+        if is_aborted {
             return false;
         }
-    };
 
-    let (stream_error, _) = process_download_stream(
-        &state,
-        &client,
-        &id,
-        &mut res,
-        &mut file,
-        &mut initial_hasher,
-        existing_size,
-        &meta_file_path,
-        &expected_hash,
-        is_sha256,
-        checkpoints,
-        &mut shutdown_rx,
-        &mut cancel_rx,
-        shared_downloaded,
-        grand_total,
-        start_time,
-        session_downloaded,
-        active_streams,
-    )
-    .await;
+        if stream_error {
+            retries += 1;
+            if retries > max_retries {
+                error!(
+                    "Max retries reached for download stream of chunk {}. Aborting.",
+                    filename
+                );
+                return false;
+            }
+            warn!(
+                "Download stream for {} failed. Retrying ({}/{}) in {} seconds...",
+                filename, retries, max_retries, backoff
+            );
+            if let Some(reason) = wait_for_backoff(backoff, &mut shutdown_rx, &mut cancel_rx).await
+            {
+                info!(
+                    "{} signal received during stream retry backoff. Aborting.",
+                    reason
+                );
+                return false;
+            }
+            backoff = (backoff * 2).min(60);
+            continue;
+        }
 
-    if stream_error {
-        return false;
+        let final_hash = hex::encode(initial_hasher.finalize());
+        let hash_mismatch = if let Some(ref expected) = expected_hash {
+            is_sha256
+                && expected.len() == 64
+                && expected.chars().all(|c| c.is_ascii_hexdigit())
+                && &final_hash != expected
+        } else {
+            false
+        };
+
+        let file_path = downloads_dir.join(&filename);
+        finalize_download(
+            &id,
+            &filename,
+            &file_path,
+            &tmp_file_path,
+            &meta_file_path,
+            hash_mismatch,
+        )
+        .await;
+
+        return hash_mismatch;
     }
-
-    drop(file);
-
-    let final_hash = hex::encode(initial_hasher.finalize());
-    let hash_mismatch = if let Some(ref expected) = expected_hash {
-        is_sha256
-            && expected.len() == 64
-            && expected.chars().all(|c| c.is_ascii_hexdigit())
-            && &final_hash != expected
-    } else {
-        false
-    };
-
-    let file_path = downloads_dir.join(&filename);
-    finalize_download(
-        &id,
-        &filename,
-        &file_path,
-        &tmp_file_path,
-        &meta_file_path,
-        hash_mismatch,
-    )
-    .await;
-
-    hash_mismatch
 }
 
 async fn check_existing_metadata(
@@ -630,8 +664,17 @@ async fn check_existing_metadata(
                                 .await
                             {
                                 if let Err(e) = f.set_len(existing_size).await {
-                                    error!("Failed to truncate {} to checkpoint size {}: {}", id, existing_size, e);
-                                    return (0, expected_hash, is_sha256, Sha256::new(), Vec::new());
+                                    error!(
+                                        "Failed to truncate {} to checkpoint size {}: {}",
+                                        id, existing_size, e
+                                    );
+                                    return (
+                                        0,
+                                        expected_hash,
+                                        is_sha256,
+                                        Sha256::new(),
+                                        Vec::new(),
+                                    );
                                 }
                             } else {
                                 error!("Failed to open {} for truncation", id);
@@ -776,7 +819,10 @@ async fn initiate_request(
             Err(e) => {
                 retries += 1;
                 if retries > config.download_retry_max_attempts {
-                    error!("Max retries reached for network error on {}: {}. Aborting.", id, e);
+                    error!(
+                        "Max retries reached for network error on {}: {}. Aborting.",
+                        id, e
+                    );
                     return None;
                 }
                 warn!(
@@ -784,7 +830,10 @@ async fn initiate_request(
                     id, e, retries, config.download_retry_max_attempts, backoff
                 );
                 if let Some(reason) = wait_for_backoff(backoff, shutdown_rx, cancel_rx).await {
-                    info!("{} signal received during network error backoff for {}. Aborting.", reason, id);
+                    info!(
+                        "{} signal received during network error backoff for {}. Aborting.",
+                        reason, id
+                    );
                     return None;
                 }
                 backoff = (backoff * 2).min(60);
@@ -796,18 +845,14 @@ async fn initiate_request(
     None
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Verifies the ETag of the response. Returns `true` if a restart is needed.
 async fn verify_and_update_etag(
-    client: &reqwest::Client,
-    url: &str, // This is now the final URL
+    res: &reqwest::Response,
     id: &str,
-    res: &mut reqwest::Response,
     existing_size: &mut u64,
     expected_hash: &mut Option<String>,
     is_sha256: &mut bool,
-    hf_token: Option<&str>,
-    hf_base_url: &str,
-) -> Result<(), ()> {
+) -> bool {
     info!("Inspecting HTTP Headers for {}:", id);
     for (k, v) in res.headers() {
         info!("  {}: {:?}", k.as_str(), v.to_str().unwrap_or("<binary>"));
@@ -818,7 +863,7 @@ async fn verify_and_update_etag(
             "  Already tracking a verified upstream SHA-256 for {}. Ignoring CDN ETags.",
             id
         );
-        return Ok(());
+        return false;
     }
 
     let mut new_etag = None;
@@ -869,33 +914,14 @@ async fn verify_and_update_etag(
         *existing_size = 0;
         *expected_hash = new_etag.clone();
         *is_sha256 = x_linked_found;
-
-        let mut req = client.get(url);
-        if url.starts_with(hf_base_url.trim_end_matches('/'))
-            && let Some(token) = hf_token
-        {
-            req = req.bearer_auth(token);
+        true // Restart needed
+    } else {
+        if new_etag.is_some() {
+            *expected_hash = new_etag;
+            *is_sha256 = x_linked_found;
         }
-        if let Ok(r) = req.send().await {
-            if r.status().is_success() {
-                *res = r;
-            } else {
-                error!(
-                    "Download failed for {} on restart with status: {}",
-                    id,
-                    r.status()
-                );
-                return Err(());
-            }
-        } else {
-            error!("Download failed for {} on restart", id);
-            return Err(());
-        }
-    } else if new_etag.is_some() {
-        *expected_hash = new_etag;
-        *is_sha256 = x_linked_found;
+        false // OK to proceed
     }
-    Ok(())
 }
 
 async fn save_metadata(
@@ -910,11 +936,14 @@ async fn save_metadata(
         checkpoints: checkpoints.to_vec(),
         hasher_version: HASHER_STATE_VERSION,
     };
-    let _ = tokio::fs::write(
-        meta_file_path,
-        serde_json::to_string(&meta).unwrap_or_default(),
-    )
-    .await;
+    if let Ok(data) = serde_json::to_string(&meta) {
+        let tmp_path = meta_file_path.with_extension("meta.tmp");
+        if tokio::fs::write(&tmp_path, data).await.is_ok()
+            && let Err(e) = tokio::fs::rename(&tmp_path, meta_file_path).await
+        {
+            error!("Failed to atomically rename metadata file: {}", e);
+        }
+    }
 }
 
 async fn open_temp_file(
@@ -953,7 +982,7 @@ async fn process_download_stream(
     start_time: std::time::Instant,
     session_downloaded: Arc<std::sync::atomic::AtomicU64>,
     active_streams: Arc<std::sync::atomic::AtomicUsize>,
-) -> (bool, u64) {
+) -> (bool, u64, bool) {
     let _active_guard = ActiveStreamGuard::new(active_streams);
 
     let mut downloaded: u64 = existing_size;
@@ -962,77 +991,87 @@ async fn process_download_stream(
     let mut last_ui_update = std::time::Instant::now();
     let mut bytes_since_last_ui_update = 0;
 
+    let timeout_secs = state.config.download_stream_chunk_timeout_seconds;
+
     loop {
         tokio::select! {
-            chunk_res = res.chunk() => {
-                let bytes = match chunk_res {
-                    Ok(Some(c)) => c,
-                    Ok(None) => break,
-                    Err(e) => {
-                        error!("Error while streaming {}: {}", id, e);
-                        stream_error = true;
-                        break;
-                    }
-                };
-
-                hasher.update(&bytes);
-
-                if let Err(e) = file.write_all(&bytes).await {
-                    error!("Failed to write to file for {}: {}", id, e);
-                    stream_error = true;
-                    break;
-                }
-                let chunk_len = bytes.len() as u64;
-                downloaded += chunk_len;
-                bytes_since_last_ui_update += chunk_len;
-
-                let total_transferred = shared_downloaded.fetch_add(chunk_len, std::sync::atomic::Ordering::Relaxed) + chunk_len;
-                let current_session_bytes = session_downloaded.fetch_add(chunk_len, std::sync::atomic::Ordering::Relaxed) + chunk_len;
-
-                if last_ui_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS
-                    || bytes_since_last_ui_update >= UPDATE_BYTES_THRESHOLD
-                {
-                    let elapsed = start_time.elapsed().as_secs_f64();
-                    let speed = if elapsed > 0.0 {
-                        current_session_bytes as f64 / elapsed
-                    } else {
-                        0.0
-                    };
-
-                    let current_grand_total = grand_total.load(std::sync::atomic::Ordering::Relaxed);
-                    {
-                        let mut dl = lock_mutex(&state.active_downloads);
-                        if let Some(status) = dl.get_mut(id) {
-                            status.bytes_transferred = total_transferred;
-                            status.total_bytes = current_grand_total;
-                            status.current_speed_bps = speed;
-                            status.state = "Downloading...".to_string();
-                        }
-                    }
-
-                    last_ui_update = std::time::Instant::now();
-                    bytes_since_last_ui_update = 0;
-                }
-
-                if last_meta_save.elapsed().as_secs() >= META_SAVE_INTERVAL_SECS {
-                    save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
-                    last_meta_save = std::time::Instant::now();
-                }
-            }
+            biased;
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received. Flushing metadata for {}...", id);
                 save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
-                return (true, downloaded);
+                return (false, downloaded, true);
             }
             _ = cancel_rx.recv() => {
                 info!("Cancel signal received. Flushing metadata for {}...", id);
                 save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
-                return (true, downloaded);
+                return (false, downloaded, true);
+            }
+            chunk_res = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), res.chunk()) => {
+                match chunk_res {
+                    Ok(Ok(Some(bytes))) => {
+                        hasher.update(&bytes);
+
+                        if let Err(e) = file.write_all(&bytes).await {
+                            error!("Failed to write to file for {}: {}", id, e);
+                            stream_error = true;
+                            break;
+                        }
+                        let chunk_len = bytes.len() as u64;
+                        downloaded += chunk_len;
+                        bytes_since_last_ui_update += chunk_len;
+
+                        let total_transferred = shared_downloaded.fetch_add(chunk_len, std::sync::atomic::Ordering::Relaxed) + chunk_len;
+                        let current_session_bytes = session_downloaded.fetch_add(chunk_len, std::sync::atomic::Ordering::Relaxed) + chunk_len;
+
+                        if last_ui_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS
+                            || bytes_since_last_ui_update >= UPDATE_BYTES_THRESHOLD
+                        {
+                            let elapsed = start_time.elapsed().as_secs_f64();
+                            let speed = if elapsed > 0.0 {
+                                current_session_bytes as f64 / elapsed
+                            } else {
+                                0.0
+                            };
+
+                            let current_grand_total = grand_total.load(std::sync::atomic::Ordering::Relaxed);
+                            {
+                                let mut dl = lock_mutex(&state.active_downloads);
+                                if let Some(status) = dl.get_mut(id) {
+                                    status.bytes_transferred = total_transferred;
+                                    status.total_bytes = current_grand_total;
+                                    status.current_speed_bps = speed;
+                                    status.state = "Downloading...".to_string();
+                                }
+                            }
+
+                            last_ui_update = std::time::Instant::now();
+                            bytes_since_last_ui_update = 0;
+                        }
+
+                        if last_meta_save.elapsed().as_secs() >= META_SAVE_INTERVAL_SECS {
+                            save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
+                            last_meta_save = std::time::Instant::now();
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        break; // Stream finished
+                    }
+                    Ok(Err(e)) => {
+                        error!("Error while streaming {}: {}", id, e);
+                        stream_error = true;
+                        break;
+                    }
+                    Err(_) => {
+                        error!("Stream for {} timed out after {} seconds.", id, timeout_secs);
+                        stream_error = true;
+                        break;
+                    }
+                }
             }
         }
     }
 
-    (stream_error, downloaded)
+    (stream_error, downloaded, false)
 }
 
 async fn finalize_download(

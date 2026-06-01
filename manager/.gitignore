@@ -10,3 +10,5 @@ node_modules
 test-results
 playwright-report
 database.jwt
+/test_downloads_cancel/model.safetensors
+/test_downloads_shutdown/model.safetensors

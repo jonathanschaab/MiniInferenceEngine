@@ -20,6 +20,7 @@ log_file_name = "server.log"
 # temp_file_retention_days = 3
 # download_retry_max_attempts = 5
 # download_retry_backoff_seconds = 2
+# download_stream_chunk_timeout_seconds = 30
 # downloads_directory = "downloads"
 # hf_base_url = "https://huggingface.co"
 
