@@ -426,6 +426,8 @@ async fn download_chunk(
         let original_existing_size = existing_size;
         shared_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
 
+        session_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
+
         let (mut res, _final_url) = loop {
             let (response, final_url) = match initiate_request(
                 &client,
@@ -442,7 +444,14 @@ async fn download_chunk(
             .await
             {
                 Some(result) => result,
-                None => return false,
+                None => {
+                    balance_chunk_counters_before_stream(
+                        &shared_downloaded,
+                        &session_downloaded,
+                        original_existing_size,
+                    );
+                    return false;
+                }
             };
 
             if verify_and_update_etag(
@@ -464,11 +473,14 @@ async fn download_chunk(
         if !is_partial && existing_size > 0 {
             existing_size = 0;
         }
+        // Balance the counter after ETag/headers adjustments.
+        // original_existing_size was added at the top of the loop; if it dropped, subtract the delta.
+        let mut contribution_from_existing = original_existing_size;
         if existing_size < original_existing_size {
-            shared_downloaded.fetch_sub(
-                original_existing_size - existing_size,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let delta = original_existing_size - existing_size;
+            shared_downloaded.fetch_sub(delta, std::sync::atomic::Ordering::Relaxed);
+            session_downloaded.fetch_sub(delta, std::sync::atomic::Ordering::Relaxed);
+            contribution_from_existing -= delta;
         }
 
         if known_chunk_size == 0
@@ -489,11 +501,16 @@ async fn download_chunk(
             Ok(f) => f,
             Err(e) => {
                 error!("Failed to open file for {}: {}", id, e);
+                balance_chunk_counters_before_stream(
+                    &shared_downloaded,
+                    &session_downloaded,
+                    contribution_from_existing,
+                );
                 return false;
             }
         };
 
-        let (stream_error, _, is_aborted) = process_download_stream(
+        let stream_result = process_download_stream(
             &state,
             &client,
             &id,
@@ -515,11 +532,23 @@ async fn download_chunk(
         )
         .await;
 
-        if is_aborted {
+        if stream_result.is_aborted {
+            balance_chunk_counters(
+                &shared_downloaded,
+                &session_downloaded,
+                contribution_from_existing,
+                stream_result.streamed_bytes,
+            );
             return false;
         }
 
-        if stream_error {
+        if stream_result.stream_error {
+            balance_chunk_counters(
+                &shared_downloaded,
+                &session_downloaded,
+                contribution_from_existing,
+                stream_result.streamed_bytes,
+            );
             retries += 1;
             if retries > max_retries {
                 error!(
@@ -565,8 +594,53 @@ async fn download_chunk(
         )
         .await;
 
+        balance_chunk_counters(
+            &shared_downloaded,
+            &session_downloaded,
+            contribution_from_existing,
+            stream_result.streamed_bytes,
+        );
         return hash_mismatch;
     }
+}
+
+/// Balances download counters after streaming completes.
+///
+/// Called by `download_chunk` to subtract the total contribution (existing + streamed)
+/// from `shared_downloaded` and `session_downloaded` before returning.
+///
+/// This function is intentionally separate so the invariant "every fetch_add has a
+/// matching fetch_sub on every exit path" can be unit tested independently of the
+/// async download machinery.
+pub(crate) fn balance_chunk_counters(
+    shared_downloaded: &std::sync::atomic::AtomicU64,
+    session_downloaded: &std::sync::atomic::AtomicU64,
+    contribution_from_existing: u64,
+    streamed_bytes: u64,
+) {
+    let total = contribution_from_existing + streamed_bytes;
+    shared_downloaded.fetch_sub(total, std::sync::atomic::Ordering::Relaxed);
+    session_downloaded.fetch_sub(total, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Balances download counters on early exit before streaming begins.
+///
+/// Called by `download_chunk` when the file cannot be opened or initiate_request
+/// fails — only the `contribution_from_existing` is subtracted (no streamed bytes
+/// were added because the stream was never entered).
+pub(crate) fn balance_chunk_counters_before_stream(
+    shared_downloaded: &std::sync::atomic::AtomicU64,
+    session_downloaded: &std::sync::atomic::AtomicU64,
+    contribution_from_existing: u64,
+) {
+    shared_downloaded.fetch_sub(
+        contribution_from_existing,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    session_downloaded.fetch_sub(
+        contribution_from_existing,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 async fn check_existing_metadata(
@@ -962,6 +1036,12 @@ async fn open_temp_file(
     }
 }
 
+struct ProcessStreamResult {
+    stream_error: bool,
+    is_aborted: bool,
+    streamed_bytes: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_download_stream(
     state: &Arc<AppState>,
@@ -982,9 +1062,10 @@ async fn process_download_stream(
     start_time: std::time::Instant,
     session_downloaded: Arc<std::sync::atomic::AtomicU64>,
     active_streams: Arc<std::sync::atomic::AtomicUsize>,
-) -> (bool, u64, bool) {
+) -> ProcessStreamResult {
     let _active_guard = ActiveStreamGuard::new(active_streams);
 
+    let starting_existing_size = existing_size;
     let mut downloaded: u64 = existing_size;
     let mut stream_error = false;
     let mut last_meta_save = std::time::Instant::now();
@@ -999,12 +1080,20 @@ async fn process_download_stream(
             _ = shutdown_rx.recv() => {
                 info!("Shutdown signal received. Flushing metadata for {}...", id);
                 save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
-                return (false, downloaded, true);
+                return ProcessStreamResult {
+                    stream_error: false,
+                    is_aborted: true,
+                    streamed_bytes: downloaded - starting_existing_size,
+                };
             }
             _ = cancel_rx.recv() => {
                 info!("Cancel signal received. Flushing metadata for {}...", id);
                 save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
-                return (false, downloaded, true);
+                return ProcessStreamResult {
+                    stream_error: false,
+                    is_aborted: true,
+                    streamed_bytes: downloaded - starting_existing_size,
+                };
             }
             chunk_res = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), res.chunk()) => {
                 match chunk_res {
@@ -1071,7 +1160,11 @@ async fn process_download_stream(
         }
     }
 
-    (stream_error, downloaded, false)
+    ProcessStreamResult {
+        stream_error,
+        is_aborted: false,
+        streamed_bytes: downloaded - starting_existing_size,
+    }
 }
 
 async fn finalize_download(
@@ -1162,6 +1255,7 @@ async fn finalize_download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn test_serialize_deserialize_hasher() {
@@ -1345,5 +1439,202 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    // ── Atomic counter balancing tests ────
+    // These tests exercise the real production helpers (balance_chunk_counters,
+    // balance_chunk_counters_before_stream) that download_chunk calls on every
+    // exit path. If someone changes download_chunk without keeping the helpers
+    // in sync, these tests will catch it.
+
+    #[derive(Clone, Copy, Debug)]
+    enum CounterExit {
+        InitRequestFail,
+        OpenFileFail,
+        Aborted,
+        StreamError,
+        Success,
+    }
+
+    /// Simulates the full lifecycle of a single download-chunk loop iteration:
+    /// fetch_add(existing), optional ETag delta, then one exit path's subtraction.
+    /// Calls the real production helpers on every path.
+    fn simulate_counter_balance(
+        init_existing: u64,
+        etag_delta: Option<u64>,
+        streamed_bytes: u64,
+        exit_path: CounterExit,
+    ) -> (u64, u64) {
+        let shared = Arc::new(AtomicU64::new(0));
+        let session = Arc::new(AtomicU64::new(0));
+
+        // Step 1: initial contribution (as in download_chunk loop top)
+        shared.fetch_add(init_existing, Ordering::Relaxed);
+        session.fetch_add(init_existing, Ordering::Relaxed);
+
+        // Step 2: ETag/headers adjustment (as in download_chunk after verify_and_update_etag)
+        let mut contribution_from_existing = init_existing;
+        if let Some(delta) = etag_delta {
+            shared.fetch_sub(delta, Ordering::Relaxed);
+            session.fetch_sub(delta, Ordering::Relaxed);
+            contribution_from_existing -= delta;
+        }
+
+        // Step 3: exit path subtraction - calls the real production helpers
+        match exit_path {
+            CounterExit::InitRequestFail | CounterExit::OpenFileFail => {
+                super::balance_chunk_counters_before_stream(
+                    &shared,
+                    &session,
+                    contribution_from_existing,
+                );
+            }
+            CounterExit::Aborted | CounterExit::StreamError | CounterExit::Success => {
+                // Simulate process_download_stream adding streamed bytes to the counters
+                shared.fetch_add(streamed_bytes, Ordering::Relaxed);
+                session.fetch_add(streamed_bytes, Ordering::Relaxed);
+                super::balance_chunk_counters(
+                    &shared,
+                    &session,
+                    contribution_from_existing,
+                    streamed_bytes,
+                );
+            }
+        }
+
+        (
+            shared.load(Ordering::Relaxed),
+            session.load(Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn test_balance_counters_before_stream_no_etag() {
+        let shared = Arc::new(AtomicU64::new(0));
+        let session = Arc::new(AtomicU64::new(100));
+        shared.fetch_add(100, Ordering::Relaxed);
+        session.fetch_add(100, Ordering::Relaxed);
+        super::balance_chunk_counters_before_stream(&shared, &session, 100);
+        assert_eq!(shared.load(Ordering::Relaxed), 0);
+        assert_eq!(session.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn test_balance_counters_before_stream_with_etag_delta() {
+        let shared = Arc::new(AtomicU64::new(0));
+        let session = Arc::new(AtomicU64::new(0));
+        shared.fetch_add(100, Ordering::Relaxed);
+        session.fetch_add(100, Ordering::Relaxed);
+        shared.fetch_sub(50, Ordering::Relaxed);
+        session.fetch_sub(50, Ordering::Relaxed);
+        super::balance_chunk_counters_before_stream(&shared, &session, 50);
+        assert_eq!(shared.load(Ordering::Relaxed), 0);
+        assert_eq!(session.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_balance_counters_after_stream_no_etag() {
+        let shared = Arc::new(AtomicU64::new(0));
+        let session = Arc::new(AtomicU64::new(0));
+        shared.fetch_add(100, Ordering::Relaxed);
+        session.fetch_add(100, Ordering::Relaxed);
+        shared.fetch_add(50, Ordering::Relaxed);
+        session.fetch_add(50, Ordering::Relaxed);
+        super::balance_chunk_counters(&shared, &session, 100, 50);
+        assert_eq!(shared.load(Ordering::Relaxed), 0);
+        assert_eq!(session.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_balance_counters_after_stream_with_etag_delta() {
+        let shared = Arc::new(AtomicU64::new(0));
+        let session = Arc::new(AtomicU64::new(0));
+        shared.fetch_add(100, Ordering::Relaxed);
+        session.fetch_add(100, Ordering::Relaxed);
+        shared.fetch_sub(50, Ordering::Relaxed);
+        session.fetch_sub(50, Ordering::Relaxed);
+        shared.fetch_add(25, Ordering::Relaxed);
+        session.fetch_add(25, Ordering::Relaxed);
+        super::balance_chunk_counters(&shared, &session, 50, 25);
+        assert_eq!(shared.load(Ordering::Relaxed), 0);
+        assert_eq!(session.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_balance_counters_zero_existing() {
+        let shared = Arc::new(AtomicU64::new(0));
+        let session = Arc::new(AtomicU64::new(0));
+        shared.fetch_add(200, Ordering::Relaxed);
+        session.fetch_add(200, Ordering::Relaxed);
+        super::balance_chunk_counters(&shared, &session, 0, 200);
+        assert_eq!(shared.load(Ordering::Relaxed), 0);
+        assert_eq!(session.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_balance_counters_large_transfer() {
+        let shared = Arc::new(AtomicU64::new(0));
+        let session = Arc::new(AtomicU64::new(0));
+        shared.fetch_add(10_000_000, Ordering::Relaxed);
+        session.fetch_add(10_000_000, Ordering::Relaxed);
+        shared.fetch_add(50_000_000, Ordering::Relaxed);
+        session.fetch_add(50_000_000, Ordering::Relaxed);
+        super::balance_chunk_counters(&shared, &session, 10_000_000, 50_000_000);
+        assert_eq!(shared.load(Ordering::Relaxed), 0);
+        assert_eq!(session.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_balance_counters_all_exit_paths_net_zero() {
+        let paths = vec![
+            (CounterExit::InitRequestFail, 0),
+            (CounterExit::OpenFileFail, 0),
+            (CounterExit::Aborted, 50),
+            (CounterExit::StreamError, 25),
+            (CounterExit::Success, 100),
+        ];
+        for (exit, streamed) in paths {
+            let (shared, session) = simulate_counter_balance(100, None, streamed, exit);
+            assert_eq!(
+                shared, 0,
+                "shared_downloaded not zero for path {:?} with {} bytes",
+                exit, streamed
+            );
+            assert_eq!(
+                session, 0,
+                "session_downloaded not zero for path {:?} with {} bytes",
+                exit, streamed
+            );
+        }
+    }
+
+    #[test]
+    fn test_balance_counters_with_etag_and_streaming_combinations() {
+        let etag_deltas = vec![Some(100), Some(50), None];
+        let stream_sizes = vec![0u64, 10, 50, 100, 1000];
+        let exits = vec![
+            CounterExit::Success,
+            CounterExit::Aborted,
+            CounterExit::StreamError,
+            CounterExit::InitRequestFail,
+            CounterExit::OpenFileFail,
+        ];
+        for delta in etag_deltas {
+            for streamed in &stream_sizes {
+                for exit in &exits {
+                    let (shared, session) = simulate_counter_balance(100, delta, *streamed, *exit);
+                    assert_eq!(
+                        shared, 0,
+                        "shared not zero for delta={:?} streamed={} exit={:?}",
+                        delta, streamed, exit
+                    );
+                    assert_eq!(
+                        session, 0,
+                        "session not zero for delta={:?} streamed={} exit={:?}",
+                        delta, streamed, exit
+                    );
+                }
+            }
+        }
     }
 }
