@@ -366,6 +366,10 @@ async fn resolve_model_size(
                 req = req.bearer_auth(token);
             }
             if let Ok(res) = req.send().await {
+                if !res.status().is_success() {
+                    remote_found = false;
+                    break;
+                }
                 let size_header = res
                     .headers()
                     .get("X-Linked-Size")
@@ -769,365 +773,630 @@ pub async fn get_model_registry(config: &crate::config::AppConfig) -> Vec<ModelC
             },
         ];
 
-        let mut handles = Vec::new();
+        let mut initial_configs = Vec::new();
+        for reg in &registrations {
+            let arch_val = reg.overrides.arch.unwrap_or(ModelArch::Llama);
+            let max_context_len_val = reg.overrides.max_context_len.unwrap_or(8192);
+
+            let mut max_yarn_context = max_context_len_val;
+            if arch_val == ModelArch::Qwen2 {
+                if let Some(sw) = reg.overrides.sliding_window {
+                    max_yarn_context = max_yarn_context.max(sw);
+                }
+            } else if let (Some(factor), Some(orig_ctx)) = (reg.overrides.rope_scaling_factor, reg.overrides.original_max_position_embeddings) {
+                let scaled_ctx = (orig_ctx as f32 * factor) as usize;
+                max_yarn_context = max_yarn_context.max(scaled_ctx);
+            }
+
+            let fallback_size_gb = match reg.compression_dtype {
+                Some(ModelDType::F32) => reg.parameters_billions * 4.0,
+                Some(ModelDType::F16) | Some(ModelDType::BF16) => reg.parameters_billions * 2.0,
+                None => reg.parameters_billions * 0.65, // Assume typical Q4_K_M GGUF
+            };
+
+            let mut provenance = std::collections::HashMap::new();
+            for name in &[
+                "arch",
+                "kv_cache_dtype",
+                "max_context_len",
+                "sliding_window",
+                "rope_scaling_factor",
+                "original_max_position_embeddings",
+                "num_layers",
+                "n_embd",
+                "n_head",
+                "n_head_kv",
+                "head_dim",
+                "intermediate_size",
+                "num_local_experts",
+                "num_experts_per_tok",
+                "kv_lora_rank",
+                "qk_rope_head_dim",
+                "size_on_disk_gb",
+            ] {
+                provenance.insert(name.to_string(), "fallback".to_string());
+            }
+
+            let n_head_val = reg.overrides.n_head.unwrap_or(1);
+            let n_embd_val = reg.overrides.n_embd.unwrap_or(4096);
+
+            initial_configs.push(ModelConfig {
+                id: reg.id.to_string(),
+                name: reg.name.to_string(),
+                repo: reg.repo.to_string(),
+                tokenizer_repo: reg.tokenizer_repo.to_string(),
+                filename: reg.filename.to_string(),
+                roles: reg.roles.clone(),
+                arch: arch_val,
+                compression_dtype: reg.compression_dtype,
+                kv_cache_dtype: reg.overrides.kv_cache_dtype.unwrap_or(ModelDType::F16),
+                supported_backends: reg.supported_backends.clone(),
+                is_default_chat: reg.is_default_chat,
+                is_default_compressor: reg.is_default_compressor,
+                max_context_len: max_context_len_val,
+                max_yarn_context,
+                sliding_window: reg.overrides.sliding_window,
+                rope_scaling_factor: reg.overrides.rope_scaling_factor,
+                original_max_position_embeddings: reg.overrides.original_max_position_embeddings,
+                num_layers: reg.overrides.num_layers.unwrap_or(32),
+                n_embd: n_embd_val,
+                n_head: n_head_val,
+                n_head_kv: reg.overrides.n_head_kv.unwrap_or(n_head_val),
+                head_dim: reg.overrides.head_dim.unwrap_or(n_embd_val / n_head_val.max(1)),
+                intermediate_size: reg.overrides.intermediate_size.unwrap_or(n_embd_val * 4),
+                num_local_experts: reg.overrides.num_local_experts,
+                num_experts_per_tok: reg.overrides.num_experts_per_tok,
+                kv_lora_rank: reg.overrides.kv_lora_rank,
+                qk_rope_head_dim: reg.overrides.qk_rope_head_dim,
+                parameters_billions: reg.parameters_billions,
+                non_layer_params_billions: reg.non_layer_params_billions,
+                size_on_disk_gb: reg.overrides.size_on_disk_gb.unwrap_or(fallback_size_gb),
+                provenance,
+                is_downloaded: false,
+                is_in_hf_cache: false,
+                is_corrupted: false,
+            });
+        }
+
+        lock.write().await.extend(initial_configs);
+
         let hf_cache = hf_hub::Cache::default();
         let init_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
 
         for reg in registrations {
-            let api_opt = api_opt.clone();
-            let reqwest_client = shared_reqwest_client.clone();
-            let hf_token = hf_token.clone();
-            let hf_cache = hf_cache.clone();
-            let downloads_dir = downloads_dir.clone();
-            let hf_base_url = hf_base_url.clone();
-            let sem_clone = init_semaphore.clone();
-
-            handles.push(tokio::spawn(async move {
-                let _permit = sem_clone.acquire().await;
-
-                let mut provenance = std::collections::HashMap::new();
-
-                let mut arch = reg.overrides.arch;
-                    let mut kv_cache_dtype = reg.overrides.kv_cache_dtype;
-                    let mut max_context_len = reg.overrides.max_context_len;
-                    let mut sliding_window = reg.overrides.sliding_window;
-                    let mut rope_scaling_factor = reg.overrides.rope_scaling_factor;
-                    let mut original_max_position_embeddings = reg.overrides.original_max_position_embeddings;
-                    let mut num_layers = reg.overrides.num_layers;
-                    let mut n_embd = reg.overrides.n_embd;
-                    let mut n_head = reg.overrides.n_head;
-                    let mut n_head_kv = reg.overrides.n_head_kv;
-                    let mut head_dim = reg.overrides.head_dim;
-                    let mut intermediate_size = reg.overrides.intermediate_size;
-                    let mut num_local_experts = reg.overrides.num_local_experts;
-                    let mut num_experts_per_tok = reg.overrides.num_experts_per_tok;
-                    let mut kv_lora_rank = reg.overrides.kv_lora_rank;
-                    let mut qk_rope_head_dim = reg.overrides.qk_rope_head_dim;
-                    let mut size_on_disk_gb = reg.overrides.size_on_disk_gb;
-
-                    let mut check_override = |opt: bool, name: &str| {
-                        if opt { provenance.insert(name.to_string(), "override".to_string()); }
-                    };
-                    check_override(arch.is_some(), "arch");
-                    check_override(kv_cache_dtype.is_some(), "kv_cache_dtype");
-                    check_override(max_context_len.is_some(), "max_context_len");
-                    check_override(sliding_window.is_some(), "sliding_window");
-                    check_override(rope_scaling_factor.is_some(), "rope_scaling_factor");
-                    check_override(original_max_position_embeddings.is_some(), "original_max_position_embeddings");
-                    check_override(num_layers.is_some(), "num_layers");
-                    check_override(n_embd.is_some(), "n_embd");
-                    check_override(n_head.is_some(), "n_head");
-                    check_override(n_head_kv.is_some(), "n_head_kv");
-                    check_override(head_dim.is_some(), "head_dim");
-                    check_override(intermediate_size.is_some(), "intermediate_size");
-                    check_override(num_local_experts.is_some(), "num_local_experts");
-                    check_override(num_experts_per_tok.is_some(), "num_experts_per_tok");
-                    check_override(kv_lora_rank.is_some(), "kv_lora_rank");
-                    check_override(qk_rope_head_dim.is_some(), "qk_rope_head_dim");
-                    check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
-
-                let repo = reg.repo;
-                let filename = reg.filename;
-
-                if size_on_disk_gb.is_none() {
-                    let filenames = get_split_filenames(filename);
-                    if let Some((size, source)) = resolve_model_size(
-                        &filenames,
-                        &downloads_dir,
-                        &hf_cache,
-                        repo,
-                        reqwest_client.as_ref(),
-                        &hf_base_url,
-                        hf_token.as_ref(),
-                        reg.id,
-                    )
-                    .await
-                    {
-                        size_on_disk_gb = Some(size);
-                        provenance.insert("size_on_disk_gb".to_string(), source);
-                    }
-                }
-
-                // 2. Fetch config.json from tokenizer repo to dynamically populate architectural details
-                let needs_remote_config = arch.is_none()
-                    || kv_cache_dtype.is_none()
-                    || max_context_len.is_none()
-                    || sliding_window.is_none()
-                    || rope_scaling_factor.is_none()
-                    || original_max_position_embeddings.is_none()
-                    || num_layers.is_none()
-                    || n_embd.is_none()
-                    || n_head.is_none()
-                    || n_head_kv.is_none()
-                    || head_dim.is_none()
-                    || intermediate_size.is_none()
-                    || num_local_experts.is_none()
-                    || num_experts_per_tok.is_none()
-                    || kv_lora_rank.is_none()
-                    || qk_rope_head_dim.is_none();
-
-                if needs_remote_config {
-                    if let Some(api) = &api_opt {
-                        match api.model(reg.tokenizer_repo.to_string()).get("config.json").await {
-                            Ok(config_path) => {
-                                if let Ok(config_str) = tokio::fs::read_to_string(config_path).await
-                                    && let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                                        let get_val = |key: &str| -> Option<&serde_json::Value> {
-                                            json.get("text_config").and_then(|tc| tc.get(key)).or_else(|| json.get(key))
-                                        };
-
-                                        let is_optional_key = |key: &str| -> bool {
-                                            [
-                                                "head_dim",
-                                                "num_key_value_heads",
-                                                "sliding_window",
-                                                "num_local_experts",
-                                                "intermediate_size",
-                                                "num_experts_per_tok",
-                                                "kv_lora_rank",
-                                                "qk_rope_head_dim",
-                                                "dtype",
-                                                "torch_dtype",
-                                            ]
-                                            .contains(&key)
-                                        };
-
-                                        let get_u64 = |key: &str| -> Option<usize> {
-                                            if let Some(val) = get_val(key)
-                                                && !val.is_null()
-                                            {
-                                                if let Some(v) = val.as_u64() {
-                                                    return Some(v as usize);
-                                                }
-                                                warn!("Invalid format for '{}' in config.json for {}", key, reg.id);
-                                            } else if !is_optional_key(key) {
-                                                warn!("Missing '{}' in config.json for {}", key, reg.id);
-                                            }
-                                            None
-                                        };
-
-                                        let get_str = |key: &str| -> Option<String> {
-                                            if let Some(val) = get_val(key)
-                                                && !val.is_null()
-                                            {
-                                                if let Some(v) = val.as_str() {
-                                                    return Some(v.to_string());
-                                                }
-                                                warn!("Invalid format for '{}' in config.json for {}", key, reg.id);
-                                            } else if !is_optional_key(key) {
-                                                warn!("Missing '{}' in config.json for {}", key, reg.id);
-                                            }
-                                            None
-                                        };
-
-                                        // 1. Resolve arch first to inform subsequent parsing rules
-                                        if arch.is_none()
-                                            && let Some(model_type) = get_str("model_type") {
-                                                arch = match model_type.as_str() {
-                                                    "llama" => Some(ModelArch::Llama),
-                                                    "qwen2" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => Some(ModelArch::Qwen2),
-                                                    "xlm-roberta" => Some(ModelArch::XLMRoberta),
-                                                    "gpt_oss" => Some(ModelArch::GptOss),
-                                                    "mistral" | "mixtral" => Some(ModelArch::Mistral),
-                                                    "gemma" | "gemma2" | "gemma4_text" => Some(ModelArch::Gemma),
-                                                    "deepseek_v2" | "deepseek_v3" | "deepseek_v4" | "deepseek" => Some(ModelArch::Deepseek),
-                                                    "cohere" => Some(ModelArch::Cohere),
-                                                    _ => {
-                                                    warn!("Unrecognized 'model_type' ({}) in config.json for {}", model_type, reg.id);
-                                                        None
-                                                    }
-                                                };
-                                                if arch.is_some() {
-                                                    provenance.insert("arch".to_string(), "config.json".to_string());
-                                                }
-                                            }
-
-                                        if max_context_len.is_none()
-                                            && let Some(v) = get_u64("max_position_embeddings")
-                                                .or_else(|| get_u64("model_max_length"))
-                                                .or_else(|| get_u64("max_sequence_length"))
-                                                .or_else(|| get_u64("max_seq_len"))
-                                                .or_else(|| get_u64("seq_length")) {
-                                                max_context_len = Some(v);
-                                                provenance.insert("max_context_len".to_string(), "config.json".to_string());
-                                            }
-                                        if sliding_window.is_none() && arch == Some(ModelArch::Qwen2) {
-                                            if let Some(v) = get_u64("sliding_window") {
-                                                sliding_window = Some(v);
-                                                provenance.insert("sliding_window".to_string(), "config.json".to_string());
-                                            } else {
-                                        debug!("Missing 'sliding_window' in config.json for {}", reg.id);
-                                            }
-                                        }
-                                        if (rope_scaling_factor.is_none() || original_max_position_embeddings.is_none())
-                                        && let Some(rope_scaling) = get_val("rope_scaling")
-                                                && rope_scaling.is_object() {
-                                                    if rope_scaling_factor.is_none()
-                                                        && let Some(factor) = rope_scaling.get("factor").and_then(|v| v.as_f64()) {
-                                                            rope_scaling_factor = Some(factor as f32);
-                                                            provenance.insert("rope_scaling_factor".to_string(), "config.json".to_string());
-                                                        }
-                                                    if original_max_position_embeddings.is_none()
-                                                        && let Some(orig_ctx) = rope_scaling.get("original_max_position_embeddings").and_then(|v| v.as_u64()) {
-                                                            original_max_position_embeddings = Some(orig_ctx as usize);
-                                                            provenance.insert("original_max_position_embeddings".to_string(), "config.json".to_string());
-                                                        }
-                                                }
-
-                                        let apply_u64 = |opt: &mut Option<usize>, json_key: &str, prov_key: &str, prov: &mut std::collections::HashMap<String, String>| {
-                                            if opt.is_none() && let Some(v) = get_u64(json_key) {
-                                                *opt = Some(v);
-                                                prov.insert(prov_key.to_string(), "config.json".to_string());
-                                            }
-                                        };
-
-                                        apply_u64(&mut num_layers, "num_hidden_layers", "num_layers", &mut provenance);
-                                        apply_u64(&mut n_embd, "hidden_size", "n_embd", &mut provenance);
-                                        apply_u64(&mut n_head, "num_attention_heads", "n_head", &mut provenance);
-                                        if n_head_kv.is_none()
-                                            && let Some(v) = get_u64("num_key_value_heads").or(n_head) {
-                                                n_head_kv = Some(v);
-                                                provenance.insert("n_head_kv".to_string(), "config.json".to_string());
-                                            }
-                                        apply_u64(&mut head_dim, "head_dim", "head_dim", &mut provenance);
-                                        apply_u64(&mut intermediate_size, "intermediate_size", "intermediate_size", &mut provenance);
-                                        apply_u64(&mut num_local_experts, "num_local_experts", "num_local_experts", &mut provenance);
-                                        apply_u64(&mut num_experts_per_tok, "num_experts_per_tok", "num_experts_per_tok", &mut provenance);
-                                        apply_u64(&mut kv_lora_rank, "kv_lora_rank", "kv_lora_rank", &mut provenance);
-                                        apply_u64(&mut qk_rope_head_dim, "qk_rope_head_dim", "qk_rope_head_dim", &mut provenance);
-                                        if kv_cache_dtype.is_none() {
-                                            if let Some(dt) = get_str("dtype").or_else(|| get_str("torch_dtype")) {
-                                                kv_cache_dtype = match dt.as_str() {
-                                                    "float16" => Some(ModelDType::F16),
-                                                    "bfloat16" => Some(ModelDType::BF16),
-                                                    "float32" => Some(ModelDType::F32),
-                                                    _ => {
-                                                    warn!("Unrecognized dtype ({}) in config.json for {}", dt, reg.id);
-                                                        None
-                                                    }
-                                                };
-                                                if kv_cache_dtype.is_some() {
-                                                    provenance.insert("kv_cache_dtype".to_string(), "config.json".to_string());
-                                                }
-                                            } else {
-                                            warn!("Missing both 'dtype' and 'torch_dtype' in config.json for {}", reg.id);
-                                            }
-                                        }
-                                    }
-                            }
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("401") || msg.contains("Unauthorized") {
-                                warn!("Failed to fetch config.json for {}: HTTP 401 Unauthorized. If this is a gated model, make sure you have accepted the license on Hugging Face and set the HF_TOKEN environment variable.", reg.id);
-                            } else {
-                                warn!("Failed to fetch config.json for {}: {}", reg.id, e);
-                            }
-                        }
-                        }
-                    } else {
-                        warn!("HF API not initialized, skipping remote config.json fetch for {}", reg.id);
-                    }
-                }
-
-                let n_head_val = n_head.unwrap_or(1);
-                let n_embd_val = n_embd.unwrap_or(4096);
-
-                for name in &[
-                    "arch",
-                    "kv_cache_dtype",
-                    "max_context_len",
-                    "sliding_window",
-                    "rope_scaling_factor",
-                    "original_max_position_embeddings",
-                    "num_layers",
-                    "n_embd",
-                    "n_head",
-                    "n_head_kv",
-                    "head_dim",
-                    "intermediate_size",
-                    "num_local_experts",
-                    "num_experts_per_tok",
-                    "kv_lora_rank",
-                    "qk_rope_head_dim",
-                    "size_on_disk_gb",
-                ] {
-                    if !provenance.contains_key(*name) {
-                        provenance.insert(name.to_string(), "fallback".to_string());
-                    }
-                }
-
-                let arch_val = arch.unwrap_or(ModelArch::Llama);
-                let max_context_len_val = max_context_len.unwrap_or(8192);
-
-                let mut max_yarn_context = max_context_len_val;
-                if arch_val == ModelArch::Qwen2 {
-                    if let Some(sw) = sliding_window {
-                        max_yarn_context = max_yarn_context.max(sw);
-                    }
-                } else if let (Some(factor), Some(orig_ctx)) = (rope_scaling_factor, original_max_position_embeddings) {
-                    let scaled_ctx = (orig_ctx as f32 * factor) as usize;
-                    max_yarn_context = max_yarn_context.max(scaled_ctx);
-                }
-
-                let fallback_size_gb = match reg.compression_dtype {
-                    Some(ModelDType::F32) => reg.parameters_billions * 4.0,
-                    Some(ModelDType::F16) | Some(ModelDType::BF16) => reg.parameters_billions * 2.0,
-                    None => reg.parameters_billions * 0.65, // Assume typical Q4_K_M GGUF
-                };
-
-                ModelConfig {
-                        id: reg.id.to_string(),
-                        name: reg.name.to_string(),
-                        repo: reg.repo.to_string(),
-                        tokenizer_repo: reg.tokenizer_repo.to_string(),
-                        filename: reg.filename.to_string(),
-                        roles: reg.roles,
-                        arch: arch_val,
-                        compression_dtype: reg.compression_dtype,
-                        kv_cache_dtype: kv_cache_dtype.unwrap_or(ModelDType::F16),
-                        supported_backends: reg.supported_backends,
-                        is_default_chat: reg.is_default_chat,
-                        is_default_compressor: reg.is_default_compressor,
-
-                        max_context_len: max_context_len_val,
-                        max_yarn_context,
-                        sliding_window,
-                        rope_scaling_factor,
-                        original_max_position_embeddings,
-                        num_layers: num_layers.unwrap_or(32),
-                        n_embd: n_embd_val,
-                        n_head: n_head_val,
-                        n_head_kv: n_head_kv.unwrap_or(n_head_val),
-                        head_dim: head_dim.unwrap_or(n_embd_val / n_head_val.max(1)),
-                        intermediate_size: intermediate_size.unwrap_or(n_embd_val * 4),
-                        num_local_experts,
-                        num_experts_per_tok,
-                        kv_lora_rank,
-                        qk_rope_head_dim,
-                        parameters_billions: reg.parameters_billions,
-                        non_layer_params_billions: reg.non_layer_params_billions,
-                        size_on_disk_gb: size_on_disk_gb.unwrap_or(fallback_size_gb),
-                        provenance,
-                        is_downloaded: false, // This will be populated at runtime by the orchestrator
-                        is_in_hf_cache: false, // This will be populated at runtime by the API
-                        is_corrupted: false, // This will be populated at runtime by the API
-                    }
-                }));
-            }
-
-        let mut configs = Vec::new();
-        for h in handles {
-            match h.await {
-                Ok(config) => configs.push(config),
-                Err(e) => warn!("Task failed to join during model resolution: {}", e),
-            }
+            tokio::spawn(background_resolve_model(
+                reg,
+                downloads_dir.clone(),
+                hf_cache.clone(),
+                hf_base_url.clone(),
+                hf_token.clone(),
+                shared_reqwest_client.clone(),
+                api_opt.clone(),
+                lock.clone(),
+                init_semaphore.clone(),
+                5,
+            ));
         }
 
-        lock.write().await.extend(configs);
         lock
     }).await;
 
     registry_lock.read().await.clone()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn background_resolve_model(
+    reg: ModelRegistration,
+    downloads_dir: std::path::PathBuf,
+    hf_cache: hf_hub::Cache,
+    hf_base_url: String,
+    hf_token: Option<String>,
+    reqwest_client: Option<reqwest::Client>,
+    api_opt: Option<hf_hub::api::tokio::Api>,
+    lock_clone: Arc<RwLock<Vec<ModelConfig>>>,
+    sem_clone: Arc<tokio::sync::Semaphore>,
+    mut backoff: u64,
+) {
+    loop {
+        let permit = sem_clone.acquire().await;
+
+        let mut provenance = std::collections::HashMap::new();
+
+        let mut arch = reg.overrides.arch;
+        let mut kv_cache_dtype = reg.overrides.kv_cache_dtype;
+        let mut max_context_len = reg.overrides.max_context_len;
+        let mut sliding_window = reg.overrides.sliding_window;
+        let mut rope_scaling_factor = reg.overrides.rope_scaling_factor;
+        let mut original_max_position_embeddings = reg.overrides.original_max_position_embeddings;
+        let mut num_layers = reg.overrides.num_layers;
+        let mut n_embd = reg.overrides.n_embd;
+        let mut n_head = reg.overrides.n_head;
+        let mut n_head_kv = reg.overrides.n_head_kv;
+        let mut head_dim = reg.overrides.head_dim;
+        let mut intermediate_size = reg.overrides.intermediate_size;
+        let mut num_local_experts = reg.overrides.num_local_experts;
+        let mut num_experts_per_tok = reg.overrides.num_experts_per_tok;
+        let mut kv_lora_rank = reg.overrides.kv_lora_rank;
+        let mut qk_rope_head_dim = reg.overrides.qk_rope_head_dim;
+        let mut size_on_disk_gb = reg.overrides.size_on_disk_gb;
+
+        let mut check_override = |opt: bool, name: &str| {
+            if opt {
+                provenance.insert(name.to_string(), "override".to_string());
+            }
+        };
+        check_override(arch.is_some(), "arch");
+        check_override(kv_cache_dtype.is_some(), "kv_cache_dtype");
+        check_override(max_context_len.is_some(), "max_context_len");
+        check_override(sliding_window.is_some(), "sliding_window");
+        check_override(rope_scaling_factor.is_some(), "rope_scaling_factor");
+        check_override(
+            original_max_position_embeddings.is_some(),
+            "original_max_position_embeddings",
+        );
+        check_override(num_layers.is_some(), "num_layers");
+        check_override(n_embd.is_some(), "n_embd");
+        check_override(n_head.is_some(), "n_head");
+        check_override(n_head_kv.is_some(), "n_head_kv");
+        check_override(head_dim.is_some(), "head_dim");
+        check_override(intermediate_size.is_some(), "intermediate_size");
+        check_override(num_local_experts.is_some(), "num_local_experts");
+        check_override(num_experts_per_tok.is_some(), "num_experts_per_tok");
+        check_override(kv_lora_rank.is_some(), "kv_lora_rank");
+        check_override(qk_rope_head_dim.is_some(), "qk_rope_head_dim");
+        check_override(size_on_disk_gb.is_some(), "size_on_disk_gb");
+
+        let repo = reg.repo;
+        let filename = reg.filename;
+
+        if size_on_disk_gb.is_none() {
+            let filenames = get_split_filenames(filename);
+            if let Some((size, source)) = resolve_model_size(
+                &filenames,
+                &downloads_dir,
+                &hf_cache,
+                repo,
+                reqwest_client.as_ref(),
+                &hf_base_url,
+                hf_token.as_ref(),
+                reg.id,
+            )
+            .await
+            {
+                size_on_disk_gb = Some(size);
+                provenance.insert("size_on_disk_gb".to_string(), source);
+            }
+        }
+
+        // 2. Fetch config.json from tokenizer repo to dynamically populate architectural details
+        let needs_remote_config = arch.is_none()
+            || kv_cache_dtype.is_none()
+            || max_context_len.is_none()
+            || sliding_window.is_none()
+            || rope_scaling_factor.is_none()
+            || original_max_position_embeddings.is_none()
+            || num_layers.is_none()
+            || n_embd.is_none()
+            || n_head.is_none()
+            || n_head_kv.is_none()
+            || head_dim.is_none()
+            || intermediate_size.is_none()
+            || num_local_experts.is_none()
+            || num_experts_per_tok.is_none()
+            || kv_lora_rank.is_none()
+            || qk_rope_head_dim.is_none();
+
+        let mut config_parsed = false;
+
+        if needs_remote_config {
+            if let Some(api) = &api_opt {
+                match api
+                    .model(reg.tokenizer_repo.to_string())
+                    .get("config.json")
+                    .await
+                {
+                    Ok(config_path) => {
+                        if let Ok(config_str) = tokio::fs::read_to_string(config_path).await
+                            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_str)
+                        {
+                            config_parsed = true;
+
+                            let get_val = |key: &str| -> Option<&serde_json::Value> {
+                                json.get("text_config")
+                                    .and_then(|tc| tc.get(key))
+                                    .or_else(|| json.get(key))
+                            };
+
+                            let is_optional_key = |key: &str| -> bool {
+                                [
+                                    "head_dim",
+                                    "num_key_value_heads",
+                                    "sliding_window",
+                                    "num_local_experts",
+                                    "intermediate_size",
+                                    "num_experts_per_tok",
+                                    "kv_lora_rank",
+                                    "qk_rope_head_dim",
+                                    "dtype",
+                                    "torch_dtype",
+                                ]
+                                .contains(&key)
+                            };
+
+                            let get_u64 = |key: &str| -> Option<usize> {
+                                if let Some(val) = get_val(key)
+                                    && !val.is_null()
+                                {
+                                    if let Some(v) = val.as_u64() {
+                                        return Some(v as usize);
+                                    }
+                                    warn!(
+                                        "Invalid format for '{}' in config.json for {}",
+                                        key, reg.id
+                                    );
+                                } else if !is_optional_key(key) {
+                                    warn!("Missing '{}' in config.json for {}", key, reg.id);
+                                }
+                                None
+                            };
+
+                            let get_str = |key: &str| -> Option<String> {
+                                if let Some(val) = get_val(key)
+                                    && !val.is_null()
+                                {
+                                    if let Some(v) = val.as_str() {
+                                        return Some(v.to_string());
+                                    }
+                                    warn!(
+                                        "Invalid format for '{}' in config.json for {}",
+                                        key, reg.id
+                                    );
+                                } else if !is_optional_key(key) {
+                                    warn!("Missing '{}' in config.json for {}", key, reg.id);
+                                }
+                                None
+                            };
+
+                            // 1. Resolve arch first to inform subsequent parsing rules
+                            if arch.is_none()
+                                && let Some(model_type) = get_str("model_type")
+                            {
+                                arch = match model_type.as_str() {
+                                    "llama" => Some(ModelArch::Llama),
+                                    "qwen2" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe"
+                                    | "qwen3_5_moe_text" => Some(ModelArch::Qwen2),
+                                    "xlm-roberta" => Some(ModelArch::XLMRoberta),
+                                    "gpt_oss" => Some(ModelArch::GptOss),
+                                    "mistral" | "mixtral" => Some(ModelArch::Mistral),
+                                    "gemma" | "gemma2" | "gemma4_text" => Some(ModelArch::Gemma),
+                                    "deepseek_v2" | "deepseek_v3" | "deepseek_v4" | "deepseek" => {
+                                        Some(ModelArch::Deepseek)
+                                    }
+                                    "cohere" => Some(ModelArch::Cohere),
+                                    _ => {
+                                        warn!(
+                                            "Unrecognized 'model_type' ({}) in config.json for {}",
+                                            model_type, reg.id
+                                        );
+                                        None
+                                    }
+                                };
+                                if arch.is_some() {
+                                    provenance
+                                        .insert("arch".to_string(), "config.json".to_string());
+                                }
+                            }
+
+                            if max_context_len.is_none()
+                                && let Some(v) = get_u64("max_position_embeddings")
+                                    .or_else(|| get_u64("model_max_length"))
+                                    .or_else(|| get_u64("max_sequence_length"))
+                                    .or_else(|| get_u64("max_seq_len"))
+                                    .or_else(|| get_u64("seq_length"))
+                            {
+                                max_context_len = Some(v);
+                                provenance.insert(
+                                    "max_context_len".to_string(),
+                                    "config.json".to_string(),
+                                );
+                            }
+                            if sliding_window.is_none() && arch == Some(ModelArch::Qwen2) {
+                                if let Some(v) = get_u64("sliding_window") {
+                                    sliding_window = Some(v);
+                                    provenance.insert(
+                                        "sliding_window".to_string(),
+                                        "config.json".to_string(),
+                                    );
+                                } else {
+                                    debug!(
+                                        "Missing 'sliding_window' in config.json for {}",
+                                        reg.id
+                                    );
+                                }
+                            }
+                            if (rope_scaling_factor.is_none()
+                                || original_max_position_embeddings.is_none())
+                                && let Some(rope_scaling) = get_val("rope_scaling")
+                                && rope_scaling.is_object()
+                            {
+                                if rope_scaling_factor.is_none()
+                                    && let Some(factor) =
+                                        rope_scaling.get("factor").and_then(|v| v.as_f64())
+                                {
+                                    rope_scaling_factor = Some(factor as f32);
+                                    provenance.insert(
+                                        "rope_scaling_factor".to_string(),
+                                        "config.json".to_string(),
+                                    );
+                                }
+                                if original_max_position_embeddings.is_none()
+                                    && let Some(orig_ctx) = rope_scaling
+                                        .get("original_max_position_embeddings")
+                                        .and_then(|v| v.as_u64())
+                                {
+                                    original_max_position_embeddings = Some(orig_ctx as usize);
+                                    provenance.insert(
+                                        "original_max_position_embeddings".to_string(),
+                                        "config.json".to_string(),
+                                    );
+                                }
+                            }
+
+                            let apply_u64 = |opt: &mut Option<usize>,
+                                             json_key: &str,
+                                             prov_key: &str,
+                                             prov: &mut std::collections::HashMap<
+                                String,
+                                String,
+                            >| {
+                                if opt.is_none()
+                                    && let Some(v) = get_u64(json_key)
+                                {
+                                    *opt = Some(v);
+                                    prov.insert(prov_key.to_string(), "config.json".to_string());
+                                }
+                            };
+
+                            apply_u64(
+                                &mut num_layers,
+                                "num_hidden_layers",
+                                "num_layers",
+                                &mut provenance,
+                            );
+                            apply_u64(&mut n_embd, "hidden_size", "n_embd", &mut provenance);
+                            apply_u64(
+                                &mut n_head,
+                                "num_attention_heads",
+                                "n_head",
+                                &mut provenance,
+                            );
+                            if n_head_kv.is_none()
+                                && let Some(v) = get_u64("num_key_value_heads").or(n_head)
+                            {
+                                n_head_kv = Some(v);
+                                provenance
+                                    .insert("n_head_kv".to_string(), "config.json".to_string());
+                            }
+                            apply_u64(&mut head_dim, "head_dim", "head_dim", &mut provenance);
+                            apply_u64(
+                                &mut intermediate_size,
+                                "intermediate_size",
+                                "intermediate_size",
+                                &mut provenance,
+                            );
+                            apply_u64(
+                                &mut num_local_experts,
+                                "num_local_experts",
+                                "num_local_experts",
+                                &mut provenance,
+                            );
+                            apply_u64(
+                                &mut num_experts_per_tok,
+                                "num_experts_per_tok",
+                                "num_experts_per_tok",
+                                &mut provenance,
+                            );
+                            apply_u64(
+                                &mut kv_lora_rank,
+                                "kv_lora_rank",
+                                "kv_lora_rank",
+                                &mut provenance,
+                            );
+                            apply_u64(
+                                &mut qk_rope_head_dim,
+                                "qk_rope_head_dim",
+                                "qk_rope_head_dim",
+                                &mut provenance,
+                            );
+                            if kv_cache_dtype.is_none() {
+                                if let Some(dt) =
+                                    get_str("dtype").or_else(|| get_str("torch_dtype"))
+                                {
+                                    kv_cache_dtype = match dt.as_str() {
+                                        "float16" => Some(ModelDType::F16),
+                                        "bfloat16" => Some(ModelDType::BF16),
+                                        "float32" => Some(ModelDType::F32),
+                                        _ => {
+                                            warn!(
+                                                "Unrecognized dtype ({}) in config.json for {}",
+                                                dt, reg.id
+                                            );
+                                            None
+                                        }
+                                    };
+                                    if kv_cache_dtype.is_some() {
+                                        provenance.insert(
+                                            "kv_cache_dtype".to_string(),
+                                            "config.json".to_string(),
+                                        );
+                                    }
+                                } else {
+                                    warn!(
+                                        "Missing both 'dtype' and 'torch_dtype' in config.json for {}",
+                                        reg.id
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("401") || msg.contains("Unauthorized") {
+                            warn!(
+                                "Failed to fetch config.json for {}: HTTP 401 Unauthorized. If this is a gated model, make sure you have accepted the license on Hugging Face and set the HF_TOKEN environment variable.",
+                                reg.id
+                            );
+                        } else {
+                            warn!("Failed to fetch config.json for {}: {}", reg.id, e);
+                        }
+                    }
+                }
+            } else {
+                warn!(
+                    "HF API not initialized, skipping remote config.json fetch for {}",
+                    reg.id
+                );
+            }
+        }
+
+        let n_head_val = n_head.unwrap_or(1);
+        let n_embd_val = n_embd.unwrap_or(4096);
+
+        for name in &[
+            "arch",
+            "kv_cache_dtype",
+            "max_context_len",
+            "sliding_window",
+            "rope_scaling_factor",
+            "original_max_position_embeddings",
+            "num_layers",
+            "n_embd",
+            "n_head",
+            "n_head_kv",
+            "head_dim",
+            "intermediate_size",
+            "num_local_experts",
+            "num_experts_per_tok",
+            "kv_lora_rank",
+            "qk_rope_head_dim",
+            "size_on_disk_gb",
+        ] {
+            if !provenance.contains_key(*name) {
+                if config_parsed && *name != "size_on_disk_gb" {
+                    provenance.insert(name.to_string(), "default".to_string());
+                } else {
+                    provenance.insert(name.to_string(), "fallback".to_string());
+                }
+            }
+        }
+
+        let arch_val = arch.unwrap_or(ModelArch::Llama);
+        let max_context_len_val = max_context_len.unwrap_or(8192);
+
+        let mut max_yarn_context = max_context_len_val;
+        if arch_val == ModelArch::Qwen2 {
+            if let Some(sw) = sliding_window {
+                max_yarn_context = max_yarn_context.max(sw);
+            }
+        } else if let (Some(factor), Some(orig_ctx)) =
+            (rope_scaling_factor, original_max_position_embeddings)
+        {
+            let scaled_ctx = (orig_ctx as f32 * factor) as usize;
+            max_yarn_context = max_yarn_context.max(scaled_ctx);
+        }
+
+        let fallback_size_gb = match reg.compression_dtype {
+            Some(ModelDType::F32) => reg.parameters_billions * 4.0,
+            Some(ModelDType::F16) | Some(ModelDType::BF16) => reg.parameters_billions * 2.0,
+            None => reg.parameters_billions * 0.65, // Assume typical Q4_K_M GGUF
+        };
+
+        let config = ModelConfig {
+            id: reg.id.to_string(),
+            name: reg.name.to_string(),
+            repo: reg.repo.to_string(),
+            tokenizer_repo: reg.tokenizer_repo.to_string(),
+            filename: reg.filename.to_string(),
+            roles: reg.roles.clone(),
+            arch: arch_val,
+            compression_dtype: reg.compression_dtype,
+            kv_cache_dtype: kv_cache_dtype.unwrap_or(ModelDType::F16),
+            supported_backends: reg.supported_backends.clone(),
+            is_default_chat: reg.is_default_chat,
+            is_default_compressor: reg.is_default_compressor,
+
+            max_context_len: max_context_len_val,
+            max_yarn_context,
+            sliding_window,
+            rope_scaling_factor,
+            original_max_position_embeddings,
+            num_layers: num_layers.unwrap_or(32),
+            n_embd: n_embd_val,
+            n_head: n_head_val,
+            n_head_kv: n_head_kv.unwrap_or(n_head_val),
+            head_dim: head_dim.unwrap_or(n_embd_val / n_head_val.max(1)),
+            intermediate_size: intermediate_size.unwrap_or(n_embd_val * 4),
+            num_local_experts,
+            num_experts_per_tok,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            parameters_billions: reg.parameters_billions,
+            non_layer_params_billions: reg.non_layer_params_billions,
+            size_on_disk_gb: size_on_disk_gb.unwrap_or(fallback_size_gb),
+            provenance,
+            is_downloaded: false, // This will be populated at runtime by the orchestrator
+            is_in_hf_cache: false, // This will be populated at runtime by the API
+            is_corrupted: false,  // This will be populated at runtime by the API
+        };
+
+        let mut success = true;
+        for val in config.provenance.values() {
+            if val == "fallback" {
+                success = false;
+                break;
+            }
+        }
+
+        // Safely update the registry without wiping out runtime state flags
+        {
+            let mut reg_lock = lock_clone.write().await;
+            if let Some(pos) = reg_lock.iter().position(|m| m.id == config.id) {
+                let mut updated = config.clone();
+                updated.is_downloaded = reg_lock[pos].is_downloaded;
+                updated.is_in_hf_cache = reg_lock[pos].is_in_hf_cache;
+                updated.is_corrupted = reg_lock[pos].is_corrupted;
+                reg_lock[pos] = updated;
+            }
+        }
+
+        drop(permit); // Release the concurrency semaphore BEFORE sleeping
+
+        if success {
+            debug!("Successfully resolved model details for {}", config.id);
+            break;
+        }
+
+        if api_opt.is_none() && reqwest_client.is_none() {
+            warn!(
+                "Offline mode active: cannot fully resolve {}; keeping fallbacks.",
+                config.id
+            );
+            break;
+        }
+
+        let missing_keys: Vec<_> = config
+            .provenance
+            .iter()
+            .filter(|(_, v)| *v == "fallback")
+            .map(|(k, _)| k.clone())
+            .collect();
+        warn!(
+            "Failed to fully resolve {} from Hugging Face. Retrying in {} seconds...\nMissing properties: {:?}",
+            config.id, backoff, missing_keys
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(300);
+    }
 }
 
 #[cfg(test)]
@@ -1312,5 +1581,240 @@ mod tests {
                 "model-00003-of-00003.gguf"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_registry_fallback_and_background_update() {
+        let config = crate::config::AppConfig::default();
+
+        // 1. Eagerly grab the registry.
+        let initial_registry = get_model_registry(&config).await;
+        assert!(
+            !initial_registry.is_empty(),
+            "Registry should instantly return the models."
+        );
+
+        let target_id = "qwen-2.5-1.5b";
+        let initial_model = initial_registry
+            .iter()
+            .find(|m| m.id == target_id)
+            .expect("Model missing");
+
+        // Since tests run in parallel, another test might have already triggered and awaited the background resolution.
+        // We only assert the full transition if we caught it in the fallback state.
+        if initial_model.provenance.get("arch").map(|s| s.as_str()) == Some("fallback") {
+            // Because no overrides were provided for Qwen, it defaults to Llama before network resolution!
+            assert_eq!(initial_model.arch, ModelArch::Llama);
+
+            let mut updated = false;
+
+            // Poll for up to 15 seconds for the background task to complete the network requests
+            for _ in 0..30 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let current_registry = get_model_registry(&config).await;
+                let current_model = current_registry.iter().find(|m| m.id == target_id).unwrap();
+
+                if current_model.provenance.get("arch").map(|s| s.as_str()) == Some("config.json") {
+                    updated = true;
+                    // Validate that the architecture was dynamically corrected by config.json!
+                    assert_eq!(current_model.arch, ModelArch::Qwen2);
+                    assert_ne!(
+                        current_model.provenance.get("size_on_disk_gb").unwrap(),
+                        "fallback"
+                    );
+                    break;
+                }
+            }
+
+            assert!(
+                updated,
+                "Registry did not self-update from fallback within 15 seconds. (Network issue?)"
+            );
+        } else if initial_model.provenance.get("arch").map(|s| s.as_str()) == Some("config.json") {
+            // If it was already updated by another test, at least verify it was eventually correct
+            assert_eq!(initial_model.arch, ModelArch::Qwen2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_background_resolve_model_with_retry() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let start_time = std::time::Instant::now();
+
+        // Mock server that returns 500s for the first 2 seconds to trigger the backoff loop
+        let app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::get(move |req: axum::extract::Request| async move {
+                println!("[MOCK SERVER] Intercepted GET request to: {}", req.uri());
+                if start_time.elapsed().as_secs() < 2 {
+                    println!("[MOCK SERVER] Simulating 500 Internal Server Error");
+                    return axum::response::Response::builder()
+                        .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                }
+
+                // If hf-hub is asking for the API metadata (like commit info), mock a valid ModelInfo response
+                if req.uri().path().contains("/api/models/") {
+                    println!("[MOCK SERVER] Serving mock Hugging Face API ModelInfo");
+                    let model_info = serde_json::json!({
+                        "id": "test/repo",
+                        "sha": "dummy_sha",
+                        "siblings": [{"rfilename": "config.json"}]
+                    });
+                    return axum::response::Response::builder()
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(model_info.to_string()))
+                        .unwrap();
+                }
+
+                let dummy_config = serde_json::json!({
+                    "model_type": "qwen2",
+                    "hidden_size": 2048,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 16,
+                    "num_hidden_layers": 12,
+                    "head_dim": 128,
+                    "intermediate_size": 8192,
+                    "max_position_embeddings": 32768,
+                    "dtype": "bfloat16"
+                });
+                let body_str = dummy_config.to_string();
+                let len = body_str.len();
+
+                let res = axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header("ETag", "\"dummy_etag\"")
+                    .header("X-Repo-Commit", "dummy_sha")
+                    .header("Accept-Ranges", "bytes");
+
+                if let Some(range) = req.headers().get(axum::http::header::RANGE) {
+                    if let Ok(range_str) = range.to_str() {
+                        if range_str.starts_with("bytes=") {
+                            let parts: Vec<&str> = range_str["bytes=".len()..].split('-').collect();
+                            let start = parts.first().unwrap_or(&"0").parse::<usize>().unwrap_or(0);
+
+                            if start >= len {
+                                return axum::response::Response::builder()
+                                    .status(axum::http::StatusCode::RANGE_NOT_SATISFIABLE)
+                                    .header("Content-Range", format!("bytes */{}", len))
+                                    .body(axum::body::Body::empty())
+                                    .unwrap();
+                            }
+
+                            let chunk_len = len - start;
+                            println!(
+                                "[MOCK SERVER] Serving dummy config.json (Partial: {} bytes)",
+                                chunk_len
+                            );
+                            return res
+                                .status(axum::http::StatusCode::PARTIAL_CONTENT)
+                                .header(
+                                    "Content-Range",
+                                    format!("bytes {}-{}/{}", start, len - 1, len),
+                                )
+                                .header(axum::http::header::CONTENT_LENGTH, chunk_len.to_string())
+                                .body(axum::body::Body::from(body_str[start..].to_string()))
+                                .unwrap();
+                        }
+                    }
+                }
+
+                println!(
+                    "[MOCK SERVER] Serving dummy config.json (Full: {} bytes)",
+                    len
+                );
+                res.header(axum::http::header::CONTENT_LENGTH, len.to_string())
+                    .body(axum::body::Body::from(body_str))
+                    .unwrap()
+            })
+            .head(move |req: axum::extract::Request| async move {
+                println!("[MOCK SERVER] Intercepted HEAD request to: {}", req.uri());
+                if start_time.elapsed().as_secs() < 2 {
+                    println!("[MOCK SERVER] Simulating 500 Internal Server Error");
+                    return axum::response::Response::builder()
+                        .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                }
+                println!("[MOCK SERVER] Serving X-Linked-Size header");
+                axum::response::Response::builder()
+                    .header("X-Linked-Size", "8589934592") // Simulate an 8GB response
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hf_base_url = format!("http://127.0.0.1:{}", port);
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Setup isolated mock registry and lock
+        let lock = Arc::new(RwLock::new(vec![mock_config(
+            ModelArch::Llama,
+            ModelDType::F16,
+        )]));
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let reg = ModelRegistration {
+            id: "test",
+            name: "test",
+            repo: "test/repo",
+            tokenizer_repo: "test/repo",
+            filename: "model.gguf",
+            roles: vec![],
+            compression_dtype: None,
+            supported_backends: vec![],
+            is_default_chat: false,
+            is_default_compressor: false,
+            parameters_billions: 7.0,
+            non_layer_params_billions: 0.5,
+            overrides: ModelOverrides::default(),
+        };
+
+        let reqwest_client = reqwest::Client::builder().build().unwrap();
+
+        // Use an isolated cache directory so we don't accidentally read from the global ~/.cache/huggingface
+        let temp_cache_dir = std::env::temp_dir().join(format!("test_hf_cache_{}", port));
+        let _ = tokio::fs::create_dir_all(&temp_cache_dir).await;
+        let hf_cache = hf_hub::Cache::new(temp_cache_dir.clone());
+
+        let api_opt = hf_hub::api::tokio::ApiBuilder::new()
+            .with_endpoint(hf_base_url.clone())
+            .with_cache_dir(temp_cache_dir.clone())
+            .build()
+            .unwrap();
+
+        // Run the worker directly with a 1-second initial backoff
+        // This allows the 2 seconds of 500s to trigger retries until the mock server eventually passes
+        super::background_resolve_model(
+            reg,
+            std::env::temp_dir(),
+            hf_cache,
+            hf_base_url,
+            None,
+            Some(reqwest_client),
+            Some(api_opt),
+            lock.clone(),
+            sem,
+            1,
+        )
+        .await;
+
+        // Verify the worker eventually succeeded and updated the isolated lock
+        let updated_configs = lock.read().await;
+        let config = &updated_configs[0];
+
+        assert_eq!(config.arch, ModelArch::Qwen2);
+        assert_eq!(config.n_embd, 2048);
+        assert_eq!(config.size_on_disk_gb, 8.0);
+        assert_ne!(config.provenance.get("arch").unwrap(), "fallback");
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(temp_cache_dir).await;
     }
 }

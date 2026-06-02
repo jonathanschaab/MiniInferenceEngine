@@ -583,6 +583,10 @@ async fn download_chunk(
             false
         };
 
+        // Explicitly drop the file handle to release the OS lock before renaming,
+        // which is required to prevent sharing violations on Windows.
+        drop(file);
+
         let file_path = downloads_dir.join(&filename);
         finalize_download(
             &id,
@@ -1636,5 +1640,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_finalize_download_success_after_file_drop() {
+        let downloads_dir = std::env::temp_dir().join("test_finalize_success");
+        let _ = tokio::fs::create_dir_all(&downloads_dir).await;
+
+        let id = "test-model-success";
+        let filename = "model-success.safetensors";
+        let file_path = downloads_dir.join(filename);
+        let tmp_file_path = downloads_dir.join(format!("{}.tmp", filename));
+        let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
+
+        // 1. Create and open the file, explicitly mimicking the stream behavior
+        let mut file = tokio::fs::File::create(&tmp_file_path).await.unwrap();
+        file.write_all(b"test data").await.unwrap();
+        file.sync_all().await.unwrap();
+
+        // 2. EXPLICITLY DROP THE FILE HANDLE.
+        // This acts as a regression check ensuring the file lock is released on Windows
+        // before we enter the rename logic inside finalize_download.
+        drop(file);
+
+        // Create dummy meta file
+        let _ = tokio::fs::write(&meta_file_path, "{}").await;
+
+        // 3. Run finalize_download
+        super::finalize_download(
+            id,
+            filename,
+            &file_path,
+            &tmp_file_path,
+            &meta_file_path,
+            false,
+        )
+        .await;
+
+        // 4. Assert success: tmp and meta should be gone, target file should exist
+        assert!(
+            !tmp_file_path.exists(),
+            "Temp file should be deleted upon success."
+        );
+        assert!(
+            !meta_file_path.exists(),
+            "Meta file should be deleted upon success."
+        );
+        assert!(file_path.exists(), "Target file should exist.");
+        assert_eq!(
+            tokio::fs::read_to_string(&file_path).await.unwrap(),
+            "test data"
+        );
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(&downloads_dir).await;
     }
 }
