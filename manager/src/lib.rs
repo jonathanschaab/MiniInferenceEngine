@@ -266,8 +266,11 @@ pub async fn run_batcher_loop(
     status: Arc<Mutex<EngineStatus>>,
     telemetry: Arc<Mutex<TelemetryStore>>,
     gpu_device_index: u32,
-    downloads_directory: String,
+    app_config: Arc<AppConfig>,
 ) {
+    let downloads_directory = crate::types::resolve_absolute_path(&app_config.downloads_directory)
+        .to_string_lossy()
+        .to_string();
     let nvml = Nvml::init().ok();
 
     let mut active_model_id = String::new();
@@ -283,7 +286,7 @@ pub async fn run_batcher_loop(
 
     info!("ORCHESTRATOR ONLINE: Waiting for requests...");
 
-    let registry = get_model_registry(&crate::config::AppConfig::default()).await;
+    let registry = get_model_registry(&app_config).await;
 
     'main: while let Some(request) = receiver.recv().await {
         info!("Processing new chat request...");
@@ -1044,5 +1047,56 @@ mod tests {
         assert!(nvml.is_some(), "NVML must init on test runner with GPU");
         let info = get_vram_info(nvml.as_ref(), 0);
         assert!(info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_run_batcher_loop_respects_config() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let status = Arc::new(Mutex::new(EngineStatus::default()));
+        let telemetry = Arc::new(Mutex::new(TelemetryStore::default()));
+
+        let mut custom_config = AppConfig::default();
+        custom_config.downloads_directory = "test_custom_downloads".to_string();
+        let app_config = Arc::new(custom_config);
+
+        let batcher_handle = tokio::spawn(run_batcher_loop(
+            rx,
+            status.clone(),
+            telemetry.clone(),
+            0,
+            app_config.clone(),
+        ));
+
+        let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let req = UserRequest {
+            chat_model_id: "missing-model".to_string(),
+            compressor_model_id: "missing-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+            responder: resp_tx,
+            force_compression: false,
+            parameters: GenerationParameters::default(),
+            target_backend: None,
+        };
+
+        let _ = tx.send(req).await;
+        drop(tx);
+
+        if let Some(StreamEvent::Error(msg)) = resp_rx.recv().await {
+            assert!(
+                msg.contains("missing from registry"),
+                "Unexpected error message: {}",
+                msg
+            );
+        } else {
+            panic!("Expected error event for missing model");
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), batcher_handle)
+            .await
+            .expect("Batcher loop hung")
+            .expect("Batcher loop panicked");
     }
 }

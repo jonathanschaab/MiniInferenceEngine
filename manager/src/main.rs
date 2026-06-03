@@ -1653,16 +1653,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Boot up the GPU Orchestrator in the background
     let batcher_gpu_idx = config.gpu_device_index;
-    let downloads_dir = manager::types::resolve_absolute_path(&config.downloads_directory)
-        .to_string_lossy()
-        .to_string();
+    let app_config_for_batcher = Arc::new(config.clone());
     tokio::spawn(async move {
         run_batcher_loop(
             rx,
             status_for_batcher,
             telemetry_for_batcher,
             batcher_gpu_idx,
-            downloads_dir,
+            app_config_for_batcher,
         )
         .await;
     });
