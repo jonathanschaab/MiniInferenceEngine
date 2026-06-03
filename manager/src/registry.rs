@@ -1620,6 +1620,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Hits real HF API, prone to 429 Rate Limits in CI"]
     async fn test_registry_fallback_and_background_update() {
         let config = crate::config::AppConfig::default();
 
