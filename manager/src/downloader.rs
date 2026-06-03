@@ -159,7 +159,9 @@ pub async fn perform_model_download(
             fname
         );
 
-        if let Ok(meta) = tokio::fs::metadata(&file_path).await {
+        if let Ok(meta) = tokio::fs::metadata(&file_path).await
+            && meta.len() > 0
+        {
             shared_downloaded.fetch_add(meta.len(), std::sync::atomic::Ordering::Relaxed);
             grand_total.fetch_add(meta.len(), std::sync::atomic::Ordering::Relaxed);
             chunk_infos.push((fname.clone(), url, None, true, meta.len()));
@@ -435,8 +437,6 @@ async fn download_chunk(
         let original_existing_size = existing_size;
         shared_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
 
-        session_downloaded.fetch_add(existing_size, std::sync::atomic::Ordering::Relaxed);
-
         let (mut res, _final_url) = loop {
             let (response, final_url) = match initiate_request(
                 &client,
@@ -495,7 +495,6 @@ async fn download_chunk(
         if existing_size < original_existing_size {
             let delta = original_existing_size - existing_size;
             shared_downloaded.fetch_sub(delta, std::sync::atomic::Ordering::Relaxed);
-            session_downloaded.fetch_sub(delta, std::sync::atomic::Ordering::Relaxed);
             contribution_from_existing -= delta;
         }
 
@@ -646,7 +645,7 @@ pub(crate) fn balance_chunk_counters(
 ) {
     let total = contribution_from_existing + streamed_bytes;
     shared_downloaded.fetch_sub(total, std::sync::atomic::Ordering::Relaxed);
-    session_downloaded.fetch_sub(total, std::sync::atomic::Ordering::Relaxed);
+    session_downloaded.fetch_sub(streamed_bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Balances download counters on early exit before streaming begins.
@@ -656,14 +655,10 @@ pub(crate) fn balance_chunk_counters(
 /// were added because the stream was never entered).
 pub(crate) fn balance_chunk_counters_before_stream(
     shared_downloaded: &std::sync::atomic::AtomicU64,
-    session_downloaded: &std::sync::atomic::AtomicU64,
+    _session_downloaded: &std::sync::atomic::AtomicU64,
     contribution_from_existing: u64,
 ) {
     shared_downloaded.fetch_sub(
-        contribution_from_existing,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    session_downloaded.fetch_sub(
         contribution_from_existing,
         std::sync::atomic::Ordering::Relaxed,
     );
@@ -1489,13 +1484,11 @@ mod tests {
 
         // Step 1: initial contribution (as in download_chunk loop top)
         shared.fetch_add(init_existing, Ordering::Relaxed);
-        session.fetch_add(init_existing, Ordering::Relaxed);
 
         // Step 2: ETag/headers adjustment (as in download_chunk after verify_and_update_etag)
         let mut contribution_from_existing = init_existing;
         if let Some(delta) = etag_delta {
             shared.fetch_sub(delta, Ordering::Relaxed);
-            session.fetch_sub(delta, Ordering::Relaxed);
             contribution_from_existing -= delta;
         }
 
@@ -1530,12 +1523,11 @@ mod tests {
     #[test]
     fn test_balance_counters_before_stream_no_etag() {
         let shared = Arc::new(AtomicU64::new(0));
-        let session = Arc::new(AtomicU64::new(100));
+        let session = Arc::new(AtomicU64::new(0));
         shared.fetch_add(100, Ordering::Relaxed);
-        session.fetch_add(100, Ordering::Relaxed);
         super::balance_chunk_counters_before_stream(&shared, &session, 100);
         assert_eq!(shared.load(Ordering::Relaxed), 0);
-        assert_eq!(session.load(Ordering::Relaxed), 100);
+        assert_eq!(session.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1543,9 +1535,7 @@ mod tests {
         let shared = Arc::new(AtomicU64::new(0));
         let session = Arc::new(AtomicU64::new(0));
         shared.fetch_add(100, Ordering::Relaxed);
-        session.fetch_add(100, Ordering::Relaxed);
         shared.fetch_sub(50, Ordering::Relaxed);
-        session.fetch_sub(50, Ordering::Relaxed);
         super::balance_chunk_counters_before_stream(&shared, &session, 50);
         assert_eq!(shared.load(Ordering::Relaxed), 0);
         assert_eq!(session.load(Ordering::Relaxed), 0);
@@ -1556,7 +1546,6 @@ mod tests {
         let shared = Arc::new(AtomicU64::new(0));
         let session = Arc::new(AtomicU64::new(0));
         shared.fetch_add(100, Ordering::Relaxed);
-        session.fetch_add(100, Ordering::Relaxed);
         shared.fetch_add(50, Ordering::Relaxed);
         session.fetch_add(50, Ordering::Relaxed);
         super::balance_chunk_counters(&shared, &session, 100, 50);
@@ -1569,9 +1558,7 @@ mod tests {
         let shared = Arc::new(AtomicU64::new(0));
         let session = Arc::new(AtomicU64::new(0));
         shared.fetch_add(100, Ordering::Relaxed);
-        session.fetch_add(100, Ordering::Relaxed);
         shared.fetch_sub(50, Ordering::Relaxed);
-        session.fetch_sub(50, Ordering::Relaxed);
         shared.fetch_add(25, Ordering::Relaxed);
         session.fetch_add(25, Ordering::Relaxed);
         super::balance_chunk_counters(&shared, &session, 50, 25);
@@ -1595,12 +1582,49 @@ mod tests {
         let shared = Arc::new(AtomicU64::new(0));
         let session = Arc::new(AtomicU64::new(0));
         shared.fetch_add(10_000_000, Ordering::Relaxed);
-        session.fetch_add(10_000_000, Ordering::Relaxed);
         shared.fetch_add(50_000_000, Ordering::Relaxed);
         session.fetch_add(50_000_000, Ordering::Relaxed);
         super::balance_chunk_counters(&shared, &session, 10_000_000, 50_000_000);
         assert_eq!(shared.load(Ordering::Relaxed), 0);
         assert_eq!(session.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_session_downloaded_excludes_existing_size() {
+        let shared = Arc::new(AtomicU64::new(0));
+        let session = Arc::new(AtomicU64::new(0));
+
+        let existing = 5000;
+        let streamed = 1000;
+
+        shared.fetch_add(existing, Ordering::Relaxed);
+        // Only streamed bytes are added to the session tracker
+        shared.fetch_add(streamed, Ordering::Relaxed);
+        session.fetch_add(streamed, Ordering::Relaxed);
+
+        assert_eq!(
+            session.load(Ordering::Relaxed),
+            1000,
+            "Session should only contain streamed bytes"
+        );
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            6000,
+            "Shared should contain both"
+        );
+
+        super::balance_chunk_counters(&shared, &session, existing, streamed);
+
+        assert_eq!(
+            session.load(Ordering::Relaxed),
+            0,
+            "Session counter should balance to 0"
+        );
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            0,
+            "Shared counter should balance to 0"
+        );
     }
 
     #[test]
@@ -1985,11 +2009,11 @@ mod tests {
                 let dl = state.active_downloads.lock().unwrap();
                 dl.get("test-model").cloned()
             };
-            if let Some(dl) = active {
-                if dl.total_bytes > 0 {
-                    total_bytes_observed = dl.total_bytes;
-                    break;
-                }
+            if let Some(dl) = active
+                && dl.total_bytes > 0
+            {
+                total_bytes_observed = dl.total_bytes;
+                break;
             }
         }
 
@@ -2002,5 +2026,116 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_downloader_ignores_zero_byte_final_files() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        use axum::Router;
+
+        // 1. Mock server that returns valid content
+        let mock_app = Router::new().route(
+            "/{*path}",
+            axum::routing::get(|_req: axum::extract::Request| async move {
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .body(axum::body::Body::from("actual file content"))
+                    .unwrap()
+            })
+            .head(|_req: axum::extract::Request| async move {
+                axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "19")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        let temp_dir = std::env::temp_dir().join("test_zero_byte_files");
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+        let config = crate::AppConfig {
+            hf_base_url: format!("http://127.0.0.1:{}", port),
+            downloads_directory: temp_dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+
+        // 2. Pre-create the 0-byte final file to simulate an aborted setup / touched file
+        let final_file_path = temp_dir.join("model.safetensors");
+        tokio::fs::write(&final_file_path, "").await.unwrap();
+
+        // 3. Initialize AppState
+        let (queue_tx, _) = tokio::sync::mpsc::channel(1);
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+        let (_, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
+
+        let oauth_client = oauth2::basic::BasicClient::new(
+            oauth2::ClientId::new("dummy".to_string()),
+            None,
+            oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+            None,
+        );
+
+        let state = Arc::new(crate::AppState {
+            queue_tx,
+            engine_status: Arc::new(std::sync::Mutex::new(crate::EngineStatus::default())),
+            telemetry: Arc::new(std::sync::Mutex::new(crate::TelemetryStore::default())),
+            auth_store: Arc::new(std::sync::Mutex::new(crate::auth::AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client,
+            config: Arc::new(config),
+            log_buffer: crate::SharedLogBuffer(Arc::new(std::sync::Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle,
+            current_log_level: Arc::new(std::sync::Mutex::new("info".to_string())),
+            active_downloads: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            db,
+            shutdown_tx,
+        });
+
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert(
+                "test-model-zero-byte".to_string(),
+                crate::DownloadStatus::default(),
+            );
+        }
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(1);
+
+        // 4. Run the downloader
+        super::perform_model_download(
+            state,
+            "test-model-zero-byte".to_string(),
+            "test/repo".to_string(),
+            "model.safetensors".to_string(),
+            shutdown_rx,
+            cancel_rx,
+        )
+        .await;
+
+        // 5. Verify the file was actually downloaded and the 0-byte file was successfully overwritten
+        let downloaded_content = tokio::fs::read_to_string(&final_file_path)
+            .await
+            .expect("Final file should exist");
+
+        assert_eq!(
+            downloaded_content, "actual file content",
+            "The 0-byte file should have been ignored and overwritten by the actual download."
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

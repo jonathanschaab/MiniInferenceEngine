@@ -165,6 +165,25 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Validates and clamps configuration values to safe operational limits.
+    pub fn sanitize(&mut self) {
+        if self.max_concurrent_downloads == 0 {
+            warn!("max_concurrent_downloads cannot be 0. Enforcing minimum value of 1.");
+            self.max_concurrent_downloads = 1;
+        }
+        if self.max_concurrent_chunk_downloads == 0 {
+            warn!("max_concurrent_chunk_downloads cannot be 0. Enforcing minimum value of 1.");
+            self.max_concurrent_chunk_downloads = 1;
+        }
+        if self.download_stream_chunk_timeout_seconds == 0 {
+            warn!(
+                "download_stream_chunk_timeout_seconds cannot be 0. Enforcing default value of 30 seconds."
+            );
+            self.download_stream_chunk_timeout_seconds =
+                default_download_stream_chunk_timeout_seconds();
+        }
+    }
+
     pub async fn load() -> Self {
         let toml_path = crate::types::resolve_absolute_path("config.toml");
         let json_path = crate::types::resolve_absolute_path("config.json");
@@ -195,14 +214,7 @@ impl AppConfig {
             (Self::default(), true)
         };
 
-        if config.max_concurrent_downloads == 0 {
-            warn!("max_concurrent_downloads cannot be 0. Enforcing minimum value of 1.");
-            config.max_concurrent_downloads = 1;
-        }
-        if config.max_concurrent_chunk_downloads == 0 {
-            warn!("max_concurrent_chunk_downloads cannot be 0. Enforcing minimum value of 1.");
-            config.max_concurrent_chunk_downloads = 1;
-        }
+        config.sanitize();
 
         if needs_save {
             match toml::to_string_pretty(&config) {
@@ -216,5 +228,29 @@ impl AppConfig {
         }
 
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_config_sanitize() {
+        let mut config = AppConfig {
+            max_concurrent_downloads: 0,
+            max_concurrent_chunk_downloads: 0,
+            download_stream_chunk_timeout_seconds: 0,
+            ..Default::default()
+        };
+
+        config.sanitize();
+
+        assert_eq!(config.max_concurrent_downloads, 1);
+        assert_eq!(config.max_concurrent_chunk_downloads, 1);
+        assert_eq!(
+            config.download_stream_chunk_timeout_seconds,
+            default_download_stream_chunk_timeout_seconds()
+        );
     }
 }
