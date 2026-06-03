@@ -424,6 +424,10 @@ async fn download_chunk(
     let max_retries = state.config.download_retry_max_attempts;
     let mut backoff = state.config.download_retry_backoff_seconds;
 
+    // Tracks how much this chunk has dynamically contributed to `grand_total`.
+    // This prevents double-counting when retries occur or if the chunk size changes due to ETag mismatches.
+    let mut dynamic_grand_total_contribution = 0;
+
     loop {
         let (
             mut existing_size,
@@ -498,11 +502,23 @@ async fn download_chunk(
             contribution_from_existing -= delta;
         }
 
+        // If the chunk size was not known from the HEAD pre-check, we dynamically resolve it here.
+        // We must track our contribution to `grand_total` to ensure we don't double-count on retries,
+        // and to allow us to adjust the total if an ETag mismatch reveals the file size changed.
         if known_chunk_size == 0
             && let Some(content_length) = res.content_length()
         {
             let actual_chunk_size = existing_size + content_length;
-            grand_total.fetch_add(actual_chunk_size, std::sync::atomic::Ordering::Relaxed);
+            if actual_chunk_size != dynamic_grand_total_contribution {
+                if dynamic_grand_total_contribution > 0 {
+                    grand_total.fetch_sub(
+                        dynamic_grand_total_contribution,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                grand_total.fetch_add(actual_chunk_size, std::sync::atomic::Ordering::Relaxed);
+                dynamic_grand_total_contribution = actual_chunk_size;
+            }
         }
 
         if existing_size == 0 {
@@ -2258,6 +2274,204 @@ mod tests {
         assert_eq!(
             downloaded_content, "actual file content",
             "The 0-byte file should have been ignored and overwritten by the actual download."
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_chunk_size_retry_prevents_double_counting() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        use axum::Router;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let get_attempts = Arc::new(AtomicUsize::new(0));
+        let get_attempts_clone = get_attempts.clone();
+
+        // 1. Mock server that fails on the first GET but succeeds on retry
+        let mock_app = Router::new().route(
+            "/{*path}",
+            axum::routing::get(move |req: axum::extract::Request| async move {
+                let attempt = get_attempts_clone.fetch_add(1, Ordering::SeqCst);
+                let has_range = req.headers().contains_key(axum::http::header::RANGE);
+
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+                if attempt == 0 {
+                    // First attempt: Stream partial data and then drop the channel to simulate network failure
+                    tokio::spawn(async move {
+                        tracing::info!("Mock Server (Attempt 0): Sending first chunk (250 bytes)");
+                        let _ = tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 250],
+                            )))
+                            .await;
+                        // Wait long enough for the downloader's UI update timer (500ms) to elapse
+                        tracing::info!("Mock Server (Attempt 0): Waiting 600ms for UI timer...");
+                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        // Send a second chunk to trigger the UI update loop so `total_bytes` gets broadcasted
+                        tracing::info!("Mock Server (Attempt 0): Sending second chunk (250 bytes)");
+                        let _ = tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 250],
+                            )))
+                            .await;
+                        // Wait a tiny bit so the client successfully reads the chunk BEFORE the stream is killed
+                        tracing::info!("Mock Server (Attempt 0): Waiting 100ms before killing connection...");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        // Drop the tx to simulate an abrupt network error
+                    });
+
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::OK)
+                        .header(axum::http::header::CONTENT_LENGTH, "1000")
+                        .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+                        .unwrap()
+                } else {
+                    // Second attempt: Should resume with RANGE
+                    tracing::info!("Mock Server (Attempt 1): Resuming with remaining 500 bytes...");
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 500],
+                            )))
+                            .await;
+                        tracing::info!("Mock Server (Attempt 1): Keeping stream open for 500ms so test can observe state");
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    });
+
+                    axum::response::Response::builder()
+                        .status(if has_range {
+                            axum::http::StatusCode::PARTIAL_CONTENT
+                        } else {
+                            axum::http::StatusCode::OK
+                        })
+                        .header(axum::http::header::CONTENT_LENGTH, "500") // Remaining size
+                        .header("Content-Range", "bytes 500-999/1000")
+                        .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+                        .unwrap()
+                }
+            })
+            .head(|_req: axum::extract::Request| async move {
+                // Return NO Content-Length to force dynamic resolution
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        let temp_dir = std::env::temp_dir().join("test_dynamic_chunk_double_count");
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+        let config = crate::AppConfig {
+            hf_base_url: format!("http://127.0.0.1:{}", port),
+            downloads_directory: temp_dir.to_string_lossy().to_string(),
+            // Make backoff very short to speed up the test
+            download_retry_backoff_seconds: 0,
+            ..Default::default()
+        };
+
+        // 2. Setup isolated AppState
+        let (queue_tx, _) = tokio::sync::mpsc::channel(1);
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+        let (_, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
+
+        let state = Arc::new(crate::AppState {
+            queue_tx,
+            engine_status: Arc::new(std::sync::Mutex::new(crate::EngineStatus::default())),
+            telemetry: Arc::new(std::sync::Mutex::new(crate::TelemetryStore::default())),
+            auth_store: Arc::new(std::sync::Mutex::new(crate::auth::AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client: oauth2::basic::BasicClient::new(
+                oauth2::ClientId::new("dummy".to_string()),
+                None,
+                oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+                None,
+            ),
+            config: Arc::new(config),
+            log_buffer: crate::SharedLogBuffer(Arc::new(std::sync::Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle,
+            current_log_level: Arc::new(std::sync::Mutex::new("info".to_string())),
+            active_downloads: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            db,
+            shutdown_tx,
+        });
+
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("test-model".to_string(), crate::DownloadStatus::default());
+        }
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(1);
+
+        let state_clone = state.clone();
+        let task = tokio::spawn(async move {
+            super::perform_model_download(
+                state_clone,
+                "test-model".to_string(),
+                "test/repo".to_string(),
+                "model.safetensors".to_string(),
+                shutdown_rx,
+                cancel_rx,
+            )
+            .await;
+        });
+
+        let mut observed_total_bytes = 0;
+        let mut final_total_bytes = 0;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let active = {
+                let dl = state.active_downloads.lock().unwrap();
+                dl.get("test-model").cloned()
+            };
+            if let Some(dl) = active {
+                tracing::info!(
+                    "Test Poll Loop: bytes_transferred={}, total_bytes={}, state='{}'",
+                    dl.bytes_transferred,
+                    dl.total_bytes,
+                    dl.state
+                );
+                if dl.total_bytes > 0 {
+                    observed_total_bytes = dl.total_bytes;
+                    final_total_bytes = dl.total_bytes;
+                }
+            } else {
+                tracing::info!("Test Poll Loop: Download removed from active_downloads. Breaking.");
+                break;
+            }
+        }
+
+        let _ = task.await;
+
+        // Ensure we observed the dynamic assignment
+        assert!(
+            observed_total_bytes > 0,
+            "Should have dynamically assigned total bytes"
+        );
+
+        // The key assertion: Since we forced a retry, if we didn't guard against double counting,
+        // it would be 2000 instead of 1000!
+        assert_eq!(
+            final_total_bytes, 1000,
+            "total_bytes should strictly remain 1000 and not double-count to 2000 on retry"
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;

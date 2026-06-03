@@ -2117,9 +2117,11 @@ mod tests {
         // the age check `age.as_secs() > 0` evaluates to true and deletes it.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let mut config = AppConfig::default();
-        config.downloads_directory = temp_dir.to_string_lossy().to_string();
-        config.temp_file_retention_days = 0; // Disabled!
+        let config = AppConfig {
+            downloads_directory: temp_dir.to_string_lossy().to_string(),
+            temp_file_retention_days: 0, // Disabled!
+            ..Default::default()
+        };
 
         let active_downloads = std::sync::Mutex::new(std::collections::HashMap::new());
 
