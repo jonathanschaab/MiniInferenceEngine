@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{error, warn};
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -170,10 +170,27 @@ impl AppConfig {
         let json_path = crate::types::resolve_absolute_path("config.json");
         let (mut config, needs_save) = if let Ok(data) = tokio::fs::read_to_string(&toml_path).await
         {
-            (toml::from_str(&data).unwrap_or_default(), false)
+            match toml::from_str(&data) {
+                Ok(c) => (c, false),
+                Err(e) => {
+                    error!(
+                        "CRITICAL: Failed to parse config.toml: {}. Please fix the syntax errors. Falling back to defaults.",
+                        e
+                    );
+                    (Self::default(), false) // Don't overwrite the user's broken file
+                }
+            }
         } else if let Ok(data) = tokio::fs::read_to_string(&json_path).await {
-            // Fallback for backwards compatibility, but save as TOML going forward
-            (serde_json::from_str(&data).unwrap_or_default(), true)
+            match serde_json::from_str(&data) {
+                Ok(c) => (c, true), // Fallback for backwards compatibility, save as TOML going forward
+                Err(e) => {
+                    error!(
+                        "CRITICAL: Failed to parse config.json: {}. Please fix the syntax errors. Falling back to defaults.",
+                        e
+                    );
+                    (Self::default(), false) // Don't overwrite the user's broken file
+                }
+            }
         } else {
             (Self::default(), true)
         };

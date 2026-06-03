@@ -333,7 +333,7 @@ function createSessionElement(s) {
     infoDiv.appendChild(dateDiv);
 
     const actionsDiv = document.createElement('div');
-    actionsDiv.style.whiteSpace = 'nowrap';
+    actionsDiv.className = 'whitespace-nowrap';
 
     const editBtn = document.createElement('button');
     editBtn.className = 'session-action-btn';

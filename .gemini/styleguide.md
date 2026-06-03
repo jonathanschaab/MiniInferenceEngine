@@ -22,7 +22,7 @@ These are fundamental rules that must be followed to ensure the quality, stabili
 * **DRY (Don't Repeat Yourself):** Strive to keep the codebase as DRY as possible. Abstract and reuse common logic, data structures, and patterns to improve maintainability and reduce the chance of bugs.
 * **Dependency Management:** Before adding a new dependency, check if a reasonable alternative already exists within the project's current dependency tree. The goal is to keep the number of dependencies minimal.
 * **Keep Documentation Updated:** Any change to the code must be accompanied by corresponding changes to its documentation. Out-of-date documentation is a source of bugs.
-* **Modern Rust:** This project uses Rust 1.95.0 which was released on 4/16/2026 and is stable. This means Let chains are stable as are if let guards. is_none_or() is also stable. use these new features when they improve the code.
+* **Modern Rust:** This project uses Rust 1.96.0 which was released on 4/16/2026 and is stable. This means Let chains are stable as are if let guards. is_none_or() is also stable. use these new features when they improve the code.
 * **No marketing:** Avoid flourishes and self praise in comments and documentation. Don't describe things as flawless, highly intelligent, or incredible. Also avoid unnecessary exclamation points.
 * **Configuration Drift:** When adding new fields to `AppConfig`, you must also add them as commented-out default examples in `config.toml` to aid user discoverability.
 

@@ -16,7 +16,7 @@ async function loadKeys() {
         const tr = document.createElement('tr');
         
         const tdName = document.createElement('td');
-        tdName.style.fontWeight = 'bold';
+        tdName.className = 'font-bold';
         tdName.textContent = record.name; // Natively escapes HTML and quotes!
         
         const tdDesc = document.createElement('td');

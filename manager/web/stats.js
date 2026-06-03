@@ -20,7 +20,7 @@ async function openBenchmarkModal() {
             modelsHtml += `
                 <label class="model-item">
                     <input type="checkbox" class="model-cb" value="${DOMPurify.sanitize(m.id)}" data-backends="${backendsStr}" checked>
-                    ${DOMPurify.sanitize(m.name)} <span style="color: #6c7086; margin-left: 5px;">(${DOMPurify.sanitize(m.arch)})</span>
+                    ${DOMPurify.sanitize(m.name)} <span class="text-overlay0 ml-5">(${DOMPurify.sanitize(m.arch)})</span>
                     <span class="incompatible-warning">(Incompatible)</span>
                 </label>
             `;

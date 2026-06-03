@@ -321,6 +321,7 @@ async fn resolve_model_size(
     hf_base_url: &str,
     hf_token: Option<&String>,
     reg_id: &str,
+    permanent_error: &mut bool,
 ) -> Option<(f32, String)> {
     let mut total_bytes = 0;
     let mut all_found = true;
@@ -367,6 +368,13 @@ async fn resolve_model_size(
             }
             if let Ok(res) = req.send().await {
                 if !res.status().is_success() {
+                    let status = res.status();
+                    if status == reqwest::StatusCode::UNAUTHORIZED
+                        || status == reqwest::StatusCode::FORBIDDEN
+                        || status == reqwest::StatusCode::NOT_FOUND
+                    {
+                        *permanent_error = true;
+                    }
                     remote_found = false;
                     break;
                 }
@@ -898,9 +906,13 @@ async fn background_resolve_model(
     mut backoff: u64,
 ) {
     loop {
-        let permit = sem_clone.acquire().await;
+        let permit = match sem_clone.acquire().await {
+            Ok(p) => p,
+            Err(_) => return, // Semaphore closed, safely aborting background resolution
+        };
 
         let mut provenance = std::collections::HashMap::new();
+        let mut permanent_error = false;
 
         let mut arch = reg.overrides.arch;
         let mut kv_cache_dtype = reg.overrides.kv_cache_dtype;
@@ -960,6 +972,7 @@ async fn background_resolve_model(
                 &hf_base_url,
                 hf_token.as_ref(),
                 reg.id,
+                &mut permanent_error,
             )
             .await
             {
@@ -1241,11 +1254,18 @@ async fn background_resolve_model(
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        if msg.contains("401") || msg.contains("Unauthorized") {
+                        if msg.contains("401")
+                            || msg.contains("Unauthorized")
+                            || msg.contains("403")
+                            || msg.contains("Forbidden")
+                            || msg.contains("404")
+                            || msg.contains("Not Found")
+                        {
                             warn!(
-                                "Failed to fetch config.json for {}: HTTP 401 Unauthorized. If this is a gated model, make sure you have accepted the license on Hugging Face and set the HF_TOKEN environment variable.",
+                                "Failed to fetch config.json for {}: Permanent HTTP error (401/403/404). Stopping retries. If this is a gated model, make sure you have accepted the license on Hugging Face and set the HF_TOKEN environment variable.",
                                 reg.id
                             );
+                            permanent_error = true;
                         } else {
                             warn!("Failed to fetch config.json for {}: {}", reg.id, e);
                         }
@@ -1373,6 +1393,10 @@ async fn background_resolve_model(
 
         if success {
             debug!("Successfully resolved model details for {}", config.id);
+            break;
+        }
+
+        if permanent_error {
             break;
         }
 
@@ -1645,9 +1669,9 @@ mod tests {
         let app = axum::Router::new().route(
             "/{*path}",
             axum::routing::get(move |req: axum::extract::Request| async move {
-                println!("[MOCK SERVER] Intercepted GET request to: {}", req.uri());
+                info!("[MOCK SERVER] Intercepted GET request to: {}", req.uri());
                 if start_time.elapsed().as_secs() < 2 {
-                    println!("[MOCK SERVER] Simulating 500 Internal Server Error");
+                    info!("[MOCK SERVER] Simulating 500 Internal Server Error");
                     return axum::response::Response::builder()
                         .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                         .body(axum::body::Body::empty())
@@ -1656,7 +1680,7 @@ mod tests {
 
                 // If hf-hub is asking for the API metadata (like commit info), mock a valid ModelInfo response
                 if req.uri().path().contains("/api/models/") {
-                    println!("[MOCK SERVER] Serving mock Hugging Face API ModelInfo");
+                    info!("[MOCK SERVER] Serving mock Hugging Face API ModelInfo");
                     let model_info = serde_json::json!({
                         "id": "test/repo",
                         "sha": "dummy_sha",
@@ -1688,39 +1712,38 @@ mod tests {
                     .header("X-Repo-Commit", "dummy_sha")
                     .header("Accept-Ranges", "bytes");
 
-                if let Some(range) = req.headers().get(axum::http::header::RANGE) {
-                    if let Ok(range_str) = range.to_str() {
-                        if range_str.starts_with("bytes=") {
-                            let parts: Vec<&str> = range_str["bytes=".len()..].split('-').collect();
-                            let start = parts.first().unwrap_or(&"0").parse::<usize>().unwrap_or(0);
+                if let Some(range) = req.headers().get(axum::http::header::RANGE)
+                    && let Ok(range_str) = range.to_str()
+                    && let Some(stripped) = range_str.strip_prefix("bytes=")
+                {
+                    let parts: Vec<&str> = stripped.split('-').collect();
+                    let start = parts.first().unwrap_or(&"0").parse::<usize>().unwrap_or(0);
 
-                            if start >= len {
-                                return axum::response::Response::builder()
-                                    .status(axum::http::StatusCode::RANGE_NOT_SATISFIABLE)
-                                    .header("Content-Range", format!("bytes */{}", len))
-                                    .body(axum::body::Body::empty())
-                                    .unwrap();
-                            }
-
-                            let chunk_len = len - start;
-                            println!(
-                                "[MOCK SERVER] Serving dummy config.json (Partial: {} bytes)",
-                                chunk_len
-                            );
-                            return res
-                                .status(axum::http::StatusCode::PARTIAL_CONTENT)
-                                .header(
-                                    "Content-Range",
-                                    format!("bytes {}-{}/{}", start, len - 1, len),
-                                )
-                                .header(axum::http::header::CONTENT_LENGTH, chunk_len.to_string())
-                                .body(axum::body::Body::from(body_str[start..].to_string()))
-                                .unwrap();
-                        }
+                    if start >= len {
+                        return axum::response::Response::builder()
+                            .status(axum::http::StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header("Content-Range", format!("bytes */{}", len))
+                            .body(axum::body::Body::empty())
+                            .unwrap();
                     }
+
+                    let chunk_len = len - start;
+                    info!(
+                        "[MOCK SERVER] Serving dummy config.json (Partial: {} bytes)",
+                        chunk_len
+                    );
+                    return res
+                        .status(axum::http::StatusCode::PARTIAL_CONTENT)
+                        .header(
+                            "Content-Range",
+                            format!("bytes {}-{}/{}", start, len - 1, len),
+                        )
+                        .header(axum::http::header::CONTENT_LENGTH, chunk_len.to_string())
+                        .body(axum::body::Body::from(body_str[start..].to_string()))
+                        .unwrap();
                 }
 
-                println!(
+                info!(
                     "[MOCK SERVER] Serving dummy config.json (Full: {} bytes)",
                     len
                 );
@@ -1729,15 +1752,15 @@ mod tests {
                     .unwrap()
             })
             .head(move |req: axum::extract::Request| async move {
-                println!("[MOCK SERVER] Intercepted HEAD request to: {}", req.uri());
+                info!("[MOCK SERVER] Intercepted HEAD request to: {}", req.uri());
                 if start_time.elapsed().as_secs() < 2 {
-                    println!("[MOCK SERVER] Simulating 500 Internal Server Error");
+                    info!("[MOCK SERVER] Simulating 500 Internal Server Error");
                     return axum::response::Response::builder()
                         .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                         .body(axum::body::Body::empty())
                         .unwrap();
                 }
-                println!("[MOCK SERVER] Serving X-Linked-Size header");
+                info!("[MOCK SERVER] Serving X-Linked-Size header");
                 axum::response::Response::builder()
                     .header("X-Linked-Size", "8589934592") // Simulate an 8GB response
                     .body(axum::body::Body::empty())
@@ -1816,5 +1839,61 @@ mod tests {
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all(temp_cache_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_background_resolve_model_semaphore_closed() {
+        let lock = Arc::new(RwLock::new(vec![mock_config(
+            ModelArch::Llama,
+            ModelDType::F16,
+        )]));
+
+        // Create a semaphore and immediately close it
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        sem.close();
+
+        let reg = ModelRegistration {
+            id: "test",
+            name: "test",
+            repo: "test/repo",
+            tokenizer_repo: "test/repo",
+            filename: "model.gguf",
+            roles: vec![],
+            compression_dtype: None,
+            supported_backends: vec![],
+            is_default_chat: false,
+            is_default_compressor: false,
+            parameters_billions: 7.0,
+            non_layer_params_billions: 0.5,
+            overrides: ModelOverrides::default(),
+        };
+
+        let hf_cache = hf_hub::Cache::new(std::env::temp_dir().join("test_hf_cache_sem_closed"));
+
+        // Execute the background task with a strict 100ms timeout.
+        // If the semaphore error is ignored, the function will hang in a retry loop
+        // (or attempt network calls) and the timeout will trigger.
+        // If handled correctly, it returns instantly.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            super::background_resolve_model(
+                reg,
+                std::env::temp_dir(),
+                hf_cache,
+                "http://localhost".to_string(),
+                None,
+                None,
+                None,
+                lock.clone(),
+                sem,
+                1,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "The background task did not exit immediately when the semaphore was closed!"
+        );
     }
 }

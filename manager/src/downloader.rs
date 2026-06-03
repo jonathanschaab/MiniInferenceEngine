@@ -463,7 +463,10 @@ async fn download_chunk(
             )
             .await
             {
-                // ETag mismatch, restart needed
+                // ETag mismatch detected! The upstream file has changed.
+                // We mutate `existing_size` to 0 in memory and `continue` this inner loop.
+                // This forces `initiate_request` to ask for the full file from the beginning
+                // on the next pass, without ever re-reading the outdated `.meta` file.
                 continue;
             }
             break (response, final_url);
@@ -473,8 +476,12 @@ async fn download_chunk(
         if !is_partial && existing_size > 0 {
             existing_size = 0;
         }
-        // Balance the counter after ETag/headers adjustments.
-        // original_existing_size was added at the top of the loop; if it dropped, subtract the delta.
+
+        // Balance the atomic counters after ETag/headers adjustments.
+        // `original_existing_size` was blindly added at the top of the outer loop.
+        // If an ETag mismatch occurred, `existing_size` was mutated to 0 during the inner loop.
+        // This block completely subtracts the old `original_existing_size` to perfectly
+        // cancel out the earlier addition, preventing the UI from double-counting the bytes.
         let mut contribution_from_existing = original_existing_size;
         if existing_size < original_existing_size {
             let delta = original_existing_size - existing_size;
@@ -497,6 +504,7 @@ async fn download_chunk(
 
         save_metadata(&meta_file_path, &expected_hash, is_sha256, &checkpoints).await;
 
+        // Truncates the .tmp file to 0 bytes using File::create if existing_size is 0
         let mut file = match open_temp_file(&tmp_file_path, is_partial, existing_size).await {
             Ok(f) => f,
             Err(e) => {
@@ -582,6 +590,11 @@ async fn download_chunk(
         } else {
             false
         };
+
+        // Explicitly flush all data to physical storage to prevent corruption on power loss
+        if let Err(e) = file.sync_all().await {
+            error!("Failed to sync downloaded data to disk for {}: {}", id, e);
+        }
 
         // Explicitly drop the file handle to release the OS lock before renaming,
         // which is required to prevent sharing violations on Windows.
@@ -1687,5 +1700,144 @@ mod tests {
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all(&downloads_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_etag_mismatch_inner_loop_restarts_and_truncates() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        use axum::Router;
+
+        // 1. Mock server that returns a NEW ETag and content
+        let mock_app = Router::new().route(
+            "/{*path}",
+            axum::routing::get(|req: axum::extract::Request| async move {
+                let has_range = req.headers().contains_key(axum::http::header::RANGE);
+                let mut res = axum::response::Response::builder().header("ETag", "\"new_etag\""); // Notice this differs from "old_etag" in our seed
+
+                if has_range {
+                    res = res.status(axum::http::StatusCode::PARTIAL_CONTENT);
+                    res.body(axum::body::Body::from("partial")).unwrap()
+                } else {
+                    res = res.status(axum::http::StatusCode::OK);
+                    res.body(axum::body::Body::from("full new content"))
+                        .unwrap()
+                }
+            })
+            .head(|_req: axum::extract::Request| async move {
+                axum::response::Response::builder()
+                    .header("ETag", "\"new_etag\"")
+                    .header(axum::http::header::CONTENT_LENGTH, "16")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        let temp_dir = std::env::temp_dir().join("test_etag_mismatch");
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+        let config = crate::AppConfig {
+            hf_base_url: format!("http://127.0.0.1:{}", port),
+            downloads_directory: temp_dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+
+        // 2. Seed the directory with an outdated, partial download
+        let tmp_file_path = temp_dir.join("model.safetensors.tmp");
+        let meta_file_path = temp_dir.join("model.safetensors.meta");
+        let final_file_path = temp_dir.join("model.safetensors");
+
+        let old_content = b"old dummy content";
+        tokio::fs::write(&tmp_file_path, old_content).await.unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(old_content);
+        let valid_hasher_hex = super::serialize_hasher(&hasher);
+
+        // Create a metadata file explicitly expecting "old_etag"
+        let meta_json = serde_json::json!({
+            "expected_hash": "old_etag",
+            "is_sha256": false,
+            "checkpoints": [{
+                "downloaded_bytes": old_content.len(),
+                "hasher_state": valid_hasher_hex
+            }],
+            "hasher_version": super::HASHER_STATE_VERSION
+        });
+        tokio::fs::write(&meta_file_path, meta_json.to_string())
+            .await
+            .unwrap();
+
+        // 3. Initialize AppState
+        let (queue_tx, _) = tokio::sync::mpsc::channel(1);
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+        let (_, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
+
+        let oauth_client = oauth2::basic::BasicClient::new(
+            oauth2::ClientId::new("dummy".to_string()),
+            None,
+            oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+            None,
+        );
+        let state = Arc::new(crate::AppState {
+            queue_tx,
+            engine_status: Arc::new(std::sync::Mutex::new(crate::EngineStatus::default())),
+            telemetry: Arc::new(std::sync::Mutex::new(crate::TelemetryStore::default())),
+            auth_store: Arc::new(std::sync::Mutex::new(crate::auth::AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client,
+            config: Arc::new(config),
+            log_buffer: crate::SharedLogBuffer(Arc::new(std::sync::Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle,
+            current_log_level: Arc::new(std::sync::Mutex::new("info".to_string())),
+            active_downloads: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            db,
+            shutdown_tx: shutdown_tx.clone(),
+        });
+
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("test-model".to_string(), crate::DownloadStatus::default());
+        }
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(1);
+
+        // 4. Run the downloader
+        super::perform_model_download(
+            state,
+            "test-model".to_string(),
+            "test/repo".to_string(),
+            "model.safetensors".to_string(),
+            shutdown_rx,
+            cancel_rx,
+        )
+        .await;
+
+        // 5. Verify the ETag mismatch correctly restarted the stream from 0 and completely overwrote the old dummy content
+        let downloaded_content = tokio::fs::read_to_string(&final_file_path)
+            .await
+            .expect("Final file should exist");
+        assert_eq!(
+            downloaded_content, "full new content",
+            "The file should contain ONLY the new content. If it says 'old dummy contentpartial', the file was not properly truncated!"
+        );
+
+        // Verify cleanup
+        assert!(!tmp_file_path.exists());
+        assert!(!meta_file_path.exists());
+        let _ = tokio::fs::remove_dir_all(temp_dir).await;
     }
 }
