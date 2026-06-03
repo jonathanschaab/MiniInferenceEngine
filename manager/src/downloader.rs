@@ -564,6 +564,20 @@ async fn download_chunk(
         )
         .await;
 
+        if stream_result.disk_error {
+            error!(
+                "Fatal I/O error while writing chunk {} to disk. Aborting.",
+                filename
+            );
+            balance_chunk_counters(
+                &shared_downloaded,
+                &session_downloaded,
+                contribution_from_existing,
+                stream_result.streamed_bytes,
+            );
+            return false;
+        }
+
         if stream_result.is_aborted {
             balance_chunk_counters(
                 &shared_downloaded,
@@ -1107,6 +1121,7 @@ async fn open_temp_file(
 
 struct ProcessStreamResult {
     stream_error: bool,
+    disk_error: bool,
     is_aborted: bool,
     streamed_bytes: u64,
 }
@@ -1151,6 +1166,7 @@ async fn process_download_stream(
                 save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
                 return ProcessStreamResult {
                     stream_error: false,
+                    disk_error: false,
                     is_aborted: true,
                     streamed_bytes: downloaded - starting_existing_size,
                 };
@@ -1160,6 +1176,7 @@ async fn process_download_stream(
                 save_download_checkpoint(hasher, downloaded, &mut checkpoints, meta_file_path, expected_hash, is_sha256).await;
                 return ProcessStreamResult {
                     stream_error: false,
+                    disk_error: false,
                     is_aborted: true,
                     streamed_bytes: downloaded - starting_existing_size,
                 };
@@ -1171,8 +1188,12 @@ async fn process_download_stream(
 
                         if let Err(e) = file.write_all(&bytes).await {
                             error!("Failed to write to file for {}: {}", id, e);
-                            stream_error = true;
-                            break;
+                            return ProcessStreamResult {
+                                stream_error: false,
+                                disk_error: true,
+                                is_aborted: false,
+                                streamed_bytes: downloaded - starting_existing_size,
+                            };
                         }
                         let chunk_len = bytes.len() as u64;
                         downloaded += chunk_len;
@@ -1231,6 +1252,7 @@ async fn process_download_stream(
 
     ProcessStreamResult {
         stream_error,
+        disk_error: false,
         is_aborted: false,
         streamed_bytes: downloaded - starting_existing_size,
     }
@@ -1515,6 +1537,7 @@ mod tests {
         OpenFileFail,
         Aborted,
         StreamError,
+        DiskError,
         Success,
     }
 
@@ -1549,7 +1572,7 @@ mod tests {
                     contribution_from_existing,
                 );
             }
-            CounterExit::Aborted | CounterExit::StreamError => {
+            CounterExit::Aborted | CounterExit::StreamError | CounterExit::DiskError => {
                 // Simulate process_download_stream adding streamed bytes to the counters
                 shared.fetch_add(streamed_bytes, Ordering::Relaxed);
                 session.fetch_add(streamed_bytes, Ordering::Relaxed);
@@ -1688,6 +1711,7 @@ mod tests {
             (CounterExit::OpenFileFail, 0, true),
             (CounterExit::Aborted, 50, true),
             (CounterExit::StreamError, 25, true),
+            (CounterExit::DiskError, 75, true),
             (CounterExit::Success, 100, false),
         ];
         for (exit, streamed, should_be_zero) in paths {
@@ -1725,6 +1749,7 @@ mod tests {
             CounterExit::Success,
             CounterExit::Aborted,
             CounterExit::StreamError,
+            CounterExit::DiskError,
             CounterExit::InitRequestFail,
             CounterExit::OpenFileFail,
         ];
