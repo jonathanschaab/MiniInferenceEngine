@@ -372,6 +372,91 @@ fn is_active_temp_file(
     false
 }
 
+pub(crate) async fn sweep_temp_files(
+    downloads_dir: &std::path::Path,
+    active_downloads: &std::sync::Mutex<std::collections::HashMap<String, DownloadStatus>>,
+    config: &AppConfig,
+) {
+    let temp_file_retention_secs = config.temp_file_retention_days * 24 * 3600;
+    if temp_file_retention_secs == 0 {
+        return;
+    }
+
+    let registry = manager::get_model_registry(config).await;
+    let active_keys: std::collections::HashSet<String> = {
+        let active = lock_mutex(active_downloads);
+        active.keys().cloned().collect()
+    };
+
+    let mut active_expected_bases = std::collections::HashSet::new();
+    for model in &registry {
+        if active_keys.contains(&model.id) {
+            let expected_names = manager::get_split_filenames(&model.filename);
+            for expected in expected_names {
+                if let Some(expected_base) = std::path::Path::new(&expected)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
+                    active_expected_bases.insert(expected_base.to_string());
+                }
+            }
+        }
+    }
+
+    let mut dirs_to_visit = vec![downloads_dir.to_path_buf()];
+
+    while let Some(current_dir) = dirs_to_visit.pop() {
+        // Throttle directory traversal to prevent sudden I/O spikes
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        match tokio::fs::read_dir(&current_dir).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    // Yield to the executor to avoid starving other tasks if a directory is huge
+                    tokio::task::yield_now().await;
+
+                    let path = entry.path();
+
+                    if let Ok(file_type) = entry.file_type().await
+                        && file_type.is_dir()
+                    {
+                        dirs_to_visit.push(path);
+                        continue;
+                    }
+
+                    if let Some(ext) = path.extension().and_then(|s| s.to_str())
+                        && ["tmp", "meta", "corrupted", "copy_tmp"].contains(&ext)
+                        && let Ok(metadata) = entry.metadata().await
+                        && let Ok(modified) = metadata.modified()
+                        && let Ok(age) = modified.elapsed()
+                        && age.as_secs() > temp_file_retention_secs
+                    {
+                        let is_active = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|file_name| is_active_temp_file(file_name, &active_expected_bases))
+                            .unwrap_or(false);
+
+                        if !is_active {
+                            // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
+                            let _ = tokio::fs::remove_file(&path).await;
+                            info!("Cleaned up abandoned file: {:?}", path);
+                            cleanup_empty_parents(&path, downloads_dir).await;
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                error!(
+                    "Failed to read directory for cleanup {:?}: {}",
+                    current_dir, e
+                );
+            }
+        }
+    }
+}
+
 async fn cleanup_empty_parents(path: &std::path::Path, limit_dir: &std::path::Path) {
     let mut current_dir = path.parent();
     while let Some(parent) = current_dir {
@@ -1473,6 +1558,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let temp_file_retention_secs = config.temp_file_retention_days * 24 * 3600;
     let config_for_cleanup = config.clone();
     tokio::spawn(async move {
+        if temp_file_retention_secs == 0 {
+            return; // 0 disables retention cleanup
+        }
+
         // Sweep the downloads directory every 12 hours
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
             TEMP_FILE_CLEANUP_INTERVAL_SECS,
@@ -1480,81 +1569,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
 
-            let registry = manager::get_model_registry(&config_for_cleanup).await;
-            let active_keys: std::collections::HashSet<String> = {
-                let active = lock_mutex(&active_downloads_for_cleanup);
-                active.keys().cloned().collect()
-            };
-
-            let mut active_expected_bases = std::collections::HashSet::new();
-            for model in &registry {
-                if active_keys.contains(&model.id) {
-                    let expected_names = manager::get_split_filenames(&model.filename);
-                    for expected in expected_names {
-                        if let Some(expected_base) = std::path::Path::new(&expected)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                        {
-                            active_expected_bases.insert(expected_base.to_string());
-                        }
-                    }
-                }
-            }
-
-            let mut dirs_to_visit = vec![downloads_dir_for_cleanup.clone()];
-
-            while let Some(current_dir) = dirs_to_visit.pop() {
-                // Throttle directory traversal to prevent sudden I/O spikes
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-                match tokio::fs::read_dir(&current_dir).await {
-                    Ok(mut entries) => {
-                        while let Ok(Some(entry)) = entries.next_entry().await {
-                            // Yield to the executor to avoid starving other tasks if a directory is huge
-                            tokio::task::yield_now().await;
-
-                            let path = entry.path();
-
-                            if let Ok(file_type) = entry.file_type().await
-                                && file_type.is_dir()
-                            {
-                                dirs_to_visit.push(path);
-                                continue;
-                            }
-
-                            if let Some(ext) = path.extension().and_then(|s| s.to_str())
-                                && ["tmp", "meta", "corrupted", "copy_tmp"].contains(&ext)
-                                && let Ok(metadata) = entry.metadata().await
-                                && let Ok(modified) = metadata.modified()
-                                && let Ok(age) = modified.elapsed()
-                                && age.as_secs() > temp_file_retention_secs
-                            {
-                                let is_active = path
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .map(|file_name| {
-                                        is_active_temp_file(file_name, &active_expected_bases)
-                                    })
-                                    .unwrap_or(false);
-
-                                if !is_active {
-                                    // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
-                                    let _ = tokio::fs::remove_file(&path).await;
-                                    info!("Cleaned up abandoned file: {:?}", path);
-                                    cleanup_empty_parents(&path, &downloads_dir_for_cleanup).await;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        error!(
-                            "Failed to read directory for cleanup {:?}: {}",
-                            current_dir, e
-                        );
-                    }
-                }
-            }
+            sweep_temp_files(
+                &downloads_dir_for_cleanup,
+                &active_downloads_for_cleanup,
+                &config_for_cleanup,
+            )
+            .await;
         }
     });
 
@@ -2083,6 +2103,34 @@ mod tests {
 
         // Potential collision testing: another model with overlapping prefix
         assert!(!is_active_temp_file("model.safetensors_v2.tmp", &bases));
+    }
+
+    #[tokio::test]
+    async fn test_sweep_temp_files_disabled_when_retention_zero() {
+        let temp_dir = std::env::temp_dir().join("test_sweep_temp_disabled");
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let tmp_file = temp_dir.join("model.safetensors.tmp");
+        tokio::fs::write(&tmp_file, "dummy").await.unwrap();
+
+        // Ensure the file is at least 1 second old so that if the sweep mistakenly runs,
+        // the age check `age.as_secs() > 0` evaluates to true and deletes it.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut config = AppConfig::default();
+        config.downloads_directory = temp_dir.to_string_lossy().to_string();
+        config.temp_file_retention_days = 0; // Disabled!
+
+        let active_downloads = std::sync::Mutex::new(std::collections::HashMap::new());
+
+        super::sweep_temp_files(&temp_dir, &active_downloads, &config).await;
+
+        assert!(
+            tmp_file.exists(),
+            "Temporary file should not be deleted when retention is 0"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     use axum::Json;

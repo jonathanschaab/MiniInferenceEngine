@@ -184,7 +184,9 @@ function downloadModel(modelId, callbacks = {}) {
                             await sleep(500);
                             return; // Download succeeded!
                         } else {
-                            throw new Error("Interrupted");
+                            // Server no longer reports it as active or downloaded. 
+                            // It was likely paused or cancelled.
+                            throw new Error("ServerDropped");
                         }
                     }
                 }
@@ -199,6 +201,11 @@ function downloadModel(modelId, callbacks = {}) {
                 }
                 if (e.status === 401 || e.message === 'Unauthorized') throw e;
                 
+                if (e.message === "ServerDropped") {
+                    if (callbacks.onStatusText) callbacks.onStatusText('Download Stopped.');
+                    throw new Error("Download was stopped on the server.");
+                }
+
                 const isPermanent = e.status >= 400 && e.status < 500 && e.status !== 409 && e.status !== 429;
                 if (isPermanent) {
                     if (callbacks.onStatusText) callbacks.onStatusText('Download Failed (Permanent Error).');

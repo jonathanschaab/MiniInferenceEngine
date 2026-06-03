@@ -135,12 +135,21 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
 
         page.on('console', msg => {
             if (msg.type() === 'error' || msg.type() === 'warning') {
+                const text = msg.text();
+
                 // Ignore expected intentional errors from network interruption tests
-                if (testInfo.title === 'Models Directory recovers from network interruptions during download' && msg.text().includes('interrupted, retrying in 5s')) {
+                if (testInfo.title.includes('network interruptions') || testInfo.title.includes('network errors')) {
+                    if (text.includes('interrupted, retrying in 5s') || text.includes('502 (Bad Gateway)')) {
+                        return;
+                    }
+                }
+
+                // Ignore expected intentional errors from server drop tests
+                if (testInfo.title.includes('ServerDropped') && text.includes('Download was stopped on the server.')) {
                     return;
                 }
 
-                console.log(`[Browser Console]: ${msg.text()}`);
+                console.log(`[Browser Console]: ${text}`);
             }
         });
 
@@ -731,17 +740,16 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             }
         });
 
-        let postCount = 0;
+        let simulateDrop = false;
         await page.route('**/api/downloads', async route => {
             if (route.request().method() === 'GET') {
-                await route.fulfill({ status: 200, json: downloadState });
-            } else if (route.request().method() === 'POST') {
-                postCount++;
-                if (postCount === 1) {
-                    downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 10, start_time: 0, state: "Downloading..." };
-                } else if (postCount === 2) {
-                    downloadState['mock-model-1'] = { bytes_transferred: 100, total_bytes: 100, current_speed_bps: 10, start_time: 0, state: "Downloading..." };
+                if (simulateDrop) {
+                    await route.fulfill({ status: 502, body: 'Bad Gateway' });
+                } else {
+                    await route.fulfill({ status: 200, json: downloadState });
                 }
+            } else if (route.request().method() === 'POST') {
+                downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 10, start_time: 0, state: "Downloading..." };
                 await route.fulfill({ status: 202, body: '' });
             } else {
                 route.fallback();
@@ -754,8 +762,11 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
 
         const stats = card.locator('.download-stats');
         await expect(stats).toContainText('50.0%');
-        delete downloadState['mock-model-1']; // Simulate network drop
+        simulateDrop = true; // Simulate network drop
         await expect(stats).toContainText('Retrying in 5s...');
+        
+        simulateDrop = false; // Recover network
+        downloadState['mock-model-1'].bytes_transferred = 100;
         await expect(stats).toContainText('100.0%', { timeout: 15000 }); // Wait for the 5s loop to recover
         
         delete downloadState['mock-model-1']; // Simulate Finish
@@ -897,5 +908,93 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         // Fire another request; it should bypass the expired cache
         await page.evaluate(async () => await SharedDownloadProgress.get());
         expect(apiCallCount).toBe(2);
+    });
+
+    test('Models Directory handles download dropped by server (ServerDropped)', async ({ page }) => {
+        await page.route('**/api/models', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: [{ id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: false }]
+                });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.route('**/api/models/mock-model-1', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, json: { is_downloaded: false } });
+            } else {
+                route.fallback();
+            }
+        });
+
+        let postCount = 0;
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                if (postCount === 1) {
+                    await route.fulfill({ status: 200, json: { 'mock-model-1': { bytes_transferred: 10, total_bytes: 100, current_speed_bps: 10, start_time: 0, state: 'Downloading...' } } });
+                    postCount++; // Increment so next poll gets empty object
+                } else {
+                    await route.fulfill({ status: 200, json: {} });
+                }
+            } else if (route.request().method() === 'POST') {
+                postCount++;
+                await route.fulfill({ status: 202, body: '' });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.goto('/models');
+        
+        const card = page.locator('#model-card-mock-model-1');
+        await card.locator('.btn-download').click();
+
+        await expect(card.locator('.download-stats')).toContainText('Download Stopped.', { timeout: 10000 });
+        expect(postCount).toBe(2);
+    });
+
+    test('Models Directory retries on network errors or 429 Too Many Requests', async ({ page }) => {
+        await page.route('**/api/models', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: [{ id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: false }]
+                });
+            } else {
+                route.fallback();
+            }
+        });
+
+        let postCalled = false;
+        let errorServed = false;
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'POST') {
+                postCalled = true;
+                await route.fulfill({ status: 202, body: '' });
+            } else if (route.request().method() === 'GET') {
+                if (postCalled && !errorServed) {
+                    errorServed = true;
+                    await route.fulfill({ status: 502, body: 'Bad Gateway' });
+                } else if (postCalled && errorServed) {
+                    await route.fulfill({ status: 200, json: { 'mock-model-1': { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 1000, start_time: 0, state: 'Downloading...' } } });
+                } else {
+                    // Before POST, just return empty so discoverActiveDownloads does nothing
+                    await route.fulfill({ status: 200, json: {} });
+                }
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.goto('/models');
+        
+        const card = page.locator('#model-card-mock-model-1');
+        await card.locator('.btn-download').click();
+
+        await expect(card.locator('.download-stats')).toContainText('Retrying', { timeout: 6000 });
+        await expect(card.locator('.download-stats')).toContainText('50.0%', { timeout: 10000 });
     });
 });

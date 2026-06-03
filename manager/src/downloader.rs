@@ -847,8 +847,14 @@ async fn initiate_request(
             req = req.bearer_auth(token);
         }
 
-        match req.send().await {
-            Ok(r) => {
+        // We cannot use reqwest's built-in global timeout on the Client because it would abort long,
+        // successful streaming downloads. Instead, we wrap the initial `send()` connection phase in a
+        // tokio timeout to ensure we don't hang indefinitely if the server accepts the connection but
+        // never sends the HTTP headers.
+        let timeout_duration =
+            std::time::Duration::from_secs(config.download_stream_chunk_timeout_seconds);
+        match tokio::time::timeout(timeout_duration, req.send()).await {
+            Ok(Ok(r)) => {
                 if r.status().is_redirection()
                     && let Some(location) = r.headers().get(reqwest::header::LOCATION)
                     && let Ok(new_url) = location.to_str()
@@ -914,7 +920,7 @@ async fn initiate_request(
                     return Some((r, current_url));
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 retries += 1;
                 if retries > config.download_retry_max_attempts {
                     error!(
@@ -930,6 +936,29 @@ async fn initiate_request(
                 if let Some(reason) = wait_for_backoff(backoff, shutdown_rx, cancel_rx).await {
                     info!(
                         "{} signal received during network error backoff for {}. Aborting.",
+                        reason, id
+                    );
+                    return None;
+                }
+                backoff = (backoff * 2).min(60);
+                continue;
+            }
+            Err(_) => {
+                retries += 1;
+                if retries > config.download_retry_max_attempts {
+                    error!(
+                        "Max retries reached for connection timeout on {}. Aborting.",
+                        id
+                    );
+                    return None;
+                }
+                warn!(
+                    "Connection timeout for {}. Retrying ({}/{}) in {} seconds...",
+                    id, retries, config.download_retry_max_attempts, backoff
+                );
+                if let Some(reason) = wait_for_backoff(backoff, shutdown_rx, cancel_rx).await {
+                    info!(
+                        "{} signal received during connection timeout backoff for {}. Aborting.",
                         reason, id
                     );
                     return None;
@@ -2061,6 +2090,66 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_initiate_request_timeout() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        use axum::Router;
+
+        // Mock server that hangs (accepts connection but doesn't send headers)
+        let mock_app = Router::new().route(
+            "/{*path}",
+            axum::routing::get(|_req: axum::extract::Request| async move {
+                // Sleep longer than the timeout to trigger it
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .body(axum::body::Body::from("too late"))
+                    .unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        // Use a short timeout
+        let config = crate::AppConfig {
+            download_stream_chunk_timeout_seconds: 1, // 1 second timeout
+            download_retry_max_attempts: 1,           // Retry once to keep the test fast
+            download_retry_backoff_seconds: 1,
+            ..Default::default()
+        };
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/test", port);
+        let id = "test_timeout";
+        let mut existing_size = 0;
+        let active_streams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::broadcast::channel(1);
+
+        let result = super::initiate_request(
+            &client,
+            &url,
+            id,
+            &mut existing_size,
+            &active_streams,
+            &mut shutdown_rx,
+            &mut cancel_rx,
+            None,
+            "http://127.0.0.1",
+            &config,
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "Request should have timed out and returned None after exhausting retries."
+        );
     }
 
     #[tokio::test]
