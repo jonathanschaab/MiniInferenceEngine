@@ -204,6 +204,15 @@ pub async fn perform_model_download(
                         continue;
                     }
 
+                    if !head_res.status().is_success() && !head_res.status().is_redirection() {
+                        warn!(
+                            "Unexpected status code {} during metadata fetch for {}",
+                            head_res.status(),
+                            fname
+                        );
+                        break;
+                    }
+
                     let size_header = head_res
                         .headers()
                         .get("X-Linked-Size")
@@ -1838,6 +1847,160 @@ mod tests {
         // Verify cleanup
         assert!(!tmp_file_path.exists());
         assert!(!meta_file_path.exists());
+        let _ = tokio::fs::remove_dir_all(temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_metadata_fetch_ignores_error_body_size() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        use axum::Router;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        // 1. Mock server that returns a 404 error page for the second chunk
+        let mock_app = Router::new().route(
+            "/{*path}",
+            axum::routing::get(|req: axum::extract::Request| async move {
+                let uri = req.uri().to_string();
+                if uri.contains("00001") {
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 500],
+                            )))
+                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        let _ = tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 500],
+                            )))
+                            .await;
+                        // Keep the stream open a bit longer so the test polling loop can intercept the active state
+                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    });
+                    axum::response::Response::builder()
+                        .header(axum::http::header::CONTENT_LENGTH, "1000")
+                        .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+                        .unwrap()
+                } else {
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::NOT_FOUND)
+                        .header(axum::http::header::CONTENT_LENGTH, "500") // Error page size
+                        .body(axum::body::Body::from("404 Not Found error page body..."))
+                        .unwrap()
+                }
+            })
+            .head(|req: axum::extract::Request| async move {
+                let uri = req.uri().to_string();
+                if uri.contains("00001") {
+                    axum::response::Response::builder()
+                        .header(axum::http::header::CONTENT_LENGTH, "1000")
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                } else {
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::NOT_FOUND)
+                        .header(axum::http::header::CONTENT_LENGTH, "500") // Error page size
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        let temp_dir = std::env::temp_dir().join("test_metadata_error_size");
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+        let config = crate::AppConfig {
+            hf_base_url: format!("http://127.0.0.1:{}", port),
+            downloads_directory: temp_dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+
+        // 2. Setup isolated AppState
+        let (queue_tx, _) = tokio::sync::mpsc::channel(1);
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+        let (_, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
+
+        let state = Arc::new(crate::AppState {
+            queue_tx,
+            engine_status: Arc::new(std::sync::Mutex::new(crate::EngineStatus::default())),
+            telemetry: Arc::new(std::sync::Mutex::new(crate::TelemetryStore::default())),
+            auth_store: Arc::new(std::sync::Mutex::new(crate::auth::AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client: oauth2::basic::BasicClient::new(
+                oauth2::ClientId::new("dummy".to_string()),
+                None,
+                oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+                None,
+            ),
+            config: Arc::new(config),
+            log_buffer: crate::SharedLogBuffer(Arc::new(std::sync::Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle,
+            current_log_level: Arc::new(std::sync::Mutex::new("info".to_string())),
+            active_downloads: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            db,
+            shutdown_tx,
+        });
+
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("test-model".to_string(), crate::DownloadStatus::default());
+        }
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(1);
+
+        let state_clone = state.clone();
+        let task = tokio::spawn(async move {
+            super::perform_model_download(
+                state_clone,
+                "test-model".to_string(),
+                "test/repo".to_string(),
+                "model-00001-of-00002.safetensors".to_string(), // Triggers split file logic
+                shutdown_rx,
+                cancel_rx,
+            )
+            .await;
+        });
+
+        // 3. Poll until bytes_transferred > 0 to intercept the active state
+        let mut total_bytes_observed = 0;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let active = {
+                let dl = state.active_downloads.lock().unwrap();
+                dl.get("test-model").cloned()
+            };
+            if let Some(dl) = active {
+                if dl.total_bytes > 0 {
+                    total_bytes_observed = dl.total_bytes;
+                    break;
+                }
+            }
+        }
+
+        let _ = task.await;
+
+        // 4. Assert that the total bytes size is exactly the size of the valid 1st chunk, completely ignoring the 404 page's 500-byte length
+        assert_eq!(
+            total_bytes_observed, 1000,
+            "Total bytes should be exactly 1000, ignoring the 500 byte error page body."
+        );
+
         let _ = tokio::fs::remove_dir_all(temp_dir).await;
     }
 }

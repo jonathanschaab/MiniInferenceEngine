@@ -244,23 +244,25 @@ impl ModelConfig {
     }
 }
 
-// Detects if a filename is the first chunk of a split GGUF array and generates the full list of files
+// Detects if a filename is the first chunk of a split file array and generates the full list of files
 pub fn get_split_filenames(first_filename: &str) -> Vec<String> {
     let pattern = "-00001-of-";
     if let Some(pos) = first_filename.find(pattern) {
         let prefix = &first_filename[..pos];
         let suffix_start = pos + pattern.len();
-        if let Some(end_pos) = first_filename[suffix_start..].find(".gguf") {
+        if let Some(end_pos) = first_filename[suffix_start..].find('.') {
             let total_str = &first_filename[suffix_start..suffix_start + end_pos];
+            let ext = &first_filename[suffix_start + end_pos..];
             if let Ok(total) = total_str.parse::<usize>() {
                 let mut files = Vec::new();
                 let pad = total_str.len();
                 for i in 1..=total {
                     files.push(format!(
-                        "{}-{:0width$}-of-{}.gguf",
+                        "{}-{:0width$}-of-{}{}",
                         prefix,
                         i,
                         total_str,
+                        ext,
                         width = pad
                     ));
                 }

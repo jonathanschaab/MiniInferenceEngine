@@ -357,10 +357,25 @@ pub(crate) async fn pause_download(
     }
 }
 
+fn is_active_temp_file(
+    file_name: &str,
+    active_expected_bases: &std::collections::HashSet<String>,
+) -> bool {
+    for base in active_expected_bases {
+        if file_name.starts_with(base) {
+            let remainder = &file_name[base.len()..];
+            if [".tmp", ".meta", ".meta.tmp", ".corrupted", ".copy_tmp"].contains(&remainder) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 async fn cleanup_empty_parents(path: &std::path::Path, limit_dir: &std::path::Path) {
     let mut current_dir = path.parent();
     while let Some(parent) = current_dir {
-        if parent == limit_dir {
+        if parent == limit_dir || !parent.starts_with(limit_dir) {
             break;
         }
         if tokio::fs::remove_dir(parent).await.is_err() {
@@ -1508,19 +1523,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if let Some(ext) = path.extension().and_then(|s| s.to_str())
-                                && ["tmp", "meta", "meta.tmp", "corrupted", "copy_tmp"]
-                                    .contains(&ext)
+                                && ["tmp", "meta", "corrupted", "copy_tmp"].contains(&ext)
                                 && let Ok(metadata) = entry.metadata().await
                                 && let Ok(modified) = metadata.modified()
                                 && let Ok(age) = modified.elapsed()
                                 && age.as_secs() > temp_file_retention_secs
                             {
-                                let mut is_active = false;
-                                if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str())
-                                    && active_expected_bases.contains(file_stem)
-                                {
-                                    is_active = true;
-                                }
+                                let is_active = path
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .map(|file_name| {
+                                        is_active_temp_file(file_name, &active_expected_bases)
+                                    })
+                                    .unwrap_or(false);
 
                                 if !is_active {
                                     // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
@@ -2046,6 +2061,28 @@ mod tests {
 
         let query: LogQuery = serde_json::from_str(r#"{"since": 42}"#).unwrap();
         assert_eq!(query.since, Some(42));
+    }
+
+    #[test]
+    fn test_is_active_temp_file() {
+        let mut bases = std::collections::HashSet::new();
+        bases.insert("model.safetensors".to_string());
+        bases.insert("model-00001-of-00002.safetensors".to_string());
+
+        // Exact matches with expected extensions should be active
+        assert!(is_active_temp_file("model.safetensors.tmp", &bases));
+        assert!(is_active_temp_file("model.safetensors.meta", &bases));
+        assert!(is_active_temp_file("model.safetensors.meta.tmp", &bases));
+        assert!(is_active_temp_file("model.safetensors.corrupted", &bases));
+        assert!(is_active_temp_file("model.safetensors.copy_tmp", &bases));
+
+        // Unknown extensions or base names should NOT be active
+        assert!(!is_active_temp_file("model.safetensors.txt", &bases));
+        assert!(!is_active_temp_file("other-model.safetensors.tmp", &bases));
+        assert!(!is_active_temp_file("model.safetensors", &bases)); // No extension
+
+        // Potential collision testing: another model with overlapping prefix
+        assert!(!is_active_temp_file("model.safetensors_v2.tmp", &bases));
     }
 
     use axum::Json;
@@ -2967,5 +3004,56 @@ mod tests {
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all("test_downloads_cancel").await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_empty_parents() {
+        let temp_dir = std::env::temp_dir().join("test_cleanup_parents");
+        let limit_dir = temp_dir.join("limit");
+        let nested_dir = limit_dir.join("a").join("b").join("c");
+
+        // Create the nested structure
+        tokio::fs::create_dir_all(&nested_dir).await.unwrap();
+
+        // Target file path inside 'c'
+        let file_path = nested_dir.join("dummy.txt");
+
+        // Run cleanup starting from the file path
+        cleanup_empty_parents(&file_path, &limit_dir).await;
+
+        // 'c', 'b', and 'a' should be deleted because they are empty
+        assert!(!nested_dir.exists(), "c should be deleted");
+        assert!(
+            !limit_dir.join("a").join("b").exists(),
+            "b should be deleted"
+        );
+        assert!(!limit_dir.join("a").exists(), "a should be deleted");
+
+        // limit_dir should STILL exist
+        assert!(limit_dir.exists(), "limit_dir should NOT be deleted");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_empty_parents_out_of_bounds() {
+        let temp_dir = std::env::temp_dir().join("test_cleanup_oob");
+        let safe_dir = temp_dir.join("safe");
+        let out_of_bounds = temp_dir.join("oob");
+        let nested_oob = out_of_bounds.join("x").join("y");
+
+        tokio::fs::create_dir_all(&safe_dir).await.unwrap();
+        tokio::fs::create_dir_all(&nested_oob).await.unwrap();
+
+        let file_path = nested_oob.join("dummy.txt");
+
+        cleanup_empty_parents(&file_path, &safe_dir).await;
+
+        assert!(
+            nested_oob.exists(),
+            "y should NOT be deleted because it is outside limit_dir bounds"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }
