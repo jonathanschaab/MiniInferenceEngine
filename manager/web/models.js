@@ -12,13 +12,9 @@ async function checkAdmin() {
 
 async function loadModels() {
     try {
-        const [modelsRes, statusRes] = await Promise.all([
-            fetchWithAuth('/api/models'),
-            fetchWithAuth('/api/status')
-        ]);
+        const modelsRes = await fetchWithAuth('/api/models');
         const models = await modelsRes.json();
-        const engineStatus = statusRes.ok ? await statusRes.json() : { model_health: {} };
-        const healthMap = engineStatus.model_health || {};
+        
         const container = document.getElementById('models-container');
         container.innerHTML = '';
 
@@ -37,15 +33,6 @@ async function loadModels() {
 
             const rolesStr = model.roles.join(', ');
             const backendsStr = model.supported_backends.join(', ');
-
-            let healthBadge = '';
-            if (model.id === engineStatus.loading_model_id) {
-                healthBadge = `<span class="badge bg-yellow text-base ml-10" title="Currently loading into VRAM">⏳ Loading</span>`;
-            } else if (healthMap[model.id] === true) {
-                healthBadge = `<span class="badge bg-green text-base ml-10" title="Last run succeeded">✅ Passed</span>`;
-            } else if (healthMap[model.id] === false) {
-                healthBadge = `<span class="badge bg-red text-base ml-10" title="Last run failed">❌ Failed</span>`;
-            }
 
             const corruptedBadge = model.is_corrupted ? `<span class="badge bg-red text-base ml-10" title="A corrupted download file was detected. Please delete to clear it.">⚠️ Corrupted</span>` : '';
 
@@ -67,7 +54,7 @@ async function loadModels() {
             const cardHtml = `
                 <div class="model-header">
                     <div>
-                        <h2 class="model-title ${model.is_downloaded ? 'text-peach' : 'text-overlay0'}">${model.name} ${healthBadge}${corruptedBadge}</h2>
+                        <h2 class="model-title ${model.is_downloaded ? 'text-peach' : 'text-overlay0'}">${model.name} <span id="health-badge-${model.id}"></span>${corruptedBadge}</h2>
                         <p class="model-subtitle">ID: ${model.id} | Repo: <a href="https://huggingface.co/${model.repo}" target="_blank" class="text-blue">${model.repo}</a></p>
                     </div>
                     <div class="model-actions-col">
@@ -104,6 +91,33 @@ async function loadModels() {
 
             container.appendChild(card);
         });
+
+        // Fire off background request for non-critical status badges
+        fetchWithAuth('/api/status')
+            .then(res => res.ok ? res.json() : { model_health: {} })
+            .then(engineStatus => {
+                const healthMap = engineStatus.model_health || {};
+                models.forEach(model => {
+                    let healthBadge = '';
+                    if (model.id === engineStatus.loading_model_id) {
+                        healthBadge = `<span class="badge bg-yellow text-base ml-10" title="Currently loading into VRAM">⏳ Loading</span>`;
+                    } else if (healthMap[model.id] === true) {
+                        healthBadge = `<span class="badge bg-green text-base ml-10" title="Last run succeeded">✅ Passed</span>`;
+                    } else if (healthMap[model.id] === false) {
+                        healthBadge = `<span class="badge bg-red text-base ml-10" title="Last run failed">❌ Failed</span>`;
+                    }
+                    if (healthBadge) {
+                        const badgeSpan = document.getElementById(`health-badge-${model.id}`);
+                        if (badgeSpan) {
+                            badgeSpan.outerHTML = DOMPurify.sanitize(healthBadge);
+                        }
+                    }
+                });
+            })
+            .catch(e => {
+                console.debug("Could not load engine status for badges, defaulting to empty.", e);
+            });
+
     } catch (e) {
         if (e.name === 'TypeError' && e.message === 'Failed to fetch') return; // Ignore browser teardown aborts
         console.error('Failed to load models directory:', e);

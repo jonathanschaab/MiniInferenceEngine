@@ -277,6 +277,20 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         await expect(modelCards.first()).toContainText('Mock Chat Model');
     });
 
+    test('Models Directory renders even if status API fails or is slow', async ({ page }) => {
+        // Mock status API to hang indefinitely to simulate extreme slowness/failure
+        await page.route('**/api/status', () => {
+            // Do not fulfill the route, leaving it hanging
+        });
+
+        await page.goto('/models');
+        
+        const modelCards = page.locator('.model-dir-card');
+        // The models should load immediately without waiting for the status API
+        await expect(modelCards).toHaveCount(2);
+        await expect(modelCards.first()).toContainText('Mock Chat Model');
+    });
+
     test('Chat UI loads existing sessions and allows switching', async ({ page }) => {
         // Mock responses for loading specific sessions
         await page.route('**/api/chat/sessions/session-1*', route => {

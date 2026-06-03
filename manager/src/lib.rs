@@ -1055,8 +1055,10 @@ mod tests {
         let status = Arc::new(Mutex::new(EngineStatus::default()));
         let telemetry = Arc::new(Mutex::new(TelemetryStore::default()));
 
-        let mut custom_config = AppConfig::default();
-        custom_config.downloads_directory = "test_custom_downloads".to_string();
+        let custom_config = AppConfig {
+            downloads_directory: "test_custom_downloads".to_string(),
+            ..Default::default()
+        };
         let app_config = Arc::new(custom_config);
 
         let batcher_handle = tokio::spawn(run_batcher_loop(
@@ -1094,7 +1096,7 @@ mod tests {
             panic!("Expected error event for missing model");
         }
 
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), batcher_handle)
+        tokio::time::timeout(std::time::Duration::from_secs(5), batcher_handle)
             .await
             .expect("Batcher loop hung")
             .expect("Batcher loop panicked");

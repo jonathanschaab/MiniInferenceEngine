@@ -332,17 +332,27 @@ async fn resolve_model_size(
         let local_path = downloads_dir.join(fname);
         if let Ok(meta) = tokio::fs::metadata(&local_path).await {
             total_bytes += meta.len();
-        } else if let Some(gguf_path) = hf_cache
-            .repo(hf_hub::Repo::model(repo.to_string()))
-            .get(fname)
-        {
-            if let Ok(meta) = tokio::fs::metadata(&gguf_path).await {
-                total_bytes += meta.len();
+        } else {
+            let cache_clone = hf_cache.clone();
+            let repo_clone = repo.to_string();
+            let fname_clone = fname.clone();
+            let gguf_path_opt = tokio::task::spawn_blocking(move || {
+                cache_clone
+                    .repo(hf_hub::Repo::model(repo_clone))
+                    .get(&fname_clone)
+            })
+            .await
+            .unwrap_or(None);
+
+            if let Some(gguf_path) = gguf_path_opt {
+                if let Ok(meta) = tokio::fs::metadata(&gguf_path).await {
+                    total_bytes += meta.len();
+                } else {
+                    all_found = false;
+                }
             } else {
                 all_found = false;
             }
-        } else {
-            all_found = false;
         }
     }
 
