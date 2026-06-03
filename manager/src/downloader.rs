@@ -1179,14 +1179,13 @@ async fn finalize_download(
     meta_file_path: &Path,
     hash_mismatch: bool,
 ) {
-    let target_path = if hash_mismatch {
-        file_path.with_file_name(format!(
-            "{}.corrupted",
-            file_path.file_name().unwrap_or_default().to_string_lossy()
-        ))
+    let target_filename = if hash_mismatch {
+        format!("{}.corrupted", filename)
     } else {
-        file_path.to_path_buf()
+        filename.to_string()
     };
+
+    let target_path = file_path.with_file_name(&target_filename);
 
     let mut success = false;
     if let Err(e) = tokio::fs::rename(tmp_file_path, &target_path).await {
@@ -1195,13 +1194,7 @@ async fn finalize_download(
             id, e
         );
 
-        let copy_tmp_path = target_path.with_file_name(format!(
-            "{}.copy_tmp",
-            target_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ));
+        let copy_tmp_path = target_path.with_file_name(format!("{}.copy_tmp", target_filename));
 
         match tokio::fs::copy(tmp_file_path, &copy_tmp_path).await {
             Ok(_) => {
