@@ -619,12 +619,11 @@ async fn download_chunk(
         )
         .await;
 
-        balance_chunk_counters(
-            &shared_downloaded,
-            &session_downloaded,
-            contribution_from_existing,
-            stream_result.streamed_bytes,
-        );
+        // CRITICAL: Do NOT call `balance_chunk_counters` on this success path!
+        // Balancing is only for error/retry paths to prevent double-counting.
+        // Once a chunk succeeds, its bytes are permanently written to disk and must
+        // remain in the global totals, otherwise the UI progress bar will regress.
+
         return hash_mismatch;
     }
 }
@@ -637,6 +636,10 @@ async fn download_chunk(
 /// This function is intentionally separate so the invariant "every fetch_add has a
 /// matching fetch_sub on every exit path" can be unit tested independently of the
 /// async download machinery.
+///
+/// WARNING: Do NOT call this on a successful download path! It is only intended for
+/// `Aborted` and `StreamError` exit paths so that the retry loop can safely re-add
+/// the bytes without double-counting them.
 pub(crate) fn balance_chunk_counters(
     shared_downloaded: &std::sync::atomic::AtomicU64,
     session_downloaded: &std::sync::atomic::AtomicU64,
@@ -1501,7 +1504,7 @@ mod tests {
                     contribution_from_existing,
                 );
             }
-            CounterExit::Aborted | CounterExit::StreamError | CounterExit::Success => {
+            CounterExit::Aborted | CounterExit::StreamError => {
                 // Simulate process_download_stream adding streamed bytes to the counters
                 shared.fetch_add(streamed_bytes, Ordering::Relaxed);
                 session.fetch_add(streamed_bytes, Ordering::Relaxed);
@@ -1511,6 +1514,12 @@ mod tests {
                     contribution_from_existing,
                     streamed_bytes,
                 );
+            }
+            CounterExit::Success => {
+                // Simulate process_download_stream adding streamed bytes to the counters
+                shared.fetch_add(streamed_bytes, Ordering::Relaxed);
+                session.fetch_add(streamed_bytes, Ordering::Relaxed);
+                // On success, we do NOT balance the counters. The bytes are permanently downloaded.
             }
         }
 
@@ -1628,26 +1637,38 @@ mod tests {
     }
 
     #[test]
-    fn test_balance_counters_all_exit_paths_net_zero() {
+    fn test_balance_counters_all_exit_paths() {
         let paths = vec![
-            (CounterExit::InitRequestFail, 0),
-            (CounterExit::OpenFileFail, 0),
-            (CounterExit::Aborted, 50),
-            (CounterExit::StreamError, 25),
-            (CounterExit::Success, 100),
+            (CounterExit::InitRequestFail, 0, true),
+            (CounterExit::OpenFileFail, 0, true),
+            (CounterExit::Aborted, 50, true),
+            (CounterExit::StreamError, 25, true),
+            (CounterExit::Success, 100, false),
         ];
-        for (exit, streamed) in paths {
+        for (exit, streamed, should_be_zero) in paths {
             let (shared, session) = simulate_counter_balance(100, None, streamed, exit);
-            assert_eq!(
-                shared, 0,
-                "shared_downloaded not zero for path {:?} with {} bytes",
-                exit, streamed
-            );
-            assert_eq!(
-                session, 0,
-                "session_downloaded not zero for path {:?} with {} bytes",
-                exit, streamed
-            );
+            if should_be_zero {
+                assert_eq!(
+                    shared, 0,
+                    "shared_downloaded not zero for path {:?} with {} bytes",
+                    exit, streamed
+                );
+                assert_eq!(
+                    session, 0,
+                    "session_downloaded not zero for path {:?} with {} bytes",
+                    exit, streamed
+                );
+            } else {
+                assert_eq!(
+                    shared,
+                    100 + streamed,
+                    "shared_downloaded incorrect for success path"
+                );
+                assert_eq!(
+                    session, streamed,
+                    "session_downloaded incorrect for success path"
+                );
+            }
         }
     }
 
@@ -1666,16 +1687,30 @@ mod tests {
             for streamed in &stream_sizes {
                 for exit in &exits {
                     let (shared, session) = simulate_counter_balance(100, delta, *streamed, *exit);
-                    assert_eq!(
-                        shared, 0,
-                        "shared not zero for delta={:?} streamed={} exit={:?}",
-                        delta, streamed, exit
-                    );
-                    assert_eq!(
-                        session, 0,
-                        "session not zero for delta={:?} streamed={} exit={:?}",
-                        delta, streamed, exit
-                    );
+                    if matches!(exit, CounterExit::Success) {
+                        let expected_shared = 100 - delta.unwrap_or(0) + streamed;
+                        assert_eq!(
+                            shared, expected_shared,
+                            "shared incorrect for delta={:?} streamed={} exit={:?}",
+                            delta, streamed, exit
+                        );
+                        assert_eq!(
+                            session, *streamed,
+                            "session incorrect for delta={:?} streamed={} exit={:?}",
+                            delta, streamed, exit
+                        );
+                    } else {
+                        assert_eq!(
+                            shared, 0,
+                            "shared not zero for delta={:?} streamed={} exit={:?}",
+                            delta, streamed, exit
+                        );
+                        assert_eq!(
+                            session, 0,
+                            "session not zero for delta={:?} streamed={} exit={:?}",
+                            delta, streamed, exit
+                        );
+                    }
                 }
             }
         }
