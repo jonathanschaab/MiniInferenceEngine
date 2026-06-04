@@ -1,6 +1,7 @@
 .vscode/
 node_modules/
 target/
+downloads/
 test-results/
 .git/
 client_secret.*

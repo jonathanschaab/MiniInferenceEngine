@@ -55,11 +55,11 @@ document.addEventListener("DOMContentLoaded", () => {
                     
                     data.logs.forEach(line => {
                         let safe = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-                        safe = safe.replace(/\bERROR\b/, '<span style="color: #f38ba8; font-weight: bold;">ERROR</span>');
-                        safe = safe.replace(/\bWARN\b/, '<span style="color: #f9e2af; font-weight: bold;">WARN</span>');
-                        safe = safe.replace(/\bINFO\b/, '<span style="color: #89b4fa; font-weight: bold;">INFO</span>');
-                        safe = safe.replace(/\bDEBUG\b/, '<span style="color: #a6adc8; font-weight: bold;">DEBUG</span>');
-                        safe = safe.replace(/\bTRACE\b/, '<span style="color: #cba6f7; font-weight: bold;">TRACE</span>');
+                        safe = safe.replace(/\bERROR\b/, '<span class="log-error">ERROR</span>');
+                        safe = safe.replace(/\bWARN\b/, '<span class="log-warn">WARN</span>');
+                        safe = safe.replace(/\bINFO\b/, '<span class="log-info">INFO</span>');
+                        safe = safe.replace(/\bDEBUG\b/, '<span class="log-debug">DEBUG</span>');
+                        safe = safe.replace(/\bTRACE\b/, '<span class="log-trace">TRACE</span>');
                         
                         const div = document.createElement("div");
                         div.innerHTML = safe;

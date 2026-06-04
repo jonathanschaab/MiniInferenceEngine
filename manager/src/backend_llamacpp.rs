@@ -21,8 +21,6 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-const LLAMA_CPP_COMPUTE_MARGIN_BYTES: u64 = 1_500 * 1024 * 1024;
-
 static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 static LLAMA_BACKEND_INIT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -40,7 +38,18 @@ extern "C" fn llama_log_callback(
         return;
     } // Filter out empty lines and progress dots
 
-    match level {
+    // Downgrade harmless, extremely noisy upstream Llama.cpp warnings to DEBUG
+    let mut effective_level = level;
+    if level == llama_cpp_sys_2::GGML_LOG_LEVEL_WARN
+        && (msg.contains("was not control-type; this is probably a bug in the model")
+            || msg.contains("special_eog_ids contains")
+            || msg.contains("the full capacity of the model will not be utilized")
+            || msg.contains("using full-size SWA cache"))
+    {
+        effective_level = llama_cpp_sys_2::GGML_LOG_LEVEL_DEBUG;
+    }
+
+    match effective_level {
         llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR => tracing::error!("llama.cpp: {}", msg),
         llama_cpp_sys_2::GGML_LOG_LEVEL_WARN => tracing::warn!("llama.cpp: {}", msg),
         llama_cpp_sys_2::GGML_LOG_LEVEL_INFO => tracing::info!("llama.cpp: {}", msg),
@@ -59,6 +68,7 @@ self_cell! {
 enum EngineCommand {
     LoadModel {
         config: Box<ModelConfig>,
+        downloads_dir: String,
         status: Arc<Mutex<EngineStatus>>,
         strategy: MemoryStrategy,
         required_ctx: usize,
@@ -273,6 +283,7 @@ impl LlamaCppEngine {
                 match cmd {
                     EngineCommand::LoadModel {
                         config,
+                        downloads_dir,
                         status,
                         strategy,
                         required_ctx,
@@ -281,9 +292,31 @@ impl LlamaCppEngine {
                         let res = (|| -> Result<(usize, f32), String> {
                             let api = Api::new().map_err(|e| e.to_string())?;
                             let repo = api.model(config.repo.clone());
-                            let weights_path = repo
-                                .get(&config.filename)
-                                .map_err(|e| format!("Missing weights: {}", e))?;
+                            let local_weights =
+                                std::path::Path::new(&downloads_dir).join(&config.filename);
+
+                            // Note: We are inside a dedicated OS thread here (`std::thread::spawn`), so blocking I/O is safe.
+                            let weights_path = if local_weights.exists() {
+                                local_weights
+                            } else {
+                                let filenames =
+                                    crate::registry::get_split_filenames(&config.filename);
+                                let mut first_cached_path = None;
+                                for fname in &filenames {
+                                    let cached_path = repo.get(fname).map_err(|e| {
+                                        format!("Missing weights ({}): {}", fname, e)
+                                    })?;
+                                    if first_cached_path.is_none() {
+                                        first_cached_path = Some(cached_path);
+                                    }
+                                }
+                                first_cached_path.ok_or_else(|| {
+                                    format!(
+                                        "Could not find any of the files for model {} in the HF cache: {:?}",
+                                        config.id, filenames
+                                    )
+                                })?
+                            };
 
                             let available_vram =
                                 crate::get_vram_info(nvml.as_ref(), gpu_device_index)
@@ -292,7 +325,8 @@ impl LlamaCppEngine {
 
                             let bytes_per_token = config.estimate_kv_bytes_per_token();
 
-                            let compute_margin: u64 = LLAMA_CPP_COMPUTE_MARGIN_BYTES;
+                            // Llama.cpp defaults to a physical batch size (n_ubatch) of 512.
+                            let compute_margin: u64 = config.estimate_compute_margin_bytes(512);
                             let mut final_ctx_len =
                                 required_ctx.max(2048).min(config.max_context_len);
                             let mut n_gpu_layers = config.num_layers as u32;
@@ -328,13 +362,13 @@ impl LlamaCppEngine {
                                     .saturating_sub(non_layer_weights_est);
                                 n_gpu_layers =
                                     (vram_for_layers / total_cost_per_gpu_layer.max(1)) as u32;
-                                info!(
-                                    "CPU Offloading Active: Fitting {} / {} layers on GPU.",
-                                    n_gpu_layers, config.num_layers
-                                );
                             }
 
                             n_gpu_layers = n_gpu_layers.min(config.num_layers as u32);
+                            info!(
+                                "CPU Offloading Active: Fitting {} / {} layers on GPU.",
+                                n_gpu_layers, config.num_layers
+                            );
                             let offload_pct =
                                 1.0 - (n_gpu_layers as f32 / config.num_layers.max(1) as f32);
                             if offload_pct > 0.0 {
@@ -369,11 +403,17 @@ impl LlamaCppEngine {
                             let model_params = LlamaModelParams::default()
                                 .with_n_gpu_layers(n_gpu_layers)
                                 .with_main_gpu(gpu_device_index as i32);
-                            let model =
-                                LlamaModel::load_from_file(backend, weights_path, &model_params)
-                                    .map_err(|e| {
-                                        format!("Failed to load llama.cpp model: {}", e)
-                                    })?;
+
+                            let model = match LlamaModel::load_from_file(
+                                backend,
+                                &weights_path,
+                                &model_params,
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    return Err(format!("Failed to load llama.cpp model: {}", e));
+                                }
+                            };
 
                             let (vram_used_after, _, vram_free_after) =
                                 crate::get_vram_info(nvml.as_ref(), gpu_device_index)
@@ -388,7 +428,7 @@ impl LlamaCppEngine {
                                     "Model Weights",
                                     weights_vram as i64,
                                 );
-                                s.update_nvml(vram_total, vram_used_after, vram_free_after);
+                                s.update_nvml(vram_total, vram_used_after, vram_free_after, None);
                             }
 
                             if strategy == MemoryStrategy::Compress {
@@ -407,7 +447,7 @@ impl LlamaCppEngine {
                                 );
                                 {
                                     let mut s = crate::types::lock_status(&status);
-                                    s.log_vram("Measure", "LlamaCpp::Plan", &format!("Reserved 1.5GB Compute Margin. Allocating KV Cache for {} tokens.", final_ctx_len), 0);
+                                    s.log_vram("Measure", "LlamaCpp::Plan", &format!("Reserved {:.2}GB Compute Margin. Allocating KV Cache for {} tokens.", compute_margin as f32 / 1024.0 / 1024.0 / 1024.0, final_ctx_len), 0);
                                 }
                             } else {
                                 info!(
@@ -452,7 +492,12 @@ impl LlamaCppEngine {
                                     kv_vram,
                                     compute_margin,
                                 );
-                                s.update_nvml(vram_total, vram_used_after_ctx, vram_free_final);
+                                s.update_nvml(
+                                    vram_total,
+                                    vram_used_after_ctx,
+                                    vram_free_final,
+                                    None,
+                                );
                             }
 
                             instance = Some(inst);
@@ -564,6 +609,7 @@ impl InferenceBackend for LlamaCppEngine {
     async fn load_model(
         &mut self,
         config: &ModelConfig,
+        downloads_dir: &str,
         status: Arc<Mutex<EngineStatus>>,
         strategy: &MemoryStrategy,
         required_ctx: usize,
@@ -572,6 +618,7 @@ impl InferenceBackend for LlamaCppEngine {
         self.command_tx
             .send(EngineCommand::LoadModel {
                 config: Box::new(config.clone()),
+                downloads_dir: downloads_dir.to_string(),
                 status,
                 strategy: strategy.clone(),
                 required_ctx,

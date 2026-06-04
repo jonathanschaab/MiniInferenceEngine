@@ -2,18 +2,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-use hf_hub::api::sync::Api;
 use nvml_wrapper::Nvml;
 use tokenizers::Tokenizer;
 use tracing::{error, info, warn};
-
-const CANDLE_COMPUTE_MARGIN_BYTES: u64 = 500 * 1024 * 1024;
 
 pub mod backend;
 #[cfg(feature = "backend-candle")]
 pub mod backend_candle;
 #[cfg(feature = "backend-llamacpp")]
 pub mod backend_llamacpp;
+pub mod config;
 pub mod registry;
 pub mod telemetry;
 pub mod types;
@@ -23,6 +21,7 @@ pub use backend::*;
 pub use backend_candle::*;
 #[cfg(feature = "backend-llamacpp")]
 pub use backend_llamacpp::*;
+pub use config::AppConfig;
 pub use registry::*;
 pub use telemetry::*;
 pub use types::*;
@@ -33,6 +32,40 @@ pub fn get_vram_info(nvml: Option<&Nvml>, device_index: u32) -> Option<(u64, u64
     let info = device.memory_info().ok()?;
 
     Some((info.used, info.total, info.free))
+}
+
+/// Gets the exact VRAM currently allocated specifically to this Rust process.
+pub fn get_engine_process_vram(nvml: Option<&Nvml>, device_index: u32) -> Option<u64> {
+    use nvml_wrapper::enums::device::UsedGpuMemory;
+    let device = nvml?.device_by_index(device_index).ok()?;
+    let current_pid = std::process::id();
+
+    if let Ok(processes) = device.running_compute_processes() {
+        for process in processes {
+            if process.pid == current_pid {
+                return match process.used_gpu_memory {
+                    UsedGpuMemory::Used(bytes) => Some(bytes),
+                    UsedGpuMemory::Unavailable => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+pub async fn fetch_tokenizer_path(repo: &str) -> Result<std::path::PathBuf, String> {
+    let cache = hf_hub::Cache::default();
+    if let Some(p) = cache
+        .repo(hf_hub::Repo::model(repo.to_string()))
+        .get("tokenizer.json")
+    {
+        return Ok(p);
+    }
+    let api = hf_hub::api::tokio::Api::new().map_err(|e| e.to_string())?;
+    api.model(repo.to_string())
+        .get("tokenizer.json")
+        .await
+        .map_err(|e| e.to_string())
 }
 
 pub async fn wait_for_vram_release(
@@ -78,6 +111,34 @@ fn get_exact_token_count(prompt: &str, tokenizer: &Tokenizer) -> usize {
         .unwrap_or_else(|_| prompt.len() / 4)
 }
 
+pub fn free_model_vram(
+    status: &Arc<Mutex<EngineStatus>>,
+    model_id: &str,
+    offload_pct: f32,
+    nvml: Option<&Nvml>,
+    gpu_device_index: u32,
+) {
+    let mut s = lock_status(status);
+    if offload_pct > 0.0 {
+        s.log_ram(
+            "Free",
+            "Orchestrator",
+            &format!("Released offloaded layers for {}", model_id),
+            0,
+        );
+    }
+    s.remove_model_vram(model_id);
+    s.log_vram(
+        "Free",
+        "Orchestrator",
+        &format!("Released {} from VRAM", model_id),
+        0,
+    );
+    if let Some((used, total, free)) = get_vram_info(nvml, gpu_device_index) {
+        s.update_nvml(total, used, free, None);
+    }
+}
+
 pub enum ActiveBackend {
     #[cfg(feature = "backend-candle")]
     Candle(Box<CandleEngine>),
@@ -89,16 +150,21 @@ impl ActiveBackend {
     pub async fn load_model(
         &mut self,
         config: &ModelConfig,
+        downloads_dir: &str,
         status: Arc<Mutex<EngineStatus>>,
         strategy: &MemoryStrategy,
         required_ctx: usize,
     ) -> Result<usize, String> {
         match self {
             #[cfg(feature = "backend-candle")]
-            ActiveBackend::Candle(b) => b.load_model(config, status, strategy, required_ctx).await,
+            ActiveBackend::Candle(b) => {
+                b.load_model(config, downloads_dir, status, strategy, required_ctx)
+                    .await
+            }
             #[cfg(feature = "backend-llamacpp")]
             ActiveBackend::LlamaCpp(b) => {
-                b.load_model(config, status, strategy, required_ctx).await
+                b.load_model(config, downloads_dir, status, strategy, required_ctx)
+                    .await
             }
         }
     }
@@ -174,6 +240,12 @@ impl ActiveBackend {
     }
 }
 
+/// Helper function to update the health status of a model in the engine status
+pub fn set_model_health(status: &Arc<Mutex<EngineStatus>>, model_id: &str, is_healthy: bool) {
+    let mut s = lock_status(status);
+    s.model_health.insert(model_id.to_string(), is_healthy);
+}
+
 pub fn create_backend(btype: &BackendType, gpu_device_index: u32) -> Result<ActiveBackend, String> {
     match btype {
         #[cfg(feature = "backend-candle")]
@@ -194,7 +266,11 @@ pub async fn run_batcher_loop(
     status: Arc<Mutex<EngineStatus>>,
     telemetry: Arc<Mutex<TelemetryStore>>,
     gpu_device_index: u32,
+    app_config: Arc<AppConfig>,
 ) {
+    let downloads_directory = crate::types::resolve_absolute_path(&app_config.downloads_directory)
+        .to_string_lossy()
+        .to_string();
     let nvml = Nvml::init().ok();
 
     let mut active_model_id = String::new();
@@ -209,6 +285,8 @@ pub async fn run_batcher_loop(
         std::collections::HashMap::new();
 
     info!("ORCHESTRATOR ONLINE: Waiting for requests...");
+
+    let registry = get_model_registry(&app_config).await;
 
     'main: while let Some(request) = receiver.recv().await {
         info!("Processing new chat request...");
@@ -226,11 +304,7 @@ pub async fn run_batcher_loop(
 
         let requested_max_tokens = request.parameters.max_tokens.unwrap_or(500);
         let ctx_buffer = request.parameters.context_buffer.unwrap_or(0);
-        let mut config_for_prompt = match get_model_registry()
-            .await
-            .iter()
-            .find(|c| c.id == request.chat_model_id)
-        {
+        let mut config_for_prompt = match registry.iter().find(|c| c.id == request.chat_model_id) {
             Some(c) => c.clone(),
             None => {
                 let _ = request.responder.send(StreamEvent::Error(
@@ -250,18 +324,19 @@ pub async fn run_batcher_loop(
             Some(tok) => tok.clone(),
             None => {
                 let repo = config_for_prompt.tokenizer_repo.clone();
-                let tok_res = tokio::task::spawn_blocking(move || {
-                    let api = Api::new().map_err(|e| e.to_string())?;
-                    let path = api
-                        .model(repo)
-                        .get("tokenizer.json")
-                        .map_err(|e| e.to_string())?;
-                    Tokenizer::from_file(path).map_err(|e| e.to_string())
-                })
+                let tok_res = async move {
+                    let path = crate::fetch_tokenizer_path(&repo).await?;
+
+                    tokio::task::spawn_blocking(move || {
+                        Tokenizer::from_file(path).map_err(|e| e.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+                }
                 .await;
 
                 match tok_res {
-                    Ok(Ok(tok)) => {
+                    Ok(tok) => {
                         if tokenizer_cache.len() >= 5 {
                             // Simple eviction to prevent memory leak
                             tokenizer_cache.clear();
@@ -354,6 +429,11 @@ pub async fn run_batcher_loop(
         if needs_reload {
             info!("Swapping VRAM to {}...", request.chat_model_id);
 
+            {
+                let mut s = lock_status(&status);
+                s.loading_model_id = Some(request.chat_model_id.clone());
+            }
+
             if let Some(backend) = active_backend.take() {
                 let offload_pct = backend.get_offload_pct();
 
@@ -382,25 +462,13 @@ pub async fn run_batcher_loop(
                 )
                 .await;
 
-                let mut s = lock_status(&status);
-                if offload_pct > 0.0 {
-                    s.log_ram(
-                        "Free",
-                        "Orchestrator",
-                        &format!("Released offloaded layers for {}", active_model_id),
-                        0,
-                    );
-                }
-                s.remove_model_vram(&active_model_id);
-                s.log_vram(
-                    "Free",
-                    "Orchestrator",
-                    &format!("Released {} from VRAM", active_model_id),
-                    0,
+                free_model_vram(
+                    &status,
+                    &active_model_id,
+                    offload_pct,
+                    nvml.as_ref(),
+                    gpu_device_index,
                 );
-                if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), gpu_device_index) {
-                    s.update_nvml(total, used, free);
-                }
             }
 
             // wipe the ID and config so a failed load doesn't leave a poison state
@@ -419,6 +487,10 @@ pub async fn run_batcher_loop(
             let mut backend = match create_backend(&target_btype, gpu_device_index) {
                 Ok(b) => b,
                 Err(e) => {
+                    {
+                        let mut s = lock_status(&status);
+                        s.loading_model_id = None;
+                    }
                     let _ = request
                         .responder
                         .send(StreamEvent::Error(format!("Server Error: {}", e)));
@@ -432,6 +504,7 @@ pub async fn run_batcher_loop(
             let actual_context = match backend
                 .load_model(
                     &config,
+                    &downloads_directory,
                     status.clone(),
                     &active_memory_strategy,
                     target_allocated_ctx,
@@ -441,8 +514,10 @@ pub async fn run_batcher_loop(
                 Ok(ctx) => ctx,
                 Err(e) => {
                     error!("Chat model load failed: {}", e);
+                    set_model_health(&status, &config.id, false);
                     {
                         let mut s = lock_status(&status);
+                        s.loading_model_id = None;
                         s.log_vram(
                             "Fail",
                             "Orchestrator",
@@ -485,8 +560,10 @@ pub async fn run_batcher_loop(
                 active_max_context
             );
 
+            set_model_health(&status, &active_model_id, true);
             {
                 let mut current_status = lock_status(&status);
+                current_status.loading_model_id = None;
                 current_status.active_chat_model_id = Some(active_model_id.clone());
                 current_status.active_backend = Some(target_backend_name);
             }
@@ -515,44 +592,35 @@ pub async fn run_batcher_loop(
         let mut trigger_compression = false;
         let mut dynamic_target_budget = active_max_context;
 
+        let active_backend_ref = match active_backend.as_ref() {
+            Some(b) => b,
+            None => {
+                let _ = request.responder.send(StreamEvent::Error(
+                    "Server Error: Active backend is unexpectedly missing.".to_string(),
+                ));
+                continue 'main;
+            }
+        };
+
         // Use the backend's get_vram_usage if available, otherwise fallback to Orchestrator's NVML
-        let vram_info = active_backend
-            .as_ref()
-            .unwrap()
+        let vram_info = active_backend_ref
             .get_vram_usage()
             .map(|(u, t)| (u, t, t.saturating_sub(u)))
             .or_else(|| get_vram_info(nvml.as_ref(), gpu_device_index));
 
-        let static_alloc = active_backend.as_ref().unwrap().is_statically_allocated();
+        let static_alloc = active_backend_ref.is_statically_allocated();
 
-        if static_alloc {
+        let mut warning_msg = "Prompt + Max Tokens exceeds KV Cache! Triggering compression.";
+        let effective_limit = if static_alloc {
             info!(
                 "MEMORY CHECK: Statically allocated up to {} tokens.",
                 active_max_context
             );
-            if token_count + requested_max_tokens > active_max_context {
-                warn!("Prompt + Max Tokens exceeds KV Cache! Triggering compression.");
-                trigger_compression = true;
-                dynamic_target_budget = active_max_context
-                    .saturating_sub(requested_max_tokens)
-                    .max(256);
-            } else if token_count > (active_max_context as f32 * 0.80) as usize {
-                trigger_compression = true;
-                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(active_max_context);
-            } else if request.force_compression {
-                info!("Benchmarking: Forcing compression execution.");
-                trigger_compression = true;
-                dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(active_max_context);
-            }
+            active_max_context
         } else if let Some((_, _, free_vram)) = vram_info {
-            // This rough heuristic is only for the Candle backend's dynamic memory check.
-            // Llama.cpp calculates this precisely during its static allocation.
             let bytes_per_token = config.estimate_kv_bytes_per_token();
-            let safe_free_vram = free_vram.saturating_sub(CANDLE_COMPUTE_MARGIN_BYTES);
+            let compute_margin = config.estimate_compute_margin_bytes(256);
+            let safe_free_vram = free_vram.saturating_sub(compute_margin);
             let absolute_max_tokens =
                 (safe_free_vram as usize / bytes_per_token).min(active_max_context);
 
@@ -560,45 +628,29 @@ pub async fn run_batcher_loop(
                 "MEMORY CHECK: Free VRAM can hold ~{} tokens.",
                 absolute_max_tokens
             );
-
-            if token_count + requested_max_tokens > absolute_max_tokens {
-                warn!("Prompt exceeds physical VRAM limits! Triggering dynamic compression.");
-                trigger_compression = true;
-                dynamic_target_budget = absolute_max_tokens
-                    .saturating_sub(requested_max_tokens)
-                    .max(256);
-            } else if token_count > (active_max_context as f32 * 0.80) as usize {
-                trigger_compression = true;
-                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(absolute_max_tokens);
-            } else if request.force_compression {
-                info!("Benchmarking: Forcing compression execution.");
-                trigger_compression = true;
-                dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(absolute_max_tokens);
-            }
+            warning_msg = "Prompt exceeds physical VRAM limits! Triggering dynamic compression.";
+            absolute_max_tokens
         } else {
-            // CPU fallback
-            if token_count + requested_max_tokens > active_max_context {
-                warn!("Prompt + Max Tokens exceeds KV Cache! Triggering compression.");
-                trigger_compression = true;
-                dynamic_target_budget = active_max_context
-                    .saturating_sub(requested_max_tokens)
-                    .max(256);
-            } else if token_count > (active_max_context as f32 * 0.80) as usize {
-                trigger_compression = true;
-                dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(active_max_context);
-            } else if request.force_compression {
-                info!("Benchmarking: Forcing compression execution.");
-                trigger_compression = true;
-                dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
-                    .max(256)
-                    .min(active_max_context);
-            }
+            active_max_context
+        };
+
+        if token_count + requested_max_tokens > effective_limit {
+            warn!("{}", warning_msg);
+            trigger_compression = true;
+            dynamic_target_budget = effective_limit
+                .saturating_sub(requested_max_tokens)
+                .max(256);
+        } else if token_count > (active_max_context as f32 * 0.80) as usize {
+            trigger_compression = true;
+            dynamic_target_budget = ((active_max_context as f32 * 0.50) as usize)
+                .max(256)
+                .min(effective_limit);
+        } else if request.force_compression {
+            info!("Benchmarking: Forcing compression execution.");
+            trigger_compression = true;
+            dynamic_target_budget = ((token_count as f32 * 0.50) as usize)
+                .max(256)
+                .min(effective_limit);
         }
 
         if trigger_compression {
@@ -616,8 +668,7 @@ pub async fn run_batcher_loop(
                 s.set_model_status(&active_model_id, "Idle");
             }
 
-            let comp_config = match get_model_registry()
-                .await
+            let comp_config = match registry
                 .iter()
                 .find(|c| c.id == request.compressor_model_id)
             {
@@ -674,20 +725,28 @@ pub async fn run_batcher_loop(
                 }
             };
 
+            {
+                let mut s = lock_status(&status);
+                s.loading_model_id = Some(request.compressor_model_id.clone());
+            }
+
             let comp_required_ctx = (token_count + requested_max_tokens).max(2048) + ctx_buffer;
             // --- RECORD COMPRESSOR LOAD TIME ---
             let comp_load_start = Instant::now();
             if let Err(e) = comp_backend
                 .load_model(
                     &comp_config,
+                    &downloads_directory,
                     status.clone(),
                     &MemoryStrategy::Offload,
                     comp_required_ctx,
                 )
                 .await
             {
+                set_model_health(&status, &comp_config.id, false);
                 {
                     let mut s = lock_status(&status);
+                    s.loading_model_id = None;
                     s.log_vram(
                         "Fail",
                         "Orchestrator",
@@ -721,8 +780,10 @@ pub async fn run_batcher_loop(
                 );
             }
 
+            set_model_health(&status, &request.compressor_model_id, true);
             {
                 let mut current_status = lock_status(&status);
+                current_status.loading_model_id = None;
                 current_status.last_compressor_model_id = Some(request.compressor_model_id.clone());
             }
 
@@ -746,6 +807,7 @@ pub async fn run_batcher_loop(
                             "Server Error: Context compression failed: {}",
                             e
                         )));
+                        set_model_health(&status, &request.compressor_model_id, false);
                         continue 'main;
                     }
                 }
@@ -771,6 +833,7 @@ pub async fn run_batcher_loop(
                             "Server Error: Generation failed: {}",
                             e
                         )));
+                        set_model_health(&status, &request.compressor_model_id, false);
                         continue 'main;
                     }
                 }
@@ -833,29 +896,16 @@ pub async fn run_batcher_loop(
             )
             .await;
 
+            free_model_vram(
+                &status,
+                &request.compressor_model_id,
+                comp_offload_pct,
+                nvml.as_ref(),
+                gpu_device_index,
+            );
+
             {
                 let mut s = lock_status(&status);
-                if comp_offload_pct > 0.0 {
-                    s.log_ram(
-                        "Free",
-                        "Orchestrator",
-                        &format!(
-                            "Released offloaded layers for {}",
-                            request.compressor_model_id
-                        ),
-                        0,
-                    );
-                }
-                s.remove_model_vram(&request.compressor_model_id);
-                s.log_vram(
-                    "Free",
-                    "Orchestrator",
-                    &format!("Released {} from VRAM", request.compressor_model_id),
-                    0,
-                );
-                if let Some((used, total, free)) = get_vram_info(nvml.as_ref(), gpu_device_index) {
-                    s.update_nvml(total, used, free);
-                }
                 // Mark the main chat model as active again now that the compressor is gone
                 s.set_model_status(&active_model_id, "Active");
             }
@@ -888,11 +938,17 @@ pub async fn run_batcher_loop(
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
         let responder = request.responder;
 
-        let gen_fut = active_backend.as_mut().unwrap().generate_stream(
-            &formatted_prompt,
-            &request.parameters,
-            inner_tx,
-        );
+        let backend_mut = match active_backend.as_mut() {
+            Some(b) => b,
+            None => {
+                let _ = responder.send(StreamEvent::Error(
+                    "Server Error: Active backend is unexpectedly missing.".to_string(),
+                ));
+                continue 'main;
+            }
+        };
+
+        let gen_fut = backend_mut.generate_stream(&formatted_prompt, &request.parameters, inner_tx);
 
         // Concurrently run the backend generator and dynamically intercept internal stream
         // events like 'TokenizationTime' so they don't leak into the web HTTP chunked response!
@@ -910,6 +966,7 @@ pub async fn run_batcher_loop(
                     StreamEvent::Error(e) => {
                         terminal_received = true;
                         let _ = responder.send(StreamEvent::Error(e));
+                        set_model_health(&status, &active_model_id, false);
                         break;
                     }
                     other => {
@@ -936,7 +993,10 @@ pub async fn run_batcher_loop(
             "Generation completed in {} ms (Tokenization: {} ms)",
             elapsed, tokenization_time_ms
         );
-        let offload_pct = active_backend.as_ref().unwrap().get_offload_pct();
+        let offload_pct = active_backend
+            .as_ref()
+            .map(|b| b.get_offload_pct())
+            .unwrap_or(0.0);
         if let Ok(mut t) = telemetry.lock() {
             t.record_generation(
                 active_model_id.clone(),
@@ -987,5 +1047,58 @@ mod tests {
         assert!(nvml.is_some(), "NVML must init on test runner with GPU");
         let info = get_vram_info(nvml.as_ref(), 0);
         assert!(info.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_run_batcher_loop_respects_config() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let status = Arc::new(Mutex::new(EngineStatus::default()));
+        let telemetry = Arc::new(Mutex::new(TelemetryStore::default()));
+
+        let custom_config = AppConfig {
+            downloads_directory: "test_custom_downloads".to_string(),
+            ..Default::default()
+        };
+        let app_config = Arc::new(custom_config);
+
+        let batcher_handle = tokio::spawn(run_batcher_loop(
+            rx,
+            status.clone(),
+            telemetry.clone(),
+            0,
+            app_config.clone(),
+        ));
+
+        let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let req = UserRequest {
+            chat_model_id: "missing-model".to_string(),
+            compressor_model_id: "missing-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+            responder: resp_tx,
+            force_compression: false,
+            parameters: GenerationParameters::default(),
+            target_backend: None,
+        };
+
+        let _ = tx.send(req).await;
+        drop(tx);
+
+        if let Some(StreamEvent::Error(msg)) = resp_rx.recv().await {
+            assert!(
+                msg.contains("missing from registry"),
+                "Unexpected error message: {}",
+                msg
+            );
+        } else {
+            panic!("Expected error event for missing model");
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), batcher_handle)
+            .await
+            .expect("Batcher loop hung")
+            .expect("Batcher loop panicked");
     }
 }

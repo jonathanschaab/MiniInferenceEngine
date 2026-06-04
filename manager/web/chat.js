@@ -16,6 +16,7 @@ const SESSION_LIMIT = 20;
 let sessionOffset = 0;
 let hasMoreSessions = false;
 let isLoadingSessions = false;
+let allModels = [];
 
 const chatScrollObserver = new IntersectionObserver((entries) => {
     if (entries[0].isIntersecting && hasMoreMessages && !isLoadingMessages && currentSessionId) {
@@ -105,8 +106,16 @@ async function updateStatus() {
     try {
         const res = await fetchWithAuth('/api/status');
         const status = await res.json();
-        if (status.active_backend) {
-            document.getElementById('engine-status-indicator').textContent = `(${status.active_backend})`;
+        const indicator = document.getElementById('engine-status-indicator');
+        if (status.loading_model_id) {
+            indicator.textContent = `(Loading...)`;
+            indicator.className = 'status text-yellow';
+        } else if (status.active_backend) {
+            indicator.textContent = `(${status.active_backend})`;
+            indicator.className = 'status text-green';
+        } else {
+            indicator.textContent = '';
+            indicator.className = 'status';
         }
     } catch (e) {
         console.warn("Failed to update engine status", e);
@@ -126,6 +135,7 @@ async function initializeUI() {
         let models = [];
         if (modelsResult.status === 'fulfilled') {
             models = modelsResult.value;
+            allModels = models;
         } else {
             console.error("Critical: Failed to fetch models.", modelsResult.reason);
             appendMessage("System Error: Could not connect to the model registry.", false);
@@ -207,12 +217,13 @@ function updateDropdownCompatibility() {
         Array.from(chatSelect.options).forEach(opt => {
             const supported = opt.dataset.backends && opt.dataset.backends.split(',').includes(selectedBackend);
             opt.disabled = !supported;
+            opt.title = supported ? '' : 'Incompatible with selected backend';
         });
-        if (chatSelect.options[chatSelect.selectedIndex]?.disabled) {
-            chatSelect.value = Array.from(chatSelect.options).find(o => !o.disabled)?.value || '';
-        }
     } else {
-        Array.from(chatSelect.options).forEach(opt => opt.disabled = false);
+        Array.from(chatSelect.options).forEach(opt => {
+            opt.disabled = false;
+            opt.title = '';
+        });
     }
 
     // 2. Filter backends based on selected Chat model
@@ -221,16 +232,17 @@ function updateDropdownCompatibility() {
     const chatBackends = chatOpt && chatOpt.dataset.backends ? chatOpt.dataset.backends.split(',') : [];
 
     Array.from(backendSelect.options).forEach(opt => {
-        if (opt.value === '') { opt.disabled = false; return; } // Auto is always allowed
+        if (opt.value === '') { 
+            opt.disabled = false; 
+            opt.title = '';
+            return; 
+        } // Auto is always allowed
         
         let supported = chatOpt && chatBackends.includes(opt.value);
         
         opt.disabled = !supported;
+        opt.title = supported ? '' : 'Incompatible with selected chat model';
     });
-    if (backendSelect.options[backendSelect.selectedIndex]?.disabled) {
-        backendSelect.value = ''; // Fallback to Auto
-        Array.from(chatSelect.options).forEach(opt => opt.disabled = false);
-    }
 }
 
 async function loadSessions() {
@@ -292,10 +304,7 @@ function renderSessionList(sessions) {
     if (hasMoreSessions) {
         const sentinel = document.createElement('div');
         sentinel.id = 'session-sentinel';
-        sentinel.style.padding = '10px';
-        sentinel.style.textAlign = 'center';
-        sentinel.style.color = '#6c7086';
-        sentinel.style.fontSize = '0.85rem';
+        sentinel.className = 'session-sentinel';
         sentinel.textContent = 'Loading more...';
         list.appendChild(sentinel);
         sessionScrollObserver.observe(sentinel);
@@ -324,7 +333,7 @@ function createSessionElement(s) {
     infoDiv.appendChild(dateDiv);
 
     const actionsDiv = document.createElement('div');
-    actionsDiv.style.whiteSpace = 'nowrap';
+    actionsDiv.className = 'whitespace-nowrap';
 
     const editBtn = document.createElement('button');
     editBtn.className = 'session-action-btn';
@@ -459,10 +468,7 @@ function prependMessagesToUI(messages) {
     if (hasMoreMessages) {
         const sentinel = document.createElement('div');
         sentinel.id = 'chat-sentinel';
-        sentinel.style.padding = '10px';
-        sentinel.style.textAlign = 'center';
-        sentinel.style.color = '#6c7086';
-        sentinel.style.fontSize = '0.9rem';
+        sentinel.className = 'chat-sentinel';
         sentinel.textContent = 'Loading older messages...';
         fragment.appendChild(sentinel);
         chatScrollObserver.observe(sentinel);
@@ -478,7 +484,7 @@ function prependMessagesToUI(messages) {
     chatContainer.prepend(fragment);
 }
 
-window.startNewSession = function() {
+function startNewSession() {
     chatScrollObserver.disconnect();
     currentSessionId = "";
     currentSessionTitle = "";
@@ -495,7 +501,7 @@ inputField.addEventListener('input', function() {
     this.style.height = (this.scrollHeight) + 'px';
 });
 
-window.clearChat = async function() {
+async function clearChat() {
     if (chatHistory.length === 0) {
         startNewSession();
         return;
@@ -563,19 +569,122 @@ async function truncateMessagesInDB(fromIndex) {
     } catch(e) { console.error("Failed to truncate messages", e); }
 }
 
+async function startChatDownload(modelId, modelName) {
+    const div = document.createElement('div');
+    div.className = 'message ai-message';
+
+    const titleDiv = document.createElement('div');
+    titleDiv.textContent = 'Downloading ';
+    const strong = document.createElement('strong');
+    strong.textContent = modelName;
+    titleDiv.appendChild(strong);
+    titleDiv.appendChild(document.createTextNode('...'));
+
+    const containerDiv = document.createElement('div');
+    containerDiv.className = 'download-progress-container';
+    containerDiv.classList.add('mt-10');
+
+    const barWrapper = document.createElement('div');
+    barWrapper.className = 'dl-bar-wrapper';
+    
+    const bar = document.createElement('div');
+    bar.id = `dl-bar-${modelId}`; // Direct property assignment is inherently safe from HTML breakouts
+    bar.className = 'dl-bar';
+    barWrapper.appendChild(bar);
+
+    const statsRow = document.createElement('div');
+    statsRow.className = 'dl-stats-row';
+
+    const statsText = document.createElement('div');
+    statsText.id = `dl-stats-${modelId}`;
+    statsText.className = 'dl-stats-text';
+    statsText.textContent = 'Starting...';
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'dl-btn-row';
+
+    const pauseBtn = document.createElement('button');
+    pauseBtn.id = `dl-pause-${modelId}`;
+    pauseBtn.className = 'dl-pause-btn';
+    pauseBtn.textContent = 'Pause';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.id = `dl-cancel-${modelId}`;
+    cancelBtn.className = 'dl-cancel-btn';
+    cancelBtn.textContent = 'Cancel';
+
+    btnRow.appendChild(pauseBtn);
+    btnRow.appendChild(cancelBtn);
+    statsRow.appendChild(statsText);
+    statsRow.appendChild(btnRow);
+    containerDiv.appendChild(barWrapper);
+    containerDiv.appendChild(statsRow);
+    
+    div.appendChild(titleDiv);
+    div.appendChild(containerDiv);
+
+    chatContainer.appendChild(div);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+
+    const dl = downloadModel(modelId, {
+        onProgress: (status, pct, speedMB, transMB, totalMB, etaStr) => {
+            const bar = document.getElementById(`dl-bar-${modelId}`);
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (bar) bar.style.width = `${pct}%`;
+            if (stats) {
+                if (status.state === 'Queued...') {
+                    stats.innerHTML = `<span class="text-yellow">Queued...</span> <a href="/queue" class="text-blue no-underline ml-5">(View Queue)</a>`;
+                } else if (status.state !== 'Downloading...') {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) | ${status.state}`;
+                } else {
+                    stats.innerText = `${pct.toFixed(1)}% (${transMB} / ${totalMB} MB) @ ${speedMB} MB/s | ETA: ${etaStr}`;
+                }
+            }
+        },
+        onStatusText: (text) => {
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (stats) {
+                if (text === 'Queued...') {
+                    stats.innerHTML = `<span class="text-yellow">Queued...</span> <a href="/queue" class="text-blue no-underline ml-5">(View Queue)</a>`;
+                } else {
+                    stats.innerText = text;
+                }
+            }
+        },
+        onComplete: () => {
+            const bar = document.getElementById(`dl-bar-${modelId}`);
+            const stats = document.getElementById(`dl-stats-${modelId}`);
+            if (bar) bar.style.width = '100%';
+            if (stats) stats.innerText = 'Download Complete!';
+            if (cancelBtn) cancelBtn.style.display = 'none';
+            if (pauseBtn) pauseBtn.style.display = 'none';
+        }
+    });
+
+    cancelBtn.addEventListener('click', () => {
+        dl.cancel();
+    });
+    pauseBtn.addEventListener('click', () => {
+        dl.pause();
+    });
+
+    await dl.promise;
+}
+
+/**
+ * Resets the chat UI state after generation or upon failure.
+ */
+function resetChatUI() {
+    typingIndicator.style.display = 'none';
+    sendBtn.style.display = 'inline-flex';
+    stopBtn.style.display = 'none';
+    if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
+    sendBtn.disabled = false;
+}
+
 async function sendMessage() {
     const text = inputField.value.trim();
     if (!text) return;
-
-    // Grab the IDs from the UI dropdowns
-    const chatModelId = document.getElementById('chat-model-select').value;
-    const compModelId = document.getElementById('compressor-model-select').value;
-    const targetBackend = document.getElementById('backend-select').value;
-
-    if (!chatModelId || !compModelId) {
-        alert("Please select a valid chat model and compressor model. Check your backend compatibility if options are disabled.");
-        return;
-    }
 
     await ensureSession(text);
 
@@ -586,11 +695,51 @@ async function sendMessage() {
     
     inputField.value = '';
     inputField.style.height = 'auto'; 
+
+    await requestAiResponse();
+}
+
+async function requestAiResponse() {
+    // Grab the IDs from the UI dropdowns
+    const chatSelect = document.getElementById('chat-model-select');
+    const backendSelect = document.getElementById('backend-select');
+    const chatModelId = chatSelect.value;
+    const compModelId = document.getElementById('compressor-model-select').value;
+
+    const targetBackend = backendSelect.value;
+
+    if (!chatModelId || !compModelId || 
+        chatSelect.options[chatSelect.selectedIndex]?.disabled || 
+        backendSelect.options[backendSelect.selectedIndex]?.disabled) {
+        alert("Please select a valid chat model and compressor model. Check your backend compatibility if options are disabled.");
+        return;
+    }
+
+    const chatModel = allModels.find(m => m.id === chatModelId);
+    const compModel = allModels.find(m => m.id === compModelId);
+
     sendBtn.disabled = true;
     sendBtn.style.display = 'none';
     stopBtn.style.display = 'inline-flex';
     regenBtn.style.display = 'none';
     typingIndicator.style.display = 'block';
+    
+    if (chatModel && !chatModel.is_downloaded) {
+        try { await startChatDownload(chatModel.id, chatModel.name); chatModel.is_downloaded = true; } 
+        catch (e) {
+            console.error("Chat model download failed:", e);
+            resetChatUI();
+            return;
+        }
+    }
+    if (compModel && !compModel.is_downloaded) {
+        try { await startChatDownload(compModel.id, compModel.name); compModel.is_downloaded = true; } 
+        catch (e) {
+            console.error("Compressor model download failed:", e);
+            resetChatUI();
+            return;
+        }
+    }
     
     currentAbortController = new AbortController();
 
@@ -654,16 +803,12 @@ async function sendMessage() {
             updateStatus();
             await appendMessageToDB("assistant", aiMessageDiv.textContent, aiIndex);
         } else {
-            typingIndicator.style.display = 'none';
             aiMessageDiv.textContent = "Error: Failed to connect to engine.";
             chatHistory.pop(); 
         }
     }
     
-    sendBtn.style.display = 'inline-flex';
-    stopBtn.style.display = 'none';
-    if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
-    sendBtn.disabled = false;
+    resetChatUI();
     inputField.focus();
     currentAbortController = null;
     
@@ -686,15 +831,12 @@ async function regenerateLast() {
     if (chatHistory[chatHistory.length - 1].role === 'assistant') {
         chatHistory.pop();
         chatContainer.removeChild(chatContainer.lastChild);
+        await truncateMessagesInDB(chatHistory.length);
     }
     
-    // Remove the user's last message, place it in the input box, and immediately re-send
+    // If the last remaining message is from the user, request a new response
     if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'user') {
-        const lastUserMsg = chatHistory.pop();
-        chatContainer.removeChild(chatContainer.lastChild);
-        await truncateMessagesInDB(chatHistory.length);
-        inputField.value = lastUserMsg.content;
-        sendMessage();
+        await requestAiResponse();
     }
 }
 
@@ -710,3 +852,19 @@ inputField.addEventListener('keydown', (e) => {
         sendMessage();
     }
 });
+
+setInterval(updateStatus, 2000);
+
+// Bind top-level buttons
+document.getElementById('toggle-parameters-btn')?.addEventListener('click', () => {
+    const panel = document.getElementById('parameters-panel');
+    panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+});
+document.getElementById('clear-chat-btn')?.addEventListener('click', clearChat);
+document.getElementById('param-temp')?.addEventListener('input', function() {
+    document.getElementById('val-temp').innerText = this.value;
+});
+document.getElementById('param-top-p')?.addEventListener('input', function() {
+    document.getElementById('val-top-p').innerText = this.value;
+});
+document.getElementById('new-chat-btn')?.addEventListener('click', startNewSession);

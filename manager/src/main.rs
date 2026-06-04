@@ -3,12 +3,12 @@ use axum::{
     Json,
     body::Body,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::StatusCode,
     http::header,
-    response::{Html, IntoResponse, Redirect},
+    middleware::Next,
+    response::{Html, IntoResponse, Redirect, Response},
 };
-use hf_hub::api::sync::Api;
 use oauth2::basic::BasicClient;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -23,131 +23,22 @@ use tracing::{error, info, warn}; // Ensure this is imported for AppState
 use tracing_subscriber::EnvFilter;
 
 use manager::{
-    ApiRequest, BenchmarkRequest, EngineStatus, Message, ModelArch, ModelConfig, ModelRole,
-    StreamEvent, TelemetryStore, UserRequest, get_model_registry, lock_status, run_batcher_loop,
+    ApiRequest, AppConfig, BenchmarkRequest, DownloadStatus, EngineStatus, Message, ModelArch,
+    ModelConfig, ModelRole, StreamEvent, TelemetryStore, UserRequest, get_model_registry,
+    lock_mutex, lock_status, run_batcher_loop,
 };
 
-// --- CONFIGURATION ---
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct DatabaseConfig {
-    pub url: String,
-    pub jwt_file_path: String,
-    pub namespace: String,
-    pub database: String,
-}
-
-impl Default for DatabaseConfig {
-    fn default() -> Self {
-        Self {
-            url: "ws://localhost:8001".to_string(),
-            jwt_file_path: "database.jwt".to_string(),
-            namespace: "mini_inference_engine".to_string(),
-            database: "main".to_string(),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct AppConfig {
-    pub bind_address: String,
-    pub oauth_redirect_uri: String,
-    #[serde(default = "default_oauth_client_secret_path")]
-    pub oauth_client_secret_path: String,
-    #[serde(default = "default_oauth_auth_url")]
-    pub oauth_auth_url: String,
-    #[serde(default = "default_oauth_token_url")]
-    pub oauth_token_url: String,
-    #[serde(default = "default_oauth_userinfo_url")]
-    pub oauth_userinfo_url: String,
-    pub admin_emails: Vec<String>,
-    pub user_emails: Vec<String>,
-    pub secure_cookies: bool,
-    #[serde(default)]
-    pub gpu_device_index: u32,
-    #[serde(default = "default_telemetry_retention_days")]
-    pub telemetry_retention_days: u64,
-    #[serde(default = "default_log_level_console")]
-    pub log_level_console: String,
-    #[serde(default = "default_log_level_file")]
-    pub log_level_file: String,
-    #[serde(default = "default_log_level_memory")]
-    pub log_level_memory: String,
-    #[serde(default = "default_log_file_name")]
-    pub log_file_name: String,
-    #[serde(default)]
-    pub database: DatabaseConfig,
-}
-
-fn default_log_level_console() -> String {
-    "info".to_string()
-}
-fn default_log_level_file() -> String {
-    "warn".to_string()
-}
-fn default_log_level_memory() -> String {
-    "debug".to_string()
-}
-fn default_log_file_name() -> String {
-    "server.log".to_string()
-}
-fn default_oauth_client_secret_path() -> String {
-    "client_secret.apps.googleusercontent.com.json".to_string()
-}
-fn default_oauth_auth_url() -> String {
-    "https://accounts.google.com/o/oauth2/v2/auth".to_string()
-}
-fn default_oauth_token_url() -> String {
-    "https://oauth2.googleapis.com/token".to_string()
-}
-fn default_oauth_userinfo_url() -> String {
-    "https://www.googleapis.com/oauth2/v2/userinfo".to_string()
-}
-fn default_telemetry_retention_days() -> u64 {
-    30
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            bind_address: "127.0.0.1:3000".to_string(), // Secure local default
-            oauth_redirect_uri: "http://localhost:3000/auth/google/callback".to_string(),
-            oauth_client_secret_path: default_oauth_client_secret_path(),
-            oauth_auth_url: default_oauth_auth_url(),
-            oauth_token_url: default_oauth_token_url(),
-            oauth_userinfo_url: default_oauth_userinfo_url(),
-            admin_emails: vec![],
-            user_emails: vec![],
-            secure_cookies: true,
-            gpu_device_index: 0,
-            telemetry_retention_days: default_telemetry_retention_days(),
-            log_level_console: default_log_level_console(),
-            log_level_file: default_log_level_file(),
-            log_level_memory: default_log_level_memory(),
-            log_file_name: default_log_file_name(),
-            database: DatabaseConfig::default(),
-        }
-    }
-}
-
-impl AppConfig {
-    pub fn load() -> Self {
-        if let Ok(data) = std::fs::read_to_string("config.toml") {
-            toml::from_str(&data).unwrap_or_default()
-        } else if let Ok(data) = std::fs::read_to_string("config.json") {
-            // Fallback for backwards compatibility, but save as TOML going forward
-            let config: Self = serde_json::from_str(&data).unwrap_or_default();
-            let _ = std::fs::write("config.toml", toml::to_string_pretty(&config).unwrap());
-            config
-        } else {
-            let config = Self::default();
-            let _ = std::fs::write("config.toml", toml::to_string_pretty(&config).unwrap());
-            config
-        }
-    }
-}
+// --- CONSTANTS ---
+const TELEMETRY_CLEANUP_INTERVAL_SECS: u64 = 24 * 3600;
+const TEMP_FILE_CLEANUP_INTERVAL_SECS: u64 = 12 * 3600;
+const VRAM_TRACKER_INTERVAL_SECS: u64 = 1;
+const WATCHER_DEBOUNCE_INTERVAL_MILLIS: u64 = 1000;
+const WATCHER_REFRESH_INTERVAL_SECS: u64 = 300;
+const FALLBACK_REFRESH_INTERVAL_SECS: u64 = 30;
+const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 
 pub mod auth;
+pub mod downloader;
 pub mod setup;
 
 // --- SHARED MEMORY LOG WRITER ---
@@ -174,7 +65,7 @@ impl Drop for SharedLogWriter {
         let s = String::from_utf8_lossy(&self.local_buf);
         let trimmed = s.trim_end();
         if !trimmed.is_empty() {
-            let mut guard = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = lock_mutex(&self.buffer);
             guard.1.push_back(trimmed.to_string());
             guard.0 += 1; // Increment the global cursor counter
             if guard.1.len() > 1000 {
@@ -197,6 +88,11 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
 pub type LogReloadHandle =
     tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
 
+pub type DownloadTaskInfo = (
+    tokio::sync::broadcast::Sender<()>,
+    tokio::task::JoinHandle<()>,
+);
+
 // State to share the transmitter queue across web requests
 pub struct AppState {
     pub queue_tx: mpsc::Sender<UserRequest>,
@@ -209,21 +105,91 @@ pub struct AppState {
     pub log_buffer: SharedLogBuffer,
     pub log_reload_handle: LogReloadHandle,
     pub current_log_level: Arc<Mutex<String>>,
+    pub active_downloads: Arc<Mutex<std::collections::HashMap<String, DownloadStatus>>>,
+    pub download_tasks: Arc<Mutex<std::collections::HashMap<String, DownloadTaskInfo>>>,
+    pub download_semaphore: Arc<tokio::sync::Semaphore>,
     pub db: surrealdb::Surreal<surrealdb::engine::any::Any>,
+    pub shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
-pub(crate) async fn serve_ui(
-    session: tower_sessions::Session,
-) -> Result<Html<&'static str>, Redirect> {
-    if require_session(session).await.is_err() {
-        return Err(Redirect::to("/auth/login"));
+async fn csp_middleware(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    // Strict CSP: Disallows inline scripts and styles, preventing XSS.
+    let csp = "default-src 'self'; script-src 'self' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:;";
+    if let Ok(val) = axum::http::HeaderValue::from_str(csp) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, val);
     }
-    Ok(Html(include_str!("../index.html")))
+    response
+}
+
+macro_rules! require_admin {
+    ($user:expr, $msg:expr) => {
+        if !$user.is_admin {
+            return (StatusCode::FORBIDDEN, $msg).into_response();
+        }
+    };
+}
+
+macro_rules! serve_html {
+    ($name:ident, $path:expr) => {
+        pub(crate) async fn $name(
+            session: tower_sessions::Session,
+        ) -> Result<Html<&'static str>, Redirect> {
+            if require_session(session).await.is_err() {
+                return Err(Redirect::to("/auth/login"));
+            }
+            Ok(Html(include_str!($path)))
+        }
+    };
+}
+
+macro_rules! serve_static {
+    ($name:ident, $content_type:expr, $path:expr) => {
+        pub(crate) async fn $name() -> impl IntoResponse {
+            ([(header::CONTENT_TYPE, $content_type)], include_str!($path))
+        }
+    };
+}
+
+serve_html!(serve_ui, "../web/index.html");
+serve_html!(serve_queue_ui, "../web/queue.html");
+serve_static!(serve_queue_js, "application/javascript", "../web/queue.js");
+
+fn apply_model_status_flags(model: &mut ModelConfig, status: &EngineStatus) {
+    model.is_downloaded = status.downloaded_models.contains(&model.id);
+    model.is_in_hf_cache = status.cached_models.contains(&model.id);
+    model.is_corrupted = status.corrupted_models.contains(&model.id);
 }
 
 // Send the model roster to the Javascript dropdowns
-pub(crate) async fn get_models() -> Json<Vec<ModelConfig>> {
-    Json(get_model_registry().await)
+pub(crate) async fn get_models(State(state): State<Arc<AppState>>) -> Json<Vec<ModelConfig>> {
+    let mut models = get_model_registry(&state.config).await;
+    let status = lock_status(&state.engine_status);
+
+    for model in &mut models {
+        apply_model_status_flags(model, &status);
+    }
+
+    Json(models)
+}
+
+// Fetch a single model by ID
+pub(crate) async fn get_model(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ModelConfig>, StatusCode> {
+    let models = get_model_registry(&state.config).await;
+    let mut model = models
+        .into_iter()
+        .find(|m| m.id == id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let status = lock_status(&state.engine_status);
+    apply_model_status_flags(&mut model, &status);
+
+    Ok(Json(model))
 }
 
 // Handle incoming chat requests
@@ -267,6 +233,385 @@ pub(crate) async fn get_status(State(state): State<Arc<AppState>>) -> Json<Engin
     Json(current_status)
 }
 
+// Retrieve the progress of all active downloads
+pub(crate) async fn get_download_progress(
+    State(state): State<Arc<AppState>>,
+) -> Json<std::collections::HashMap<String, DownloadStatus>> {
+    let downloads = lock_mutex(&state.active_downloads).clone();
+    Json(downloads)
+}
+
+#[derive(Deserialize)]
+pub struct DownloadRequest {
+    pub model_id: String,
+}
+
+// Start a background streaming download
+pub(crate) async fn trigger_download(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Json(payload): Json<DownloadRequest>,
+) -> impl IntoResponse {
+    require_admin!(user, "Admin access required for downloading");
+
+    let id = payload.model_id;
+
+    {
+        // CRITICAL: This explicit VRAM check is not just for user experience; it prevents fatal OS-level errors.
+        // Because the inference backends use memory-mapped files (mmap) for the model weights,
+        // the OS keeps the file descriptor active as long as the model is loaded in VRAM.
+        // If a user manually deletes the file from disk, the background file watcher will remove it from `downloaded_models`.
+        // Without this check, a re-download would be allowed, and attempting to overwrite the active memory-mapped file
+        // would cause a "Text file busy" error or a segmentation fault crashing the entire engine.
+        let status = lock_status(&state.engine_status);
+        if status.is_model_in_use(&id) {
+            return (
+                StatusCode::CONFLICT,
+                "Cannot download a model that is currently loaded or being loaded in VRAM. Please load a different model first.",
+            )
+                .into_response();
+        }
+    }
+
+    let registry = get_model_registry(&state.config).await;
+    let model = match registry.into_iter().find(|m| m.id == id) {
+        Some(m) => m,
+        None => return (StatusCode::NOT_FOUND, "Model not found").into_response(),
+    };
+
+    let is_downloaded = {
+        let status = lock_status(&state.engine_status);
+        status.downloaded_models.contains(&id)
+    };
+
+    if is_downloaded {
+        return (StatusCode::CONFLICT, "Model is already downloaded").into_response();
+    }
+
+    let downloads_dir = manager::types::resolve_absolute_path(&state.config.downloads_directory);
+    let filenames = manager::get_split_filenames(&model.filename);
+    for fname in filenames {
+        let corrupted_path = downloads_dir.join(format!("{}.corrupted", fname));
+        if let Ok(true) = tokio::fs::try_exists(&corrupted_path).await {
+            return (StatusCode::UNPROCESSABLE_ENTITY, "A corrupted download for this model already exists on disk. Please contact an admin to verify it or delete the model to try again.").into_response();
+        }
+    }
+
+    {
+        let mut downloads = lock_mutex(&state.active_downloads);
+        if downloads.contains_key(&id) {
+            return (StatusCode::CONFLICT, "Download already in progress").into_response();
+        }
+        downloads.insert(
+            id.clone(),
+            DownloadStatus {
+                bytes_transferred: 0,
+                total_bytes: 0,
+                start_time: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                current_speed_bps: 0.0,
+                state: "Queued...".to_string(),
+            },
+        );
+    }
+
+    let state_clone = state.clone();
+    let id_clone = id.clone();
+    let repo = model.repo.clone();
+    let filename = model.filename.clone();
+    let shutdown_rx = state.shutdown_tx.subscribe();
+    let (cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(16);
+
+    let task = tokio::spawn(async move {
+        downloader::perform_model_download(
+            state_clone,
+            id_clone,
+            repo,
+            filename,
+            shutdown_rx,
+            cancel_rx,
+        )
+        .await;
+    });
+
+    lock_mutex(&state.download_tasks).insert(id.clone(), (cancel_tx, task));
+
+    (StatusCode::ACCEPTED, format!("Download started for {}", id)).into_response()
+}
+
+// Pause an active download without deleting the partial files
+pub(crate) async fn pause_download(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    require_admin!(user, "Admin access required for pausing downloads");
+
+    if abort_download_task(&state, &id).await {
+        info!("Aborted active download task for model {} (Paused)", id);
+        (StatusCode::OK, "Download paused").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "No active download to pause").into_response()
+    }
+}
+
+fn is_active_temp_file(
+    file_name: &str,
+    active_expected_bases: &std::collections::HashSet<String>,
+) -> bool {
+    for base in active_expected_bases {
+        if file_name.starts_with(base) {
+            let remainder = &file_name[base.len()..];
+            if [".tmp", ".meta", ".meta.tmp", ".corrupted", ".copy_tmp"].contains(&remainder) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) async fn sweep_temp_files(
+    downloads_dir: &std::path::Path,
+    active_downloads: &std::sync::Mutex<std::collections::HashMap<String, DownloadStatus>>,
+    config: &AppConfig,
+) {
+    let temp_file_retention_secs = config.temp_file_retention_days * 24 * 3600;
+    if temp_file_retention_secs == 0 {
+        return;
+    }
+
+    let registry = manager::get_model_registry(config).await;
+    let active_keys: std::collections::HashSet<String> = {
+        let active = lock_mutex(active_downloads);
+        active.keys().cloned().collect()
+    };
+
+    let mut active_expected_bases = std::collections::HashSet::new();
+    for model in &registry {
+        if active_keys.contains(&model.id) {
+            let expected_names = manager::get_split_filenames(&model.filename);
+            for expected in expected_names {
+                if let Some(expected_base) = std::path::Path::new(&expected)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
+                    active_expected_bases.insert(expected_base.to_string());
+                }
+            }
+        }
+    }
+
+    let mut dirs_to_visit = vec![downloads_dir.to_path_buf()];
+
+    while let Some(current_dir) = dirs_to_visit.pop() {
+        // Throttle directory traversal to prevent sudden I/O spikes
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        match tokio::fs::read_dir(&current_dir).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    // Yield to the executor to avoid starving other tasks if a directory is huge
+                    tokio::task::yield_now().await;
+
+                    let path = entry.path();
+
+                    if let Ok(file_type) = entry.file_type().await
+                        && file_type.is_dir()
+                    {
+                        dirs_to_visit.push(path);
+                        continue;
+                    }
+
+                    if let Some(ext) = path.extension().and_then(|s| s.to_str())
+                        && ["tmp", "meta", "corrupted", "copy_tmp"].contains(&ext)
+                        && let Ok(metadata) = entry.metadata().await
+                        && let Ok(modified) = metadata.modified()
+                        && let Ok(age) = modified.elapsed()
+                        && age.as_secs() > temp_file_retention_secs
+                    {
+                        let is_active = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|file_name| is_active_temp_file(file_name, &active_expected_bases))
+                            .unwrap_or(false);
+
+                        if !is_active {
+                            // If the temporary or corrupted file hasn't been touched in > 3 days, delete it
+                            let _ = tokio::fs::remove_file(&path).await;
+                            info!("Cleaned up abandoned file: {:?}", path);
+                            cleanup_empty_parents(&path, downloads_dir).await;
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                error!(
+                    "Failed to read directory for cleanup {:?}: {}",
+                    current_dir, e
+                );
+            }
+        }
+    }
+}
+
+async fn cleanup_empty_parents(path: &std::path::Path, limit_dir: &std::path::Path) {
+    let mut current_dir = path.parent();
+    while let Some(parent) = current_dir {
+        if parent == limit_dir || !parent.starts_with(limit_dir) {
+            break;
+        }
+        if tokio::fs::remove_dir(parent).await.is_err() {
+            break; // Stop if directory is not empty or on other errors
+        }
+        current_dir = parent.parent();
+    }
+}
+
+async fn cleanup_model_files(
+    downloads_dir: &std::path::Path,
+    filename: &str,
+    delete_completed: bool,
+) {
+    let filenames = manager::get_split_filenames(filename);
+    for fname in filenames {
+        let tmp_file_path = downloads_dir.join(format!("{}.tmp", fname));
+        let meta_file_path = downloads_dir.join(format!("{}.meta", fname));
+        let _ = tokio::fs::remove_file(&tmp_file_path).await;
+        let _ = tokio::fs::remove_file(&meta_file_path).await;
+
+        if delete_completed {
+            let file_path = downloads_dir.join(&fname);
+            let corrupted_path = downloads_dir.join(format!("{}.corrupted", fname));
+            let _ = tokio::fs::remove_file(&file_path).await;
+            let _ = tokio::fs::remove_file(&corrupted_path).await;
+            cleanup_empty_parents(&file_path, downloads_dir).await;
+        } else {
+            cleanup_empty_parents(&tmp_file_path, downloads_dir).await;
+        }
+    }
+}
+
+async fn abort_download_task(state: &AppState, id: &str) -> bool {
+    let download_task = {
+        let mut tasks = lock_mutex(&state.download_tasks);
+        tasks.remove(id)
+    };
+
+    if let Some((cancel_tx, task)) = download_task {
+        let _ = cancel_tx.send(());
+        let _ = task.await; // Wait for the task to finish cancelling
+        let mut dl = lock_mutex(&state.active_downloads);
+        dl.remove(id);
+        true
+    } else {
+        false
+    }
+}
+
+async fn cleanup_model_by_id(state: &AppState, id: &str, delete_completed: bool) -> bool {
+    let registry = manager::get_model_registry(&state.config).await;
+    if let Some(model) = registry.into_iter().find(|m| m.id == id) {
+        let downloads_dir =
+            manager::types::resolve_absolute_path(&state.config.downloads_directory);
+        cleanup_model_files(&downloads_dir, &model.filename, delete_completed).await;
+        true
+    } else {
+        false
+    }
+}
+
+// Cancel and clear all active and queued downloads
+pub(crate) async fn cancel_all_downloads(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+) -> impl IntoResponse {
+    require_admin!(user, "Admin access required for cancelling downloads");
+
+    let tasks_to_abort: Vec<_> = {
+        let mut tasks = lock_mutex(&state.download_tasks);
+        tasks.drain().collect()
+    };
+
+    for (id, (cancel_tx, task)) in tasks_to_abort {
+        let _ = cancel_tx.send(());
+        let _ = task.await; // Guard cleans up active_downloads automatically
+        cleanup_model_by_id(&state, &id, false).await;
+    }
+
+    let mut dl = lock_mutex(&state.active_downloads);
+    dl.clear();
+
+    (StatusCode::OK, "All downloads cancelled").into_response()
+}
+
+// Cancel a specific download
+pub(crate) async fn cancel_download(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    require_admin!(user, "Admin access required for cancelling downloads");
+
+    if abort_download_task(&state, &id).await {
+        info!("Aborted active download task for model {}", id);
+    } else {
+        let mut dl = lock_mutex(&state.active_downloads);
+        if dl.remove(&id).is_none() {
+            return (StatusCode::NOT_FOUND, "No active download to cancel").into_response();
+        }
+    }
+
+    cleanup_model_by_id(&state, &id, false).await;
+
+    (StatusCode::OK, "Download cancelled").into_response()
+}
+
+// Delete a downloaded model from disk
+pub(crate) async fn delete_model(
+    State(state): State<Arc<AppState>>,
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    require_admin!(user, "Admin access required for deleting models");
+
+    if abort_download_task(&state, &id).await {
+        info!("Aborted active download task for model {}", id);
+    } else {
+        let downloads = lock_mutex(&state.active_downloads);
+        if downloads.contains_key(&id) {
+            return (
+                StatusCode::CONFLICT,
+                "Cannot delete a model while it is downloading.",
+            )
+                .into_response();
+        }
+    }
+
+    {
+        let status = lock_status(&state.engine_status);
+        if status.is_model_in_use(&id) {
+            return (StatusCode::CONFLICT, "Cannot delete a model while it is loaded or being loaded in memory. Please load a different model first to free the VRAM.").into_response();
+        }
+    }
+
+    if !cleanup_model_by_id(&state, &id, true).await {
+        return (StatusCode::NOT_FOUND, "Model not found").into_response();
+    }
+
+    {
+        let mut status = lock_status(&state.engine_status);
+        status.model_health.remove(&id);
+        status.downloaded_models.remove(&id);
+        status.corrupted_models.remove(&id);
+    }
+    info!("Deleted/cleared model {} from disk and state", id);
+
+    (StatusCode::OK, "Model deleted").into_response()
+}
+
 // The Automated Benchmark Trigger
 pub(crate) async fn trigger_benchmark(
     State(state): State<Arc<AppState>>,
@@ -300,10 +645,11 @@ pub(crate) async fn trigger_benchmark(
     let queue_tx = state.queue_tx.clone();
     let engine_status = state.engine_status.clone(); // Clone the Arc so the background thread can reset it
     let selected_models = payload.models;
+    let config = state.config.clone();
 
     tokio::spawn(async move {
         info!("🚀 Starting Automated Benchmark Suite...");
-        let full_registry = get_model_registry().await;
+        let full_registry = get_model_registry(&config).await;
 
         let default_compressor = full_registry
             .iter()
@@ -364,7 +710,8 @@ pub(crate) async fn trigger_benchmark(
             return;
         }
 
-        if let Err(e) = tokio::fs::create_dir_all("benchmark_prompts").await {
+        let benchmark_dir = manager::types::resolve_absolute_path("benchmark_prompts");
+        if let Err(e) = tokio::fs::create_dir_all(&benchmark_dir).await {
             error!(
                 "Benchmark aborted: Failed to create prompt directory: {}",
                 e
@@ -377,32 +724,28 @@ pub(crate) async fn trigger_benchmark(
         // --- GENERATE REALISTIC PROMPTS ---
         info!("🌱 Verifying benchmark prompt files...");
 
-        let tokenizer_result = tokio::task::spawn_blocking(|| {
-            let api = Api::new().map_err(|e| format!("API Init Error: {}", e))?;
-            let path = api
-                .model("Qwen/Qwen2.5-1.5B-Instruct".to_string())
-                .get("tokenizer.json")
-                .map_err(|e| format!("Tokenizer Download Error: {}", e))?;
+        let tokenizer_result = async {
+            let path = manager::fetch_tokenizer_path("Qwen/Qwen2.5-1.5B-Instruct").await?;
 
-            Tokenizer::from_file(path).map_err(|e| format!("Tokenizer Parse Error: {}", e))
-        })
+            tokio::task::spawn_blocking(move || {
+                Tokenizer::from_file(path).map_err(|e| format!("Tokenizer Parse Error: {}", e))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Thread execution failed: {}", e)))
+        }
         .await;
 
         let mut qwen_tokenizer = None;
 
         match tokenizer_result {
-            Ok(Ok(tokenizer)) => {
+            Ok(tokenizer) => {
                 qwen_tokenizer = Some(tokenizer);
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 warn!(
                     "Tokenizer initialization failed: {}. Falling back to padding.",
                     e
                 );
-            }
-            Err(e) => {
-                // If the spawn_blocking task actually panics, it is caught here as a JoinError
-                error!("Thread execution failed: {}. Falling back to padding.", e);
             }
         }
 
@@ -423,9 +766,9 @@ pub(crate) async fn trigger_benchmark(
         sorted_sizes.sort();
 
         for size in sorted_sizes {
-            let filename = format!("benchmark_prompts/prompt_{}.txt", size);
+            let filename = benchmark_dir.join(format!("prompt_{}.txt", size));
 
-            if !std::path::Path::new(&filename).exists() {
+            if !tokio::fs::try_exists(&filename).await.unwrap_or(false) {
                 let mut should_save = false;
                 let mut final_content = String::new();
 
@@ -601,7 +944,7 @@ pub(crate) async fn trigger_benchmark(
             }
 
             for size in test_sizes {
-                let filename = format!("benchmark_prompts/prompt_{}.txt", size);
+                let filename = benchmark_dir.join(format!("prompt_{}.txt", size));
                 let exact_prompt = tokio::fs::read_to_string(&filename)
                     .await
                     .unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
@@ -617,7 +960,9 @@ pub(crate) async fn trigger_benchmark(
 
                     info!(
                         "📊 Benchmarking Generative {} using file {} on Backend {}...",
-                        model.name, filename, target_b
+                        model.name,
+                        filename.display(),
+                        target_b
                     );
 
                     let (response_tx, mut response_rx) = mpsc::unbounded_channel();
@@ -658,7 +1003,7 @@ pub(crate) async fn trigger_benchmark(
             }
 
             for size in test_sizes {
-                let filename = format!("benchmark_prompts/prompt_{}.txt", size);
+                let filename = benchmark_dir.join(format!("prompt_{}.txt", size));
                 let exact_prompt = tokio::fs::read_to_string(&filename)
                     .await
                     .unwrap_or_else(|_| "system ".repeat(size).trim().to_string());
@@ -674,7 +1019,9 @@ pub(crate) async fn trigger_benchmark(
 
                     info!(
                         "📊 Benchmarking Compressor {} using file {} on Backend {}...",
-                        comp_model.name, filename, target_b
+                        comp_model.name,
+                        filename.display(),
+                        target_b
                     );
 
                     let (response_tx, mut response_rx) = mpsc::unbounded_channel();
@@ -724,7 +1071,7 @@ pub(crate) async fn serve_stats_ui(
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
-    Ok(Html(include_str!("../stats.html")))
+    Ok(Html(include_str!("../web/stats.html")))
 }
 
 pub(crate) async fn serve_settings_ui(
@@ -733,7 +1080,7 @@ pub(crate) async fn serve_settings_ui(
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
-    Ok(Html(include_str!("../settings.html")))
+    Ok(Html(include_str!("../web/settings.html")))
 }
 
 pub(crate) async fn serve_models_ui(
@@ -742,7 +1089,7 @@ pub(crate) async fn serve_models_ui(
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
-    Ok(Html(include_str!("../models.html")))
+    Ok(Html(include_str!("../web/models.html")))
 }
 
 pub(crate) async fn serve_memory_ui(
@@ -751,7 +1098,7 @@ pub(crate) async fn serve_memory_ui(
     if require_session(session).await.is_err() {
         return Err(Redirect::to("/auth/login"));
     }
-    Ok(Html(include_str!("../memory.html")))
+    Ok(Html(include_str!("../web/memory.html")))
 }
 
 pub(crate) async fn serve_console_ui(
@@ -765,15 +1112,14 @@ pub(crate) async fn serve_console_ui(
     if !state.config.admin_emails.contains(&email) {
         return Err(Redirect::to("/"));
     }
-    Ok(Html(include_str!("../console.html")))
+    Ok(Html(include_str!("../web/console.html")))
 }
 
-pub(crate) async fn serve_console_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../console.js"),
-    )
-}
+serve_static!(
+    serve_console_js,
+    "application/javascript",
+    "../web/console.js"
+);
 
 #[derive(Deserialize)]
 pub struct LogQuery {
@@ -791,10 +1137,8 @@ pub(crate) async fn get_console_logs(
     axum::extract::Query(query): axum::extract::Query<LogQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
-    }
-    let guard = state.log_buffer.0.lock().unwrap_or_else(|e| e.into_inner());
+    require_admin!(user, "Admin access required");
+    let guard = lock_mutex(&state.log_buffer.0);
 
     let total_emitted = guard.0;
     let buffer = &guard.1;
@@ -821,10 +1165,8 @@ pub(crate) async fn clear_console_logs(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
-    }
-    let mut guard = state.log_buffer.0.lock().unwrap_or_else(|e| e.into_inner());
+    require_admin!(user, "Admin access required");
+    let mut guard = lock_mutex(&state.log_buffer.0);
     guard.1.clear();
     guard.0 = 0;
     StatusCode::OK.into_response()
@@ -840,9 +1182,7 @@ pub(crate) async fn set_console_loglevel(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LogLevelRequest>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
-    }
+    require_admin!(user, "Admin access required");
     let new_filter = match EnvFilter::try_new(&payload.level) {
         Ok(filter) => filter,
         Err(e) => {
@@ -856,10 +1196,7 @@ pub(crate) async fn set_console_loglevel(
         )
             .into_response();
     }
-    *state
-        .current_log_level
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = payload.level.clone();
+    *lock_mutex(&state.current_log_level) = payload.level.clone();
     (StatusCode::OK, "Log level updated").into_response()
 }
 
@@ -886,33 +1223,67 @@ pub struct MessageQuery {
     pub offset: Option<usize>,
 }
 
-pub(crate) async fn get_chat_session(
-    user: auth::CurrentUser,
-    Path(id): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<MessageQuery>,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<manager::ChatSession>, StatusCode> {
-    let mut response = state
-        .db
+async fn fetch_session_record(
+    db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+    session_id: &str,
+) -> Result<Option<manager::ChatSessionRecord>, StatusCode> {
+    let mut response = db
         .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
-        .bind(("id", id.clone()))
+        .bind(("id", session_id.to_string()))
         .await
         .map_err(|e| {
             error!("DB Query Error: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let session_record: Option<manager::ChatSessionRecord> = response.take(0).map_err(|e| {
+    response.take(0).map_err(|e| {
         error!("DB Take Error: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    })
+}
 
-    match session_record {
-        Some(s) if s.email == user.email => {
-            let limit = query.limit.unwrap_or(50);
-            let offset = query.offset.unwrap_or(0);
+async fn verify_session_ownership(
+    db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+    session_id: &str,
+    user_email: &str,
+) -> Result<manager::ChatSessionRecord, StatusCode> {
+    match fetch_session_record(db, session_id).await? {
+        Some(s) if s.email == user_email => Ok(s),
+        Some(_) => Err(StatusCode::FORBIDDEN),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
 
-            let mut response = state
+async fn touch_session_updated_at(
+    db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+    session_id: &str,
+) {
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    if let Err(e) = db
+        .query("UPDATE type::thing('chat_sessions', $id) SET updated_at = $time")
+        .bind(("id", session_id.to_string()))
+        .bind(("time", updated_at))
+        .await
+    {
+        error!("DB Update Error (chat_sessions timestamp): {}", e);
+    }
+}
+
+pub(crate) async fn get_chat_session(
+    user: auth::CurrentUser,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<MessageQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<manager::ChatSession>, StatusCode> {
+    let s = verify_session_ownership(&state.db, &id, &user.email).await?;
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+
+    let mut response = state
                 .db
                 // Order DESC to get the latest messages first, then we'll reverse them
                 .query("SELECT role, content, message_index FROM chat_messages WHERE session_id = $session_id ORDER BY message_index DESC LIMIT $limit START $offset")
@@ -925,20 +1296,16 @@ pub(crate) async fn get_chat_session(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-            let mut db_messages: Vec<manager::Message> = response.take(0).unwrap_or_default();
-            db_messages.reverse(); // Reverse back to chronological order
+    let mut db_messages: Vec<manager::Message> = response.take(0).unwrap_or_default();
+    db_messages.reverse(); // Reverse back to chronological order
 
-            Ok(Json(manager::ChatSession {
-                id: s.id,
-                email: s.email,
-                updated_at: s.updated_at,
-                title: s.title,
-                messages: db_messages,
-            }))
-        }
-        Some(_) => Err(StatusCode::FORBIDDEN),
-        None => Err(StatusCode::NOT_FOUND),
-    }
+    Ok(Json(manager::ChatSession {
+        id: s.id,
+        email: s.email,
+        updated_at: s.updated_at,
+        title: s.title,
+        messages: db_messages,
+    }))
 }
 
 pub(crate) async fn save_chat_session(
@@ -973,14 +1340,7 @@ pub(crate) async fn save_chat_session(
             return Err(StatusCode::BAD_REQUEST);
         }
 
-        let mut response = state
-            .db
-            .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
-            .bind(("id", payload.id.clone()))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let existing: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
-        if let Some(s) = existing
+        if let Some(s) = fetch_session_record(&state.db, &payload.id).await?
             && s.email != user.email
         {
             return Err(StatusCode::FORBIDDEN);
@@ -1022,21 +1382,7 @@ pub(crate) async fn append_chat_message(
     State(state): State<Arc<AppState>>,
     Json(mut payload): Json<manager::ChatMessageRecord>,
 ) -> Result<StatusCode, StatusCode> {
-    let mut response = state
-        .db
-        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
-        .bind(("id", id.clone()))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let session: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
-
-    if let Some(s) = session {
-        if s.email != user.email {
-            return Err(StatusCode::FORBIDDEN);
-        }
-    } else {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    verify_session_ownership(&state.db, &id, &user.email).await?;
 
     let mut last_msg_response = state
         .db
@@ -1072,20 +1418,7 @@ pub(crate) async fn append_chat_message(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let updated_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    if let Err(e) = state
-        .db
-        .query("UPDATE type::thing('chat_sessions', $id) SET updated_at = $time")
-        .bind(("id", id.clone()))
-        .bind(("time", updated_at))
-        .await
-    {
-        error!("DB Update Error (chat_sessions timestamp): {}", e);
-    }
+    touch_session_updated_at(&state.db, &id).await;
 
     Ok(StatusCode::OK)
 }
@@ -1095,21 +1428,7 @@ pub(crate) async fn truncate_chat_messages(
     Path((id, index)): Path<(String, usize)>,
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
-    let mut response = state
-        .db
-        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
-        .bind(("id", id.clone()))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let session: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
-
-    if let Some(s) = session {
-        if s.email != user.email {
-            return Err(StatusCode::FORBIDDEN);
-        }
-    } else {
-        return Err(StatusCode::NOT_FOUND);
-    }
+    verify_session_ownership(&state.db, &id, &user.email).await?;
 
     if let Err(e) = state
         .db
@@ -1124,23 +1443,7 @@ pub(crate) async fn truncate_chat_messages(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let updated_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    if let Err(e) = state
-        .db
-        .query("UPDATE type::thing('chat_sessions', $id) SET updated_at = $time")
-        .bind(("id", id.clone()))
-        .bind(("time", updated_at))
-        .await
-    {
-        error!(
-            "DB Update Error (chat_sessions timestamp on truncate): {}",
-            e
-        );
-    }
+    touch_session_updated_at(&state.db, &id).await;
 
     Ok(StatusCode::OK)
 }
@@ -1150,117 +1453,70 @@ pub(crate) async fn delete_chat_session(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
-    let mut response = state
+    verify_session_ownership(&state.db, &id, &user.email).await?;
+
+    if let Err(e) = state
         .db
-        .query("SELECT type::string(meta::id(id)) AS id, email, updated_at, title FROM type::thing('chat_sessions', $id)")
+        .query("DELETE type::thing('chat_sessions', $id)")
         .bind(("id", id.clone()))
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let session: Option<manager::ChatSessionRecord> = response.take(0).unwrap_or_default();
-    if let Some(s) = session {
-        if s.email != user.email {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        if let Err(e) = state
-            .db
-            .query("DELETE type::thing('chat_sessions', $id)")
-            .bind(("id", id.clone()))
-            .await
-        {
-            error!("DB Delete Error (chat_sessions): {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-        if let Err(e) = state
-            .db
-            .query("DELETE FROM chat_messages WHERE session_id = $session_id")
-            .bind(("session_id", id.clone()))
-            .await
-        {
-            error!("DB Delete Error (chat_messages): {}", e);
-        }
-        Ok(StatusCode::OK)
-    } else {
-        Err(StatusCode::NOT_FOUND)
+    {
+        error!("DB Delete Error (chat_sessions): {}", e);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    if let Err(e) = state
+        .db
+        .query("DELETE FROM chat_messages WHERE session_id = $session_id")
+        .bind(("session_id", id.clone()))
+        .await
+    {
+        error!("DB Delete Error (chat_messages): {}", e);
+    }
+    Ok(StatusCode::OK)
 }
 
 pub(crate) async fn get_console_loglevel(
     user: auth::CurrentUser,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if !user.is_admin {
-        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
-    }
-    let level = state
-        .current_log_level
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    require_admin!(user, "Admin access required");
+    let level = lock_mutex(&state.current_log_level).clone();
     Json(LogLevelRequest { level }).into_response()
 }
 
-pub(crate) async fn serve_chat_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../chat.js"),
-    )
-}
-
-pub(crate) async fn serve_stats_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../stats.js"),
-    )
-}
-
-pub(crate) async fn serve_models_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../models.js"),
-    )
-}
-
-pub(crate) async fn serve_settings_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../settings.js"),
-    )
-}
-
-pub(crate) async fn serve_memory_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../memory.js"),
-    )
-}
-
-pub(crate) async fn serve_common_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/javascript")],
-        include_str!("../common.js"),
-    )
-}
-
-pub(crate) async fn serve_common_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css")],
-        include_str!("../common.css"),
-    )
-}
+serve_static!(serve_chat_js, "application/javascript", "../web/chat.js");
+serve_static!(serve_stats_js, "application/javascript", "../web/stats.js");
+serve_static!(
+    serve_models_js,
+    "application/javascript",
+    "../web/models.js"
+);
+serve_static!(
+    serve_settings_js,
+    "application/javascript",
+    "../web/settings.js"
+);
+serve_static!(
+    serve_memory_js,
+    "application/javascript",
+    "../web/memory.js"
+);
+serve_static!(
+    serve_common_js,
+    "application/javascript",
+    "../web/common.js"
+);
+serve_static!(serve_common_css, "text/css", "../web/common.css");
 
 // Route: Serve the Telemetry JSON
 pub(crate) async fn get_stats_data(State(state): State<Arc<AppState>>) -> Json<TelemetryStore> {
-    let current_data = state
-        .telemetry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+    let current_data = lock_mutex(&state.telemetry).clone();
     Json(current_data)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = AppConfig::load();
+    let config = AppConfig::load().await;
 
     let (memory_buffer, log_reload_handle, _file_guard) = setup::init_logging(&config);
 
@@ -1272,6 +1528,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_client = setup::init_db(&config).await?;
 
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel(16);
+
     // Background Telemetry Cleanup Task
     let db_for_cleanup = db_client.clone();
     let retention_days = config.telemetry_retention_days;
@@ -1280,12 +1538,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return; // 0 disables retention cleanup
         }
         // Check every 24 hours (The first tick completes immediately on startup)
-        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(
+            TELEMETRY_CLEANUP_INTERVAL_SECS,
+        ));
         loop {
             cleanup_interval.tick().await;
             if let Err(e) = manager::cleanup_telemetry(&db_for_cleanup, retention_days).await {
                 error!("Telemetry cleanup task failed: {}", e);
             }
+        }
+    });
+
+    let active_downloads = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+    // Background Temp File Cleanup Task
+    let downloads_dir_for_cleanup =
+        manager::types::resolve_absolute_path(&config.downloads_directory);
+    let active_downloads_for_cleanup = active_downloads.clone();
+    let temp_file_retention_secs = config.temp_file_retention_days * 24 * 3600;
+    let config_for_cleanup = config.clone();
+    tokio::spawn(async move {
+        if temp_file_retention_secs == 0 {
+            return; // 0 disables retention cleanup
+        }
+
+        // Sweep the downloads directory every 12 hours
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            TEMP_FILE_CLEANUP_INTERVAL_SECS,
+        ));
+        loop {
+            interval.tick().await;
+
+            sweep_temp_files(
+                &downloads_dir_for_cleanup,
+                &active_downloads_for_cleanup,
+                &config_for_cleanup,
+            )
+            .await;
         }
     });
 
@@ -1296,7 +1585,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sys = System::new_all();
         let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
         let nvml = nvml_wrapper::Nvml::init().ok();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(VRAM_TRACKER_INTERVAL_SECS));
         loop {
             interval.tick().await;
 
@@ -1317,7 +1607,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some((used, total, free)) =
                 manager::get_vram_info(nvml.as_ref(), vram_tracker_gpu_idx)
             {
-                s.update_nvml(total, used, free);
+                let proc_vram =
+                    manager::get_engine_process_vram(nvml.as_ref(), vram_tracker_gpu_idx);
+                s.update_nvml(total, used, free, proc_vram);
             }
         }
     });
@@ -1361,12 +1653,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Boot up the GPU Orchestrator in the background
     let batcher_gpu_idx = config.gpu_device_index;
+    let app_config_for_batcher = Arc::new(config.clone());
     tokio::spawn(async move {
         run_batcher_loop(
             rx,
             status_for_batcher,
             telemetry_for_batcher,
             batcher_gpu_idx,
+            app_config_for_batcher,
         )
         .await;
     });
@@ -1391,17 +1685,241 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_store = Arc::new(Mutex::new(store));
 
     // Initialize global pooled clients once!
-    let reqwest_client = reqwest::Client::new();
+    let reqwest_client = reqwest::Client::builder()
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(55))
+        .build()?;
     let oauth_client = auth::build_oauth_client(
         &config.oauth_redirect_uri,
         &config.oauth_client_secret_path,
         &config.oauth_auth_url,
         &config.oauth_token_url,
-    )?;
+    )
+    .await?;
 
     // Eagerly initialize the model registry in the background
-    tokio::spawn(async {
-        manager::get_model_registry().await;
+    let engine_status_for_init = engine_status.clone();
+    let downloads_dir_for_init = manager::types::resolve_absolute_path(&config.downloads_directory)
+        .to_string_lossy()
+        .to_string();
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let config_for_registry = config.clone();
+    tokio::spawn(async move {
+        use notify::Watcher;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<std::path::PathBuf>>();
+        let mut watcher_opt =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    let _ = tx.send(event.paths);
+                }
+            }) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    warn!(
+                        "Failed to create file watcher ({}). Falling back to periodic polling.",
+                        e
+                    );
+                    None
+                }
+            };
+
+        let path = std::path::Path::new(&downloads_dir_for_init);
+        if let Ok(false) | Err(_) = tokio::fs::try_exists(path).await {
+            let _ = tokio::fs::create_dir_all(path).await;
+        }
+        if let Some(w) = &mut watcher_opt {
+            let _ = w.watch(path, notify::RecursiveMode::Recursive);
+        }
+
+        let models = manager::get_model_registry(&config_for_registry).await;
+        let cache = hf_hub::Cache::default();
+
+        for model in &models {
+            let repo_path = cache
+                .path()
+                .join(format!("models--{}", model.repo.replace('/', "--")));
+            if let Ok(true) = tokio::fs::try_exists(&repo_path).await
+                && let Some(w) = &mut watcher_opt
+            {
+                let _ = w.watch(&repo_path, notify::RecursiveMode::Recursive);
+            }
+        }
+
+        let mut debounce_timer = tokio::time::interval(std::time::Duration::from_millis(
+            WATCHER_DEBOUNCE_INTERVAL_MILLIS,
+        ));
+        debounce_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let refresh_secs = if watcher_opt.is_some() {
+            WATCHER_REFRESH_INTERVAL_SECS
+        } else {
+            FALLBACK_REFRESH_INTERVAL_SECS
+        };
+        let mut watch_refresh_timer =
+            tokio::time::interval(std::time::Duration::from_secs(refresh_secs));
+        watch_refresh_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut pending_update = true;
+        let mut first_run = true;
+        let mut pending_paths = std::collections::HashSet::new();
+        let mut check_task: Option<tokio::task::JoinHandle<()>> = None;
+
+        loop {
+            tokio::select! {
+                Some(paths) = rx.recv() => {
+                    if !pending_update {
+                        pending_paths.extend(paths);
+                    }
+                }
+                _ = watch_refresh_timer.tick() => {
+                    for model in &models {
+                        let repo_path = cache.path().join(format!("models--{}", model.repo.replace('/', "--")));
+                        if let Ok(true) = tokio::fs::try_exists(&repo_path).await {
+                            // notify handles duplicates gracefully, so this is safe to call repeatedly
+                            if let Some(w) = &mut watcher_opt {
+                                let _ = w.watch(&repo_path, notify::RecursiveMode::Recursive);
+                            }
+                        }
+                    }
+                    // Force a state update in case we missed a directory creation event
+                    pending_update = true;
+                    pending_paths.clear();
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received. Stopping model registry watcher task.");
+                    break;
+                }
+                _ = debounce_timer.tick() => {
+                    if !pending_update && pending_paths.is_empty() && !first_run {
+                        continue;
+                    }
+
+                    if let Some(task) = &check_task
+                        && !task.is_finished()
+                    {
+                        continue;
+                    }
+
+                    let is_full_update = pending_update || first_run;
+                    let paths_to_check = if is_full_update {
+                        pending_paths.clear();
+                        Vec::new()
+                    } else {
+                        pending_paths.drain().collect::<Vec<_>>()
+                    };
+                    pending_update = false;
+                    let was_first_run = first_run;
+                    first_run = false;
+
+                    let models_clone = models.clone();
+                    let downloads_dir = downloads_dir_for_init.clone();
+                    let engine_status_clone = engine_status_for_init.clone();
+
+                    check_task = Some(tokio::spawn(async move {
+                        let updates = tokio::task::spawn_blocking(move || {
+                            let cache = hf_hub::Cache::default();
+                            let abs_downloads_dir = manager::types::resolve_absolute_path(&downloads_dir);
+                            let abs_paths_to_check: Vec<_> = paths_to_check.iter().map(manager::types::resolve_absolute_path).collect();
+
+                            let models_to_check = if is_full_update {
+                                models_clone
+                            } else {
+                                models_clone.into_iter().filter(|m| {
+                        let filenames = manager::get_split_filenames(&m.filename);
+                                    let repo_path = cache.path().join(format!("models--{}", m.repo.replace('/', "--")));
+
+                                    abs_paths_to_check.iter().any(|p| {
+                            p.starts_with(&repo_path) || filenames.iter().any(|f| {
+                                p == &abs_downloads_dir.join(f) || p == &abs_downloads_dir.join(format!("{}.corrupted", f))
+                            })
+                                    })
+                                }).collect::<Vec<_>>()
+                            };
+
+                            let mut results = Vec::new();
+                            for model in models_to_check {
+                    let filenames = manager::get_split_filenames(&model.filename);
+                    let mut is_downloaded = true;
+                    let mut is_cached = true;
+                    let mut is_corrupted = false;
+
+                    for fname in &filenames {
+                        let local_path = abs_downloads_dir.join(fname);
+                        let corrupted_path = abs_downloads_dir.join(format!("{}.corrupted", fname));
+
+                        let is_in_hf_cache = cache
+                            .repo(hf_hub::Repo::model(model.repo.clone()))
+                            .get(fname)
+                            .is_some();
+
+                        if !is_in_hf_cache { is_cached = false; }
+                        if !local_path.exists() && !is_in_hf_cache { is_downloaded = false; }
+                        if corrupted_path.exists() { is_corrupted = true; }
+                    }
+
+                                results.push((model.id, is_downloaded, is_cached, is_corrupted));
+                            }
+                            results
+                        })
+                        .await
+                        .unwrap_or_default();
+
+                        let mut status = lock_status(&engine_status_clone);
+                        if is_full_update {
+                            let mut d_ids = std::collections::HashSet::new();
+                            let mut c_ids = std::collections::HashSet::new();
+                            let mut err_ids = std::collections::HashSet::new();
+
+                            for (id, d, c, err) in updates {
+                                if d { d_ids.insert(id.clone()); }
+                                if c { c_ids.insert(id.clone()); }
+                                if err { err_ids.insert(id); }
+                            }
+
+                            if was_first_run {
+                                status.downloaded_models = d_ids;
+                                status.cached_models = c_ids;
+                                status.corrupted_models = err_ids;
+                                info!(
+                                    "Found {} downloaded models on disk.",
+                                    status.downloaded_models.len()
+                                );
+                            } else if status.downloaded_models != d_ids
+                                || status.cached_models != c_ids
+                                || status.corrupted_models != err_ids
+                            {
+                                info!(
+                                    "Disk state changed. Found {} downloaded models on disk.",
+                                    d_ids.len()
+                                );
+                                status.downloaded_models = d_ids;
+                                status.cached_models = c_ids;
+                                status.corrupted_models = err_ids;
+                            }
+                        } else {
+                            let mut changed = false;
+                            for (id, d, c, err) in updates {
+                                if d { if status.downloaded_models.insert(id.clone()) { changed = true; } }
+                                else { if status.downloaded_models.remove(&id) { changed = true; } }
+
+                                if c { if status.cached_models.insert(id.clone()) { changed = true; } }
+                                else { if status.cached_models.remove(&id) { changed = true; } }
+
+                                if err { if status.corrupted_models.insert(id.clone()) { changed = true; } }
+                                else { if status.corrupted_models.remove(&id) { changed = true; } }
+                            }
+
+                            if changed {
+                                info!(
+                                    "Disk state incrementally updated. Found {} downloaded models on disk.",
+                                    status.downloaded_models.len()
+                                );
+                            }
+                        }
+                    }));
+                }
+            }
+        }
     });
 
     let shared_state = Arc::new(AppState {
@@ -1415,7 +1933,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_buffer: memory_buffer,
         log_reload_handle,
         current_log_level: Arc::new(Mutex::new(config.log_level_memory.clone())),
+        active_downloads,
+        download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        download_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
         db: db_client.clone(),
+        shutdown_tx: shutdown_tx.clone(),
     });
 
     // Setup Session Layer
@@ -1437,7 +1959,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = web_routes
         .merge(engine_api_routes)
         .with_state(shared_state)
-        .layer(session_layer);
+        .layer(session_layer)
+        .layer(axum::middleware::from_fn(csp_middleware));
 
     // Start listening on port 3000
     let listener = tokio::net::TcpListener::bind(&config.bind_address)
@@ -1447,7 +1970,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (force_tx, force_rx) = tokio::sync::oneshot::channel();
 
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(force_tx));
+    let server =
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(force_tx, shutdown_tx));
 
     tokio::select! {
         res = server => { res?; }
@@ -1457,7 +1981,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn shutdown_signal(force_tx: tokio::sync::oneshot::Sender<()>) {
+async fn wait_for_termination_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -1479,31 +2003,21 @@ async fn shutdown_signal(force_tx: tokio::sync::oneshot::Sender<()>) {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+}
+
+async fn shutdown_signal(
+    force_tx: tokio::sync::oneshot::Sender<()>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+) {
+    wait_for_termination_signal().await;
     info!("Received termination signal, starting graceful shutdown...");
+    let _ = shutdown_tx.send(());
 
     // Force shutdown if graceful shutdown takes longer than 30 seconds, or if a second signal is received
     tokio::spawn(async move {
-        let ctrl_c = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install Ctrl+C handler");
-        };
-
-        #[cfg(unix)]
-        let terminate = async {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler")
-                .recv()
-                .await;
-        };
-
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
         tokio::select! {
-            _ = ctrl_c => { error!("Received second termination signal. Forcing immediate exit."); },
-            _ = terminate => { error!("Received second termination signal. Forcing immediate exit."); },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => { error!("Graceful shutdown timed out after 30 seconds. Forcing exit."); },
+            _ = wait_for_termination_signal() => { error!("Received second termination signal. Forcing immediate exit."); },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECS)) => { error!("Graceful shutdown timed out after {} seconds. Forcing exit.", GRACEFUL_SHUTDOWN_TIMEOUT_SECS); },
         }
         let _ = force_tx.send(());
     });
@@ -1523,10 +2037,10 @@ mod tests {
 
     #[test]
     fn test_app_config_log_defaults() {
-        assert_eq!(default_log_level_console(), "info");
-        assert_eq!(default_log_level_file(), "warn");
-        assert_eq!(default_log_level_memory(), "debug");
-        assert_eq!(default_log_file_name(), "server.log");
+        assert_eq!(manager::config::default_log_level_console(), "info");
+        assert_eq!(manager::config::default_log_level_file(), "warn");
+        assert_eq!(manager::config::default_log_level_memory(), "debug");
+        assert_eq!(manager::config::default_log_file_name(), "server.log");
     }
 
     #[test]
@@ -1567,6 +2081,58 @@ mod tests {
         assert_eq!(query.since, Some(42));
     }
 
+    #[test]
+    fn test_is_active_temp_file() {
+        let mut bases = std::collections::HashSet::new();
+        bases.insert("model.safetensors".to_string());
+        bases.insert("model-00001-of-00002.safetensors".to_string());
+
+        // Exact matches with expected extensions should be active
+        assert!(is_active_temp_file("model.safetensors.tmp", &bases));
+        assert!(is_active_temp_file("model.safetensors.meta", &bases));
+        assert!(is_active_temp_file("model.safetensors.meta.tmp", &bases));
+        assert!(is_active_temp_file("model.safetensors.corrupted", &bases));
+        assert!(is_active_temp_file("model.safetensors.copy_tmp", &bases));
+
+        // Unknown extensions or base names should NOT be active
+        assert!(!is_active_temp_file("model.safetensors.txt", &bases));
+        assert!(!is_active_temp_file("other-model.safetensors.tmp", &bases));
+        assert!(!is_active_temp_file("model.safetensors", &bases)); // No extension
+
+        // Potential collision testing: another model with overlapping prefix
+        assert!(!is_active_temp_file("model.safetensors_v2.tmp", &bases));
+    }
+
+    #[tokio::test]
+    async fn test_sweep_temp_files_disabled_when_retention_zero() {
+        let temp_dir = std::env::temp_dir().join("test_sweep_temp_disabled");
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+
+        let tmp_file = temp_dir.join("model.safetensors.tmp");
+        tokio::fs::write(&tmp_file, "dummy").await.unwrap();
+
+        // Ensure the file is at least 1 second old so that if the sweep mistakenly runs,
+        // the age check `age.as_secs() > 0` evaluates to true and deletes it.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let config = AppConfig {
+            downloads_directory: temp_dir.to_string_lossy().to_string(),
+            temp_file_retention_days: 0, // Disabled!
+            ..Default::default()
+        };
+
+        let active_downloads = std::sync::Mutex::new(std::collections::HashMap::new());
+
+        super::sweep_temp_files(&temp_dir, &active_downloads, &config).await;
+
+        assert!(
+            tmp_file.exists(),
+            "Temporary file should not be deleted when retention is 0"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
     use axum::Json;
     use axum::extract::{Path, State};
     use std::collections::HashMap;
@@ -1605,6 +2171,8 @@ mod tests {
         let (_, log_reload_handle) =
             tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
 
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(16);
+
         Arc::new(AppState {
             queue_tx,
             engine_status: Arc::new(Mutex::new(EngineStatus::default())),
@@ -1625,6 +2193,7 @@ mod tests {
                 "https://accounts.google.com/o/oauth2/v2/auth",
                 "https://oauth2.googleapis.com/token",
             )
+            .await
             .unwrap(), // Dummy client
             config: Arc::new(AppConfig::default()),
             log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
@@ -1633,7 +2202,11 @@ mod tests {
             )))),
             log_reload_handle,
             current_log_level: Arc::new(Mutex::new("info".to_string())),
+            active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
             db,
+            shutdown_tx,
         })
     }
 
@@ -1959,5 +2532,576 @@ mod tests {
         )
         .await;
         assert_eq!(res1_retry, Ok(StatusCode::OK));
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
+    async fn test_get_download_progress() {
+        let state = create_test_app_state().await;
+
+        // Initially empty
+        let Json(progress) = get_download_progress(State(state.clone())).await;
+        assert!(progress.is_empty());
+
+        // Insert mock progress
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert(
+                "test-model".to_string(),
+                DownloadStatus {
+                    bytes_transferred: 50,
+                    total_bytes: 100,
+                    start_time: 123456789,
+                    current_speed_bps: 10.0,
+                    state: "Downloading...".to_string(),
+                },
+            );
+        }
+
+        // Fetch again and verify
+        let Json(progress) = get_download_progress(State(state.clone())).await;
+        assert_eq!(progress.len(), 1);
+        let status = progress.get("test-model").unwrap();
+        assert_eq!(status.bytes_transferred, 50);
+        assert_eq!(status.total_bytes, 100);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
+    async fn test_trigger_download_validation() {
+        let state = create_test_app_state().await;
+        let admin_user = mock_user("admin@local", true);
+        let normal_user = mock_user("user@local", false);
+
+        // 1. Non-admin should be rejected (403)
+        let res = trigger_download(
+            State(state.clone()),
+            normal_user,
+            Json(DownloadRequest {
+                model_id: "llama-3.1-8b".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // 2. Admin requesting non-existent model should fail (404)
+        let res = trigger_download(
+            State(state.clone()),
+            admin_user.clone(),
+            Json(DownloadRequest {
+                model_id: "fake-model-id".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // 3. Admin requesting an already active download should fail (409)
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("llama-3.1-8b".to_string(), DownloadStatus::default());
+        }
+        let res = trigger_download(
+            State(state.clone()),
+            admin_user.clone(),
+            Json(DownloadRequest {
+                model_id: "llama-3.1-8b".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
+    async fn test_cancel_all_downloads() {
+        let state = create_test_app_state().await;
+        let admin_user = mock_user("admin@local", true);
+        let normal_user = mock_user("user@local", false);
+
+        // 1. Non-admin should be rejected (403)
+        let res = cancel_all_downloads(State(state.clone()), normal_user)
+            .await
+            .into_response();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // 2. Insert dummy tasks into the queue/active state
+        let (tx1, mut rx1) = tokio::sync::broadcast::channel(1);
+        let (tx2, mut rx2) = tokio::sync::broadcast::channel(1);
+        let task1 = tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                _ = rx1.recv() => {}
+            }
+        });
+        let task2 = tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+                _ = rx2.recv() => {}
+            }
+        });
+        {
+            let mut tasks = state.download_tasks.lock().unwrap();
+            tasks.insert("model1".to_string(), (tx1, task1));
+            tasks.insert("model2".to_string(), (tx2, task2));
+        }
+
+        // 3. Admin request should successfully cancel and drain all tasks
+        let res = cancel_all_downloads(State(state.clone()), admin_user)
+            .await
+            .into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let tasks = state.download_tasks.lock().unwrap();
+        assert!(
+            tasks.is_empty(),
+            "All download tasks should be removed from the map"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_signal_flushes_download_metadata() {
+        // Initialize a logger to capture output from the mock server and downloader
+        // This will only show up if the test fails.
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        use axum::Router;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        // 1. Create a mock server that slowly streams data
+        let mock_app = Router::new().route(
+            "/{*path}",
+            axum::routing::get(|req: axum::extract::Request| async move {
+                tracing::info!("Mock server received GET request to {}", req.uri());
+
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move {
+                    for _ in 0..500 {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        if tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 1024],
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            tracing::info!("Mock server: client disconnected");
+                            break;
+                        }
+                    }
+                });
+                axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "512000")
+                    .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+                    .expect("Failed to build mock response")
+            })
+            .head(|req: axum::extract::Request| async move {
+                tracing::info!("Mock server received HEAD request to {}", req.uri());
+                axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "512000")
+                    .body(axum::body::Body::empty())
+                    .expect("Failed to build mock HEAD response")
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener
+            .local_addr()
+            .expect("Failed to get local address")
+            .port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        // 2. Setup isolated AppState configured to point to our mock server
+        let config = AppConfig {
+            hf_base_url: format!("http://127.0.0.1:{}", port),
+            downloads_directory: "test_downloads_shutdown".to_string(),
+            ..Default::default()
+        };
+        let _ = tokio::fs::remove_dir_all(&config.downloads_directory).await;
+        let _ = tokio::fs::create_dir_all(&config.downloads_directory).await;
+
+        let (queue_tx, _) = mpsc::channel(1);
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select test namespace and DB");
+        let (_, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
+
+        let oauth_client = oauth2::basic::BasicClient::new(
+            oauth2::ClientId::new("dummy".to_string()),
+            None,
+            oauth2::AuthUrl::new("http://localhost".to_string())
+                .expect("Failed to parse dummy AuthUrl"),
+            None,
+        );
+
+        let state = Arc::new(AppState {
+            queue_tx,
+            engine_status: Arc::new(Mutex::new(EngineStatus::default())),
+            telemetry: Arc::new(Mutex::new(TelemetryStore::default())),
+            auth_store: Arc::new(Mutex::new(AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client,
+            config: Arc::new(config),
+            log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle,
+            current_log_level: Arc::new(Mutex::new("info".to_string())),
+            active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            db,
+            shutdown_tx: shutdown_tx.clone(),
+        });
+
+        // 3. Spawn the model downloader
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("test-model".to_string(), DownloadStatus::default());
+        }
+        let state_clone = state.clone();
+        let task = tokio::spawn(async move {
+            let (_cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(1);
+            downloader::perform_model_download(
+                state_clone,
+                "test-model".to_string(),
+                "test/repo".to_string(),
+                "model.safetensors".to_string(),
+                shutdown_rx,
+                cancel_rx,
+            )
+            .await;
+        });
+
+        // Let it connect and download a chunk or two, using a polling loop to avoid race conditions
+        let mut downloaded_bytes = 0;
+        for i in 0..50 {
+            let active = {
+                let dl = state.active_downloads.lock().unwrap();
+                dl.get("test-model").cloned()
+            };
+            if let Some(dl) = active {
+                if dl.bytes_transferred > 0 {
+                    downloaded_bytes = dl.bytes_transferred;
+                    tracing::info!(
+                        "Test: downloader registered {} bytes. Breaking loop.",
+                        downloaded_bytes
+                    );
+                    // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    break;
+                }
+            } else {
+                tracing::error!("Test: downloader task disappeared from active_downloads!");
+                break;
+            }
+            if i % 10 == 0 {
+                tracing::info!(
+                    "Test: waiting for downloader to receive bytes... (attempt {})",
+                    i
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            downloaded_bytes > 0,
+            "Test timed out waiting for the download to start receiving bytes."
+        );
+
+        // 4. Fire shutdown signal!
+        tracing::info!("Test: Firing shutdown signal.");
+        let _ = shutdown_tx.send(());
+
+        // Wait for cancellation to forcibly exit the task
+        let _ = task.await;
+
+        // 5. Verify the metadata file was saved right before exiting
+        let meta_path =
+            manager::types::resolve_absolute_path("test_downloads_shutdown/model.safetensors.meta");
+        let meta_content = tokio::fs::read_to_string(&meta_path)
+            .await
+            .expect("Meta file should exist after graceful abort");
+
+        let meta_json: serde_json::Value =
+            serde_json::from_str(&meta_content).expect("Metadata content should be valid JSON");
+        let downloaded = meta_json["checkpoints"]
+            .as_array()
+            .expect("Metadata should contain a checkpoints array")
+            .last()
+            .expect("Checkpoints array should not be empty")["downloaded_bytes"]
+            .as_u64()
+            .expect("Downloaded bytes should be a valid u64");
+
+        assert!(
+            downloaded > 0,
+            "Should have downloaded at least some bytes before shutting down"
+        );
+        assert!(
+            downloaded < 512000,
+            "Should have aborted before reaching the full file size"
+        );
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all("test_downloads_shutdown").await;
+    }
+
+    #[tokio::test]
+    async fn test_cancel_download_flushes_metadata() {
+        // Initialize a logger to capture output from the mock server and downloader
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        use axum::Router;
+        use tokio_stream::wrappers::ReceiverStream;
+
+        // 1. Create a mock server that slowly streams data
+        let mock_app = Router::new().route(
+            "/{*path}",
+            axum::routing::get(|req: axum::extract::Request| async move {
+                tracing::info!("Mock server received GET request to {}", req.uri());
+
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move {
+                    for _ in 0..500 {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        if tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 1024],
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            tracing::info!("Mock server: client disconnected");
+                            break;
+                        }
+                    }
+                });
+                axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "512000")
+                    .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+                    .expect("Failed to build mock response")
+            })
+            .head(|req: axum::extract::Request| async move {
+                tracing::info!("Mock server received HEAD request to {}", req.uri());
+                axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_LENGTH, "512000")
+                    .body(axum::body::Body::empty())
+                    .expect("Failed to build mock HEAD response")
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener
+            .local_addr()
+            .expect("Failed to get local address")
+            .port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock_app).await;
+        });
+
+        // 2. Setup isolated AppState configured to point to our mock server
+        let config = AppConfig {
+            hf_base_url: format!("http://127.0.0.1:{}", port),
+            downloads_directory: "test_downloads_cancel".to_string(),
+            ..Default::default()
+        };
+        let _ = tokio::fs::remove_dir_all(&config.downloads_directory).await;
+        let _ = tokio::fs::create_dir_all(&config.downloads_directory).await;
+
+        let (queue_tx, _) = mpsc::channel(1);
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select test namespace and DB");
+        let (_, log_reload_handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
+
+        let oauth_client = oauth2::basic::BasicClient::new(
+            oauth2::ClientId::new("dummy".to_string()),
+            None,
+            oauth2::AuthUrl::new("http://localhost".to_string())
+                .expect("Failed to parse dummy AuthUrl"),
+            None,
+        );
+
+        let state = Arc::new(AppState {
+            queue_tx,
+            engine_status: Arc::new(Mutex::new(EngineStatus::default())),
+            telemetry: Arc::new(Mutex::new(TelemetryStore::default())),
+            auth_store: Arc::new(Mutex::new(AuthStore::default())),
+            reqwest_client: reqwest::Client::new(),
+            oauth_client,
+            config: Arc::new(config),
+            log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
+                0,
+                std::collections::VecDeque::new(),
+            )))),
+            log_reload_handle,
+            current_log_level: Arc::new(Mutex::new("info".to_string())),
+            active_downloads: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
+            db,
+            shutdown_tx: shutdown_tx.clone(),
+        });
+
+        // 3. Spawn the model downloader
+        {
+            let mut dl = state.active_downloads.lock().unwrap();
+            dl.insert("test-model-cancel".to_string(), DownloadStatus::default());
+        }
+        let state_clone = state.clone();
+        let (cancel_tx, cancel_rx) = tokio::sync::broadcast::channel(16);
+        let task = tokio::spawn(async move {
+            downloader::perform_model_download(
+                state_clone,
+                "test-model-cancel".to_string(),
+                "test/repo-cancel".to_string(),
+                "model.safetensors".to_string(),
+                shutdown_rx,
+                cancel_rx,
+            )
+            .await;
+        });
+
+        // Let it connect and download a chunk or two, using a polling loop to avoid race conditions
+        let mut downloaded_bytes = 0;
+        for i in 0..50 {
+            let active = {
+                let dl = state.active_downloads.lock().unwrap();
+                dl.get("test-model-cancel").cloned()
+            };
+            if let Some(dl) = active {
+                if dl.bytes_transferred > 0 {
+                    downloaded_bytes = dl.bytes_transferred;
+                    tracing::info!(
+                        "Test: downloader registered {} bytes. Breaking loop.",
+                        downloaded_bytes
+                    );
+                    // Give the downloader a tiny fraction of time to re-enter the `tokio::select!` block
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    break;
+                }
+            } else {
+                tracing::error!("Test: downloader task disappeared from active_downloads!");
+                break;
+            }
+            if i % 10 == 0 {
+                tracing::info!(
+                    "Test: waiting for downloader to receive bytes... (attempt {})",
+                    i
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        assert!(
+            downloaded_bytes > 0,
+            "Test timed out waiting for the download to start receiving bytes."
+        );
+
+        // 4. Fire cancel signal!
+        tracing::info!("Test: Firing cancel signal.");
+        let _ = cancel_tx.send(());
+
+        // Wait for cancellation to forcibly exit the task
+        let _ = task.await;
+
+        // 5. Verify the metadata file was saved right before exiting
+        let meta_path =
+            manager::types::resolve_absolute_path("test_downloads_cancel/model.safetensors.meta");
+        let meta_content = tokio::fs::read_to_string(&meta_path)
+            .await
+            .expect("Meta file should exist after graceful abort");
+
+        let meta_json: serde_json::Value =
+            serde_json::from_str(&meta_content).expect("Metadata content should be valid JSON");
+        let downloaded = meta_json["checkpoints"]
+            .as_array()
+            .expect("Metadata should contain a checkpoints array")
+            .last()
+            .expect("Checkpoints array should not be empty")["downloaded_bytes"]
+            .as_u64()
+            .expect("Downloaded bytes should be a valid u64");
+
+        assert!(
+            downloaded > 0,
+            "Should have downloaded at least some bytes before shutting down"
+        );
+        assert!(
+            downloaded < 512000,
+            "Should have aborted before reaching the full file size"
+        );
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all("test_downloads_cancel").await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_empty_parents() {
+        let temp_dir = std::env::temp_dir().join("test_cleanup_parents");
+        let limit_dir = temp_dir.join("limit");
+        let nested_dir = limit_dir.join("a").join("b").join("c");
+
+        // Create the nested structure
+        tokio::fs::create_dir_all(&nested_dir).await.unwrap();
+
+        // Target file path inside 'c'
+        let file_path = nested_dir.join("dummy.txt");
+
+        // Run cleanup starting from the file path
+        cleanup_empty_parents(&file_path, &limit_dir).await;
+
+        // 'c', 'b', and 'a' should be deleted because they are empty
+        assert!(!nested_dir.exists(), "c should be deleted");
+        assert!(
+            !limit_dir.join("a").join("b").exists(),
+            "b should be deleted"
+        );
+        assert!(!limit_dir.join("a").exists(), "a should be deleted");
+
+        // limit_dir should STILL exist
+        assert!(limit_dir.exists(), "limit_dir should NOT be deleted");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_empty_parents_out_of_bounds() {
+        let temp_dir = std::env::temp_dir().join("test_cleanup_oob");
+        let safe_dir = temp_dir.join("safe");
+        let out_of_bounds = temp_dir.join("oob");
+        let nested_oob = out_of_bounds.join("x").join("y");
+
+        tokio::fs::create_dir_all(&safe_dir).await.unwrap();
+        tokio::fs::create_dir_all(&nested_oob).await.unwrap();
+
+        let file_path = nested_oob.join("dummy.txt");
+
+        cleanup_empty_parents(&file_path, &safe_dir).await;
+
+        assert!(
+            nested_oob.exists(),
+            "y should NOT be deleted because it is outside limit_dir bounds"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

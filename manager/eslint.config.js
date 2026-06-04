@@ -27,44 +27,16 @@ export default [
         fetchWithAuth: 'readonly',
         getGenerationParameters: 'readonly',
         injectNavbar: 'readonly',
+        SharedDownloadProgress: 'readonly',
+        downloadModel: 'readonly',
         
         // Globals from chat.js
         initializeUI: 'readonly',
         updateDropdownCompatibility: 'readonly',
         loadSessions: 'readonly',
         loadSession: 'readonly',
-        startNewSession: 'readonly',
-        clearChat: 'readonly',
-        appendMessage: 'readonly',
-        ensureSession: 'readonly',
-        appendMessageToDB: 'readonly',
-        truncateMessagesInDB: 'readonly',
-        sendMessage: 'readonly',
-        regenerateLast: 'readonly',
-        
-        // Globals from stats.js
-        openBenchmarkModal: 'readonly',
-        updateBenchmarkCompatibility: 'readonly',
-        closeModal: 'readonly',
-        submitBenchmark: 'readonly',
-        loadDashboard: 'readonly',
-        renderSpeedChart: 'readonly',
-        renderTokenChart: 'readonly',
-        renderTokTimeChart: 'readonly',
-        checkStatus: 'readonly',
-        
-        // Globals from memory.js
-        formatMB: 'readonly',
-        formatGB: 'readonly',
-        formatTime: 'readonly',
-        switchTab: 'readonly',
-        updateDashboard: 'readonly',
-        
-        // Globals from settings.js and models.js
-        openKeyModal: 'readonly',
-        closeKeyModal: 'readonly',
-        submitNewKey: 'readonly',
-        deleteKey: 'readonly',
+
+        // Globals from various pages
         loadKeys: 'readonly',
         loadModels: 'readonly'
       }

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Account Settings</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
+    <link rel="stylesheet" href="/css/common.css">
+</head>
+<body>
+    <header>
+        <h1>Account Settings</h1>
+    </header>
+
+    <div class="key-container">
+        <div class="flex-between-center">
+            <h2>API Keys</h2>
+            <button id="open-key-modal-btn" class="btn-run bg-green text-base">+ Create New Key</button>
+        </div>
+        <p class="text-subtext0 text-09">Keys are mathematically hashed using SHA-256 before being stored on our servers. For your security, we cannot show you a key after it is generated.</p>
+        
+        <table class="settings-table">
+            <thead><tr><th>Name</th><th>Description</th><th>Key Hash Prefix</th><th>Action</th></tr></thead>
+            <tbody id="keys-tbody"></tbody>
+        </table>
+    </div>
+
+    <div id="new-key-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Create API Key</h2>
+            <div class="mb-15">
+                <label>Name (required)</label><br>
+                <input type="text" id="new-key-name" class="input-field" placeholder="e.g. Python Script">
+            </div>
+            <div class="mb-15">
+                <label>Description (optional)</label><br>
+                <input type="text" id="new-key-desc" class="input-field" placeholder="e.g. Used for nightly cron job">
+            </div>
+            <div class="modal-actions">
+                <button id="new-key-cancel-btn" class="btn-cancel">Cancel</button>
+                <button id="create-key-btn" class="btn-run">Generate Key</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="delete-key-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Revoke API Key</h2>
+            <p class="mb-20">Are you sure you want to permanently revoke this key? External apps using it will instantly fail.</p>
+            <div class="modal-actions">
+                <button class="btn-cancel" id="delete-key-cancel-btn">Cancel</button>
+                <button class="btn-run bg-red text-base" id="delete-key-confirm-btn">Revoke</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/settings.js"></script>
+</body>
+</html>

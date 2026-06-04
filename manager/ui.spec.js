@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
  * Intercepts browser requests and serves the raw HTML/JS/CSS files from the disk.
  */
 async function mockStaticAssets(page) {
-    const basePath = __dirname;
+    const basePath = path.join(__dirname, 'web');
 
     // Mock HTML routes
     const routes = {
@@ -21,6 +21,7 @@ async function mockStaticAssets(page) {
         '/settings': 'settings.html',
         '/stats': 'stats.html',
         '/console': 'console.html',
+        '/queue': 'queue.html',
     };
 
     for (const [routePath, file] of Object.entries(routes)) {
@@ -68,13 +69,17 @@ async function mockEngineApis(page) {
     });
 
     await page.route('**/api/models', route => {
-        route.fulfill({
-            status: 200,
-            json: [
-                { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {} },
-                { id: 'mock-comp-1', name: 'Mock Compressor', roles: ['ContextCompressor'], supported_backends: ['Candle'], arch: 'XLMRoberta', parameters_billions: 0.5, size_on_disk_gb: 1.0, max_context_len: 1024, provenance: {} }
-            ]
-        });
+        if (route.request().method() === 'GET') {
+            route.fulfill({
+                status: 200,
+                json: [
+                    { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: true },
+                    { id: 'mock-comp-1', name: 'Mock Compressor', roles: ['ContextCompressor'], supported_backends: ['Candle'], arch: 'XLMRoberta', parameters_billions: 0.5, size_on_disk_gb: 1.0, max_context_len: 1024, provenance: {}, is_downloaded: true }
+                ]
+            });
+        } else {
+            route.fallback();
+        }
     });
 
     const handleSessionsRoute = route => {
@@ -108,15 +113,43 @@ async function mockEngineApis(page) {
         // Grant console access to the UI by mocking a successful 200 OK
         route.fulfill({ status: 200, json: { level: 'info' } });
     });
+
+    await page.route('**/api/downloads', async route => {
+        if (route.request().method() === 'GET') {
+            await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+        } else {
+            route.fallback();
+        }
+    });
 }
 
 test.describe('Mini Inference Engine - UI Functionality', () => {
-    test.beforeEach(async ({ page }) => {
-        // Route browser console logs and uncaught errors directly to the terminal
-        page.on('pageerror', err => console.log(`[Browser Exception]: ${err.message}`));
+    test.beforeEach(async ({ page }, testInfo) => {
+        // Fail tests on any Content Security Policy violation or uncaught browser error
+        page.on('pageerror', err => {
+            if (err.message.includes("Content Security Policy")) {
+                throw new Error(`CSP VIOLATION: ${err.message}`);
+            }
+            throw err; // Re-throw other errors to fail the test
+        });
+
         page.on('console', msg => {
             if (msg.type() === 'error' || msg.type() === 'warning') {
-                console.log(`[Browser Console]: ${msg.text()}`);
+                const text = msg.text();
+
+                // Ignore expected intentional errors from network interruption tests
+                if (testInfo.title.includes('network interruptions') || testInfo.title.includes('network errors')) {
+                    if (text.includes('interrupted, retrying in 5s') || text.includes('502 (Bad Gateway)')) {
+                        return;
+                    }
+                }
+
+                // Ignore expected intentional errors from server drop tests
+                if (testInfo.title.includes('ServerDropped') && text.includes('Download was stopped on the server.')) {
+                    return;
+                }
+
+                console.log(`[Browser Console]: ${text}`);
             }
         });
 
@@ -199,11 +232,62 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         await expect(page.locator('#new-key-modal')).not.toBeVisible();
     });
 
+    test('Settings UI resists XSS payloads in API Key names and descriptions', async ({ page }) => {
+        await page.route('**/api/settings/keys', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: [{
+                        name: '<script>alert("XSS-Name")</script>MaliciousName',
+                        hash: 'abcdef1234567890',
+                        description: '<img src="x" onerror="alert(\'XSS-Desc\')">MaliciousDesc'
+                    }]
+                });
+            } else {
+                route.fallback();
+            }
+        });
+
+        let alertFired = false;
+        page.on('dialog', dialog => {
+            alertFired = true;
+            dialog.dismiss();
+        });
+
+        await page.goto('/settings');
+
+        const tbody = page.locator('#keys-tbody');
+        await expect(tbody).toBeVisible();
+
+        // Because settings.js uses .textContent, the literal HTML tags should be rendered to the screen
+        // safely, rather than being stripped out or executed.
+        await expect(tbody).toContainText('<script>');
+        await expect(tbody).toContainText('alert("XSS-Name")');
+        await expect(tbody).toContainText('<img');
+
+        // Confirm no actual code execution occurred
+        expect(alertFired).toBe(false);
+    });
+
     test('Models Directory renders the model configuration cards', async ({ page }) => {
         await page.goto('/models');
         
-        const modelCards = page.locator('.model-card');
+        const modelCards = page.locator('.model-dir-card');
         await expect(modelCards).toHaveCount(2); // Based on our mock Apis output
+        await expect(modelCards.first()).toContainText('Mock Chat Model');
+    });
+
+    test('Models Directory renders even if status API fails or is slow', async ({ page }) => {
+        // Mock status API to hang indefinitely to simulate extreme slowness/failure
+        await page.route('**/api/status', () => {
+            // Do not fulfill the route, leaving it hanging
+        });
+
+        await page.goto('/models');
+        
+        const modelCards = page.locator('.model-dir-card');
+        // The models should load immediately without waiting for the status API
+        await expect(modelCards).toHaveCount(2);
         await expect(modelCards.first()).toContainText('Mock Chat Model');
     });
 
@@ -266,6 +350,63 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         const navigatedSession2 = page.locator('.session-item', { hasText: 'Second Chat Session' });
         await expect(navigatedSession2).toHaveClass(/active/);
         await expect(page.locator('.ai-message').last()).toContainText('Persistent message');
+    });
+
+    test('Chat UI resists XSS payloads in session titles and messages', async ({ page }) => {
+        // Intercept session list to inject XSS in the title
+        await page.route('**/api/chat/sessions?*', async route => {
+            await route.fulfill({
+                status: 200,
+                json: [{ 
+                    id: 'xss-session', 
+                    title: '<script>alert("XSS-Title")</script>', 
+                    updated_at: 1678886400, 
+                    email: 'mock@example.com' 
+                }]
+            });
+        });
+
+        // Intercept session messages to inject XSS in the chat history
+        await page.route('**/api/chat/sessions/xss-session*', async route => {
+            await route.fulfill({
+                status: 200,
+                json: { 
+                    id: 'xss-session', 
+                    title: '<script>alert("XSS-Title")</script>', 
+                    updated_at: 1678886400, 
+                    email: 'mock@example.com', 
+                    messages: [{ 
+                        role: 'assistant', 
+                        content: '<img src="x" onerror="alert(\'XSS-Message\')">Malicious Message' 
+                    }] 
+                }
+            });
+        });
+
+        let alertFired = false;
+        page.on('dialog', dialog => {
+            alertFired = true;
+            dialog.dismiss();
+        });
+
+        await page.goto('/');
+
+        // Wait for the session to load in the sidebar
+        const sessionItem = page.locator('.session-item[data-id="xss-session"]');
+        await expect(sessionItem).toBeVisible();
+        
+        // Check that the literal text is visible (proving it wasn't parsed as HTML tags)
+        await expect(sessionItem.locator('.session-title')).toContainText('<script>');
+        
+        // Click the session to load the messages
+        await sessionItem.click();
+        
+        const aiMessage = page.locator('.ai-message').last();
+        await expect(aiMessage).toBeVisible();
+        await expect(aiMessage).toContainText('<img src="x" onerror="alert(\'XSS-Message\')">Malicious Message');
+
+        // Confirm no alerts fired
+        expect(alertFired).toBe(false);
     });
 
     test('Chat UI restores last session from localStorage even if not in initial API results', async ({ page }) => {
@@ -410,5 +551,464 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
             const container = document.getElementById('chat-container');
             return Math.abs(container.scrollHeight - container.scrollTop - container.clientHeight) <= 2;
         });
+    });
+
+    test('Models Directory handles streaming download progress', async ({ page }) => {
+        const downloadState = {};
+        const modelState = [
+            { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: true },
+            { id: 'mock-comp-1', name: 'Mock Compressor', roles: ['ContextCompressor'], supported_backends: ['Candle'], arch: 'XLMRoberta', parameters_billions: 0.5, size_on_disk_gb: 1.0, max_context_len: 1024, provenance: {}, is_downloaded: false }
+        ];
+
+        await page.route('**/api/models', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(modelState) });
+            } else {
+                route.fallback();
+            }
+        });
+        
+        await page.route('**/api/models/*', async route => {
+            if (route.request().method() === 'GET') {
+                const id = route.request().url().split('/').pop();
+                const model = modelState.find(m => m.id === id);
+                if (model) await route.fulfill({ status: 200, json: model });
+                else await route.fulfill({ status: 404 });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(downloadState) });
+            } else if (route.request().method() === 'POST') {
+                const postData = JSON.parse(route.request().postData());
+                if (postData.model_id === 'mock-comp-1') {
+                    downloadState['mock-comp-1'] = {
+                        bytes_transferred: 52428800, // 50 MB
+                        total_bytes: 104857600,      // 100 MB
+                        current_speed_bps: 10485760, // 10 MB/s
+                        start_time: Math.floor(Date.now() / 1000) - 5,
+                        state: 'Downloading...'
+                    };
+                }
+                await route.fulfill({ status: 202, body: '' });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.goto('/models');
+
+        const compCard = page.locator('#model-card-mock-comp-1');
+        await expect(compCard).toHaveClass(/model-undownloaded/);
+        
+        const downloadBtn = compCard.locator('.btn-download');
+        await downloadBtn.click();
+
+        const progressContainer = compCard.locator('.download-progress-container');
+        await expect(progressContainer).toBeVisible();
+        await expect(progressContainer.locator('.download-stats')).toContainText('50.0%');
+        await expect(progressContainer.locator('.download-stats')).toContainText('10.0 MB/s');
+
+        // Simulate completion
+        delete downloadState['mock-comp-1'];
+        modelState[1].is_downloaded = true;
+
+        // Polling will detect activeIds is empty and trigger loadModels. We use expect's
+        // polling to wait for the UI to update after the app's own setInterval fires.
+        await expect(async () => {
+            await expect(compCard.locator('.badge-json', { hasText: 'Ready' })).toBeVisible();
+        }).toPass();
+        await expect(compCard).not.toHaveClass(/model-undownloaded/);
+    });
+
+    test('Chat UI initiates model download before generation if missing', async ({ page }) => {
+        const downloadState = {};
+        const modelState = [
+            { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: false },
+            { id: 'mock-comp-1', name: 'Mock Compressor', roles: ['ContextCompressor'], supported_backends: ['Candle'], arch: 'XLMRoberta', parameters_billions: 0.5, size_on_disk_gb: 1.0, max_context_len: 1024, provenance: {}, is_downloaded: true }
+        ];
+
+        // Mock models so the selected chat model is NOT downloaded
+        await page.route('**/api/models', route => {
+            route.fulfill({
+                status: 200,
+                json: modelState
+            });
+        });
+
+        await page.route('**/api/models/*', async route => {
+            if (route.request().method() === 'GET') {
+                const id = route.request().url().split('/').pop();
+                const model = modelState.find(m => m.id === id);
+                if (model) await route.fulfill({ status: 200, json: model });
+                else await route.fulfill({ status: 404 });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, json: downloadState });
+            } else if (route.request().method() === 'POST') {
+                const postData = JSON.parse(route.request().postData());
+                if (postData.model_id === 'mock-model-1') {
+                    downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 1000000, start_time: 0, state: 'Downloading...' };
+                }
+                await route.fulfill({ status: 202, body: '' });
+            } else {
+                route.fallback();
+            }
+        });
+
+        // Mock generate
+        await page.route('**/api/generate', route => {
+            route.fulfill({ status: 200, body: 'Generation after download.', contentType: 'text/plain' });
+        });
+
+        await page.goto('/');
+
+        // Wait for UI to initialize
+        await expect(page.locator('#chat-model-select option')).not.toHaveCount(0);
+
+        await page.locator('#prompt-input').fill('Test download');
+        await page.locator('#send-btn').click();
+
+        // The download bar should appear dynamically in the chat
+        const progressContainer = page.locator('.download-progress-container');
+        await expect(progressContainer).toBeVisible();
+        await expect(progressContainer.locator('#dl-stats-mock-model-1')).toContainText('50.0%');
+
+        // Simulate completion
+        delete downloadState['mock-model-1'];
+        modelState[0].is_downloaded = true;
+
+        // Wait for generation to complete (after the simulated download finishes)
+        await expect(page.locator('.ai-message').last()).toContainText('Generation after download.');
+    });
+
+    test('Models Directory handles download cancellation', async ({ page }) => {
+        const downloadState = {};
+        const modelState = [
+            { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: false }
+        ];
+
+        await page.route('**/api/models', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(modelState) });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(downloadState) });
+            } else if (route.request().method() === 'POST') {
+                const postData = JSON.parse(route.request().postData());
+                if (postData.model_id === 'mock-model-1') {
+                    downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 10, start_time: Math.floor(Date.now() / 1000), state: 'Downloading...' };
+                }
+                await route.fulfill({ status: 202, body: '' });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.goto('/models');
+        const card = page.locator('#model-card-mock-model-1');
+        await card.locator('.btn-download').click();
+
+        const progressContainer = card.locator('.download-progress-container');
+        await expect(progressContainer).toBeVisible();
+
+        // Click cancel and verify it escapes the retry loop
+        await progressContainer.locator('.dl-cancel-btn').click();
+        await expect(progressContainer.locator('.download-stats')).toContainText('Download Canceled.');
+    });
+
+    test('Models Directory recovers from network interruptions during download', async ({ page }) => {
+        const downloadState = {};
+        let isDownloaded = false;
+        
+        await page.route('**/api/models', async route => {
+            route.fulfill({
+                status: 200,
+                json: [{ id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: isDownloaded }]
+            });
+        });
+
+        await page.route('**/api/models/*', async route => {
+            if (route.request().method() === 'GET') {
+                const id = route.request().url().split('/').pop();
+                if (id === 'mock-model-1') {
+                    await route.fulfill({ status: 200, json: { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: isDownloaded } });
+                } else {
+                    await route.fulfill({ status: 404 });
+                }
+            } else {
+                route.fallback();
+            }
+        });
+
+        let simulateDrop = false;
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                if (simulateDrop) {
+                    await route.fulfill({ status: 502, body: 'Bad Gateway' });
+                } else {
+                    await route.fulfill({ status: 200, json: downloadState });
+                }
+            } else if (route.request().method() === 'POST') {
+                downloadState['mock-model-1'] = { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 10, start_time: 0, state: "Downloading..." };
+                await route.fulfill({ status: 202, body: '' });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.goto('/models');
+        const card = page.locator('#model-card-mock-model-1');
+        await card.locator('.btn-download').click();
+
+        const stats = card.locator('.download-stats');
+        await expect(stats).toContainText('50.0%');
+        simulateDrop = true; // Simulate network drop
+        await expect(stats).toContainText('Retrying in 5s...');
+        
+        simulateDrop = false; // Recover network
+        downloadState['mock-model-1'].bytes_transferred = 100;
+        await expect(stats).toContainText('100.0%', { timeout: 15000 }); // Wait for the 5s loop to recover
+        
+        delete downloadState['mock-model-1']; // Simulate Finish
+        isDownloaded = true;
+        await expect(card.locator('.badge-json', { hasText: 'Ready' })).toBeVisible();
+    });
+
+    test('Queue UI displays downloads and supports admin actions', async ({ page }) => {
+        let deleteCalled = false;
+        let pauseCalled = false;
+        let clearAllCalled = false;
+
+        await page.route('**/api/downloads/mock-model-2', async route => {
+            if (route.request().method() === 'DELETE') {
+                deleteCalled = true;
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        await page.route('**/api/downloads/mock-model-1/pause', async route => {
+            if (route.request().method() === 'POST') {
+                pauseCalled = true;
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        'mock-model-1': { bytes_transferred: 5242880, total_bytes: 10485760, current_speed_bps: 1048576, start_time: 0, state: 'Downloading...' },
+                        'mock-model-2': { bytes_transferred: 0, total_bytes: 0, current_speed_bps: 0, start_time: 0, state: 'Queued...' }
+                    }
+                });
+            } else if (route.request().method() === 'DELETE') {
+                clearAllCalled = true;
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        // Automatically accept any confirm() dialogs (Clear All / Cancel)
+        page.on('dialog', dialog => dialog.accept());
+
+        await page.goto('/queue');
+
+        const tbody = page.locator('#queue-tbody');
+        await expect(tbody).toContainText('mock-model-1');
+        await expect(tbody).toContainText('mock-model-2');
+        await expect(tbody).toContainText('Downloading...');
+        await expect(tbody).toContainText('Queued...');
+
+        // Test individual Cancel
+        await page.locator('tr', { hasText: 'mock-model-2' }).locator('button', { hasText: 'Cancel' }).click();
+        expect(deleteCalled).toBe(true);
+
+        // Test individual Pause
+        await page.locator('tr', { hasText: 'mock-model-1' }).locator('button', { hasText: 'Pause' }).click();
+        expect(pauseCalled).toBe(true);
+
+        // Test Clear All
+        await page.locator('#clear-all-btn').click();
+        expect(clearAllCalled).toBe(true);
+    });
+
+    test('Queue UI sanitizes malicious XSS payloads in model IDs and status', async ({ page }) => {
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        // Inject XSS payload into the Model ID
+                        '<img src="x" onerror="alert(\'XSS-ID\')">malicious-model': { 
+                            bytes_transferred: 50, 
+                            total_bytes: 100, 
+                            current_speed_bps: 10, 
+                            start_time: 0, 
+                            // Inject XSS payload into the Status string
+                            state: '<script>alert("XSS-STATUS")</script>Downloading...' 
+                        }
+                    }
+                });
+            } else { 
+                route.fallback(); 
+            }
+        });
+
+        // Listen for browser dialogs. If an alert fires, the XSS attack succeeded!
+        let alertFired = false;
+        page.on('dialog', dialog => {
+            alertFired = true;
+            dialog.dismiss();
+        });
+
+        await page.goto('/queue');
+
+        const tbody = page.locator('#queue-tbody');
+        
+        // Wait for the table to render the stripped text
+        await expect(tbody).toContainText('malicious-model');
+        await expect(tbody).toContainText('Downloading...');
+
+        // Explicitly verify the malicious tags were completely purged from the inner HTML
+        const rowHtml = await tbody.innerHTML();
+        expect(rowHtml).not.toContain('<img');
+        expect(rowHtml).not.toContain('<script');
+        expect(alertFired).toBe(false);
+    });
+
+    test('SharedDownloadProgress prevents redundant API requests', async ({ page }) => {
+        let apiCallCount = 0;
+        
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                apiCallCount++;
+                await new Promise(resolve => setTimeout(resolve, 50));
+                await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+            } else {
+                route.fallback();
+            }
+        });
+
+        // Use the chat page, which does not aggressively poll on load by default
+        await page.goto('/');
+        apiCallCount = 0; // Reset in case any immediate load checks occurred
+
+        // Fire 5 simultaneous requests from the UI
+        await page.evaluate(async () => {
+            const promises = Array.from({ length: 5 }).map(() => SharedDownloadProgress.get());
+            await Promise.all(promises);
+        });
+
+        // The poller should have coalesced all 5 requests into exactly 1 network call
+        expect(apiCallCount).toBe(1);
+
+        // Wait for the 500ms cache TTL to expire
+        await page.waitForTimeout(600);
+
+        // Fire another request; it should bypass the expired cache
+        await page.evaluate(async () => await SharedDownloadProgress.get());
+        expect(apiCallCount).toBe(2);
+    });
+
+    test('Models Directory handles download dropped by server (ServerDropped)', async ({ page }) => {
+        await page.route('**/api/models', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: [{ id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: false }]
+                });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.route('**/api/models/mock-model-1', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, json: { is_downloaded: false } });
+            } else {
+                route.fallback();
+            }
+        });
+
+        let postCount = 0;
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'GET') {
+                if (postCount === 1) {
+                    await route.fulfill({ status: 200, json: { 'mock-model-1': { bytes_transferred: 10, total_bytes: 100, current_speed_bps: 10, start_time: 0, state: 'Downloading...' } } });
+                    postCount++; // Increment so next poll gets empty object
+                } else {
+                    await route.fulfill({ status: 200, json: {} });
+                }
+            } else if (route.request().method() === 'POST') {
+                postCount++;
+                await route.fulfill({ status: 202, body: '' });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.goto('/models');
+        
+        const card = page.locator('#model-card-mock-model-1');
+        await card.locator('.btn-download').click();
+
+        await expect(card.locator('.download-stats')).toContainText('Download Stopped.', { timeout: 10000 });
+        expect(postCount).toBe(2);
+    });
+
+    test('Models Directory retries on network errors or 429 Too Many Requests', async ({ page }) => {
+        await page.route('**/api/models', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: [{ id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: false }]
+                });
+            } else {
+                route.fallback();
+            }
+        });
+
+        let postCalled = false;
+        let errorServed = false;
+        await page.route('**/api/downloads', async route => {
+            if (route.request().method() === 'POST') {
+                postCalled = true;
+                await route.fulfill({ status: 202, body: '' });
+            } else if (route.request().method() === 'GET') {
+                if (postCalled && !errorServed) {
+                    errorServed = true;
+                    await route.fulfill({ status: 502, body: 'Bad Gateway' });
+                } else if (postCalled && errorServed) {
+                    await route.fulfill({ status: 200, json: { 'mock-model-1': { bytes_transferred: 50, total_bytes: 100, current_speed_bps: 1000, start_time: 0, state: 'Downloading...' } } });
+                } else {
+                    // Before POST, just return empty so discoverActiveDownloads does nothing
+                    await route.fulfill({ status: 200, json: {} });
+                }
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.goto('/models');
+        
+        const card = page.locator('#model-card-mock-model-1');
+        await card.locator('.btn-download').click();
+
+        await expect(card.locator('.download-stats')).toContainText('Retrying', { timeout: 6000 });
+        await expect(card.locator('.download-stats')).toContainText('50.0%', { timeout: 10000 });
     });
 });

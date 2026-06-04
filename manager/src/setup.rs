@@ -8,18 +8,21 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 
 use crate::{
     AppConfig, AppState, LogReloadHandle, SharedLogBuffer, append_chat_message, auth,
-    clear_console_logs, delete_chat_session, get_chat_session, get_console_loglevel,
-    get_console_logs, get_models, get_stats_data, get_status, handle_generate, list_chat_sessions,
+    cancel_all_downloads, cancel_download, clear_console_logs, delete_chat_session, delete_model,
+    get_chat_session, get_console_loglevel, get_console_logs, get_download_progress, get_model,
+    get_models, get_stats_data, get_status, handle_generate, list_chat_sessions, pause_download,
     save_chat_session, serve_chat_js, serve_common_css, serve_common_js, serve_console_js,
     serve_console_ui, serve_memory_js, serve_memory_ui, serve_models_js, serve_models_ui,
-    serve_settings_js, serve_settings_ui, serve_stats_js, serve_stats_ui, serve_ui,
-    set_console_loglevel, trigger_benchmark, truncate_chat_messages,
+    serve_queue_js, serve_queue_ui, serve_settings_js, serve_settings_ui, serve_stats_js,
+    serve_stats_ui, serve_ui, set_console_loglevel, trigger_benchmark, trigger_download,
+    truncate_chat_messages,
 };
 
 pub async fn init_db(
     config: &AppConfig,
 ) -> Result<surrealdb::Surreal<surrealdb::engine::any::Any>, Box<dyn std::error::Error>> {
-    let jwt = match std::fs::read_to_string(&config.database.jwt_file_path) {
+    let jwt_path = manager::types::resolve_absolute_path(&config.database.jwt_file_path);
+    let jwt = match tokio::fs::read_to_string(&jwt_path).await {
         Ok(content) => content,
         Err(e) => {
             let msg = format!(
@@ -143,6 +146,7 @@ pub fn build_web_routes() -> Router<Arc<AppState>> {
         .route("/", get(serve_ui))
         .route("/settings", get(serve_settings_ui))
         .route("/models", get(serve_models_ui))
+        .route("/queue", get(serve_queue_ui))
         .route("/stats", get(serve_stats_ui))
         .route("/memory", get(serve_memory_ui))
         .route("/console", get(serve_console_ui))
@@ -151,6 +155,7 @@ pub fn build_web_routes() -> Router<Arc<AppState>> {
         .route("/js/stats.js", get(serve_stats_js))
         .route("/js/settings.js", get(serve_settings_js))
         .route("/js/memory.js", get(serve_memory_js))
+        .route("/js/queue.js", get(serve_queue_js))
         .route("/js/console.js", get(serve_console_js))
         .route("/js/common.js", get(serve_common_js))
         .route("/css/common.css", get(serve_common_css))
@@ -186,6 +191,15 @@ pub fn build_engine_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             delete(truncate_chat_messages),
         )
         .route("/api/models", get(get_models))
+        .route("/api/models/{id}", get(get_model).delete(delete_model))
+        .route(
+            "/api/downloads",
+            get(get_download_progress)
+                .post(trigger_download)
+                .delete(cancel_all_downloads),
+        )
+        .route("/api/downloads/{id}", delete(cancel_download))
+        .route("/api/downloads/{id}/pause", post(pause_download))
         .route("/api/status", get(get_status))
         .route("/api/stats/data", get(get_stats_data))
         .route(

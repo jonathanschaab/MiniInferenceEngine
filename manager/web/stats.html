@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Engine Telemetry</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
+    <link rel="stylesheet" href="/css/common.css">
+</head>
+<body>
+    <header>
+        <h1>Engine Telemetry Dashboard</h1>
+    </header>
+
+    <!-- Session Control Bar -->
+    <div class="control-bar">
+        <div class="control-group">
+            <button id="btn-run-benchmark" class="btn-nav bg-blue">▶ Run Benchmark</button>
+        </div>
+        <div class="control-group">
+            <button id="toggle-parameters-btn" class="btn-nav bg-sky">🎛️ Parameters</button>
+        </div>
+    </div>
+
+    <div id="parameters-panel" class="parameters-panel">
+        <div class="param-group">
+            <label for="param-temp">Temperature: <span id="val-temp">0.7</span></label>
+            <input type="range" id="param-temp" min="0" max="2" step="0.1" value="0.7">
+        </div>
+        <div class="param-group">
+            <label for="param-top-p">Top-P: <span id="val-top-p">0.95</span></label>
+            <input type="range" id="param-top-p" min="0" max="1" step="0.05" value="0.95">
+        </div>
+        <div class="param-group">
+            <label for="param-top-k">Top-K:</label>
+            <input type="number" id="param-top-k" min="1" max="100" value="40" class="input-number-sm">
+        </div>
+        <div class="param-group">
+            <label for="param-max-tokens">Max Tokens:</label>
+            <input type="number" id="param-max-tokens" min="1" max="8192" value="500" class="input-number-md">
+        </div>
+        <div class="param-group">
+            <label for="param-seed">Seed (Optional):</label>
+            <input type="number" id="param-seed" placeholder="Random" class="input-number-lg">
+        </div>
+        <div class="param-group">
+            <label for="param-context-buffer">Ctx Buffer:</label>
+            <input type="number" id="param-context-buffer" min="0" max="128000" value="1024" class="input-number-md">
+        </div>
+        <div class="param-group">
+            <label for="param-yarn-enabled">YaRN Extension:</label>
+            <input type="checkbox" id="param-yarn-enabled" checked class="checkbox-lg">
+        </div>
+    </div>
+
+    <div class="p-20">
+
+        <div id="benchmark-banner" class="benchmark-banner">
+            ⚠️ An automated benchmark suite is currently running. The GPU is heavily utilized and chat responses will be delayed.
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Model Name</th>
+                    <th>Parameters</th>
+                    <th>Size on Disk</th>
+                    <th>Max Context</th>
+                </tr>
+            </thead>
+            <tbody id="model-table-body"></tbody>
+        </table>
+
+        <div class="chart-container">
+            <canvas id="speedChart"></canvas>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="tokenChart"></canvas>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="tokTimeChart"></canvas>
+        </div>
+
+        <div id="benchmark-modal" class="modal-overlay">
+            <div class="modal-content">
+                <h2>Select Backends</h2>
+                <div id="backend-checkbox-list" class="model-list">
+                </div>
+                <h2>Select Models to Benchmark</h2>
+                <div id="model-checkbox-list" class="model-list mb-20">
+                </div>
+                <div class="modal-actions">
+                    <button id="close-benchmark-btn" class="btn-cancel">Cancel</button>
+                    <button id="submit-benchmark-btn" class="btn-run">Run Selected</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/stats.js"></script>
+</body>
+</html>

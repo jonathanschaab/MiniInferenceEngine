@@ -1,6 +1,5 @@
 const colorPalette = ['#89b4fa', '#f38ba8', '#a6e3a1', '#f9e2af', '#cba6f7', '#94e2d5'];
 
-/* eslint-disable-next-line no-unused-vars -- Called by: stats.html button onclick="openBenchmarkModal()" */
 async function openBenchmarkModal() {
     if (isBenchmarking) {
         alert("A benchmark is already running!");
@@ -21,8 +20,8 @@ async function openBenchmarkModal() {
             modelsHtml += `
                 <label class="model-item">
                     <input type="checkbox" class="model-cb" value="${DOMPurify.sanitize(m.id)}" data-backends="${backendsStr}" checked>
-                    ${DOMPurify.sanitize(m.name)} <span style="color: #6c7086; margin-left: 5px;">(${DOMPurify.sanitize(m.arch)})</span>
-                    <span class="incompatible-warning" style="display: none; color: #f38ba8; margin-left: auto; font-size: 0.85em; font-style: italic;">(Incompatible)</span>
+                    ${DOMPurify.sanitize(m.name)} <span class="text-overlay0 ml-5">(${DOMPurify.sanitize(m.arch)})</span>
+                    <span class="incompatible-warning">(Incompatible)</span>
                 </label>
             `;
             m.supported_backends.forEach(b => allBackends.add(b));
@@ -62,6 +61,7 @@ function updateBenchmarkCompatibility() {
         
         cb.disabled = !supported;
         cb.parentElement.style.opacity = supported ? "1" : "0.5";
+        cb.parentElement.title = supported ? "" : "This model is disabled because it is not supported by any of the currently selected backends.";
         
         const warningSpan = cb.parentElement.querySelector('.incompatible-warning');
         if (warningSpan) {
@@ -74,7 +74,6 @@ function closeModal() {
     document.getElementById('benchmark-modal').style.display = 'none';
 }
 
-/* eslint-disable-next-line no-unused-vars -- Called by: stats.html modal button onclick="submitBenchmark()" */
 async function submitBenchmark() {
     // Gather all checked boxes that are currently compatible (not disabled)
     const checkboxes = document.querySelectorAll('#model-checkbox-list input:checked:not(:disabled)');
@@ -98,20 +97,24 @@ async function submitBenchmark() {
     closeModal();
 
     // Fire the updated POST request
-    const res = await fetchWithAuth('/api/stats/collect', { 
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ 
-        models: selectedModels,
-        target_backends: selectedBackends,
-        parameters: parameters
-    })
-    });
-
-    if (res.status === 409) {
-        alert("A benchmark is already running in the background!");
-    } else {
+    try {
+        await fetchWithAuth('/api/stats/collect', { 
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                models: selectedModels,
+                target_backends: selectedBackends,
+                parameters: parameters
+            })
+        });
         checkStatus(); // Instantly lock the UI
+    } catch (e) {
+        if (e.message && e.message.includes('409')) {
+            alert("A benchmark is already running in the background!");
+        } else {
+            console.error("Failed to start benchmark:", e);
+            alert("Failed to start benchmark. Check console for details.");
+        }
     }
 }
 
@@ -177,7 +180,7 @@ function populateTable(models, loads) {
             if (loadAverages[m.id] && loadAverages[m.id][b]) {
                 rowHTML += `<td>${Math.round(loadAverages[m.id][b].sum / loadAverages[m.id][b].count)} ms</td>`;
             } else {
-                rowHTML += `<td><span style="color:#6c7086;">-</span></td>`;
+                rowHTML += `<td><span class="text-overlay0">-</span></td>`;
             }
         });
         rowHTML += `</tr>`;
@@ -390,4 +393,14 @@ setInterval(checkStatus, 2000);
 window.onload = () => {
     loadDashboard();
     checkStatus();
+    
+    document.getElementById('btn-run-benchmark')?.addEventListener('click', openBenchmarkModal);
+    document.getElementById('toggle-parameters-btn')?.addEventListener('click', () => {
+        const panel = document.getElementById('parameters-panel');
+        panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+    });
+    document.getElementById('close-benchmark-btn')?.addEventListener('click', closeModal);
+    document.getElementById('submit-benchmark-btn')?.addEventListener('click', submitBenchmark);
+    document.getElementById('param-temp')?.addEventListener('input', function() { document.getElementById('val-temp').innerText = this.value; });
+    document.getElementById('param-top-p')?.addEventListener('input', function() { document.getElementById('val-top-p').innerText = this.value; });
 };

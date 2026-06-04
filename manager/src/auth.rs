@@ -14,7 +14,7 @@ use oauth2::{
 use rand::{RngCore, thread_rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use surrealdb::{Surreal, engine::any::Any};
 use tokio::sync::mpsc::UnboundedSender;
 use tower_sessions::Session;
@@ -154,14 +154,15 @@ struct GoogleClientSecretWeb {
 
 // --- OAUTH2 CLIENT SETUP ---
 
-pub fn build_oauth_client(
+pub async fn build_oauth_client(
     redirect_uri: &str,
     secret_path: &str,
     auth_url: &str,
     token_url: &str,
 ) -> Result<BasicClient, String> {
+    let abs_secret_path = manager::types::resolve_absolute_path(secret_path);
     // 1. Read the JSON file from the disk
-    let file_content = match fs::read_to_string(secret_path) {
+    let file_content = match tokio::fs::read_to_string(&abs_secret_path).await {
         Ok(c) => c,
         Err(e) => {
             let msg = format!(
@@ -312,10 +313,7 @@ pub async fn list_keys_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ApiKeyRecord>>, StatusCode> {
     let email = require_session(session).await?;
-    let store = state
-        .auth_store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store = manager::lock_mutex(&state.auth_store);
     let keys = store.api_keys.get(&email).cloned().unwrap_or_default();
     Ok(Json(keys))
 }
@@ -326,10 +324,7 @@ pub async fn create_key_handler(
     Json(payload): Json<CreateKeyRequest>,
 ) -> Result<Json<String>, StatusCode> {
     let email = require_session(session).await?;
-    let mut store = state
-        .auth_store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut store = manager::lock_mutex(&state.auth_store);
     let new_key = store.generate_key(&email, payload.name, payload.description);
     Ok(Json(new_key))
 }
@@ -340,10 +335,7 @@ pub async fn delete_key_handler(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, StatusCode> {
     let email = require_session(session).await?;
-    let mut store = state
-        .auth_store
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut store = manager::lock_mutex(&state.auth_store);
     if store.revoke_key(&email, &hash) {
         Ok(StatusCode::OK)
     } else {
@@ -374,10 +366,7 @@ pub async fn dual_auth_middleware(
         if !token.is_empty() {
             let hash = hex::encode(Sha256::digest(token.as_bytes()));
 
-            let store = state
-                .auth_store
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let store = manager::lock_mutex(&state.auth_store);
             if let Some(email) = store.key_index.get(&hash) {
                 let is_admin = state.config.admin_emails.contains(email);
                 current_user = Some(CurrentUser {

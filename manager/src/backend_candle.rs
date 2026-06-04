@@ -5,7 +5,7 @@ use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig};
 use candle_transformers::models::quantized_llama::ModelWeights as QuantizedLlamaModel;
 use candle_transformers::models::quantized_qwen2::ModelWeights as QuantizedQwen2Model;
-use hf_hub::api::sync::Api;
+use hf_hub::api::tokio::Api;
 use tokenizers::Tokenizer;
 
 use crate::backend::InferenceBackend;
@@ -53,26 +53,53 @@ impl DynamicModel {
     }
 }
 
-pub fn load_engine(
+pub async fn load_engine(
     config: &ModelConfig,
+    downloads_dir: &str,
     device: &Device,
 ) -> Result<(DynamicModel, Tokenizer, Option<std::fs::File>), String> {
     let api = Api::new().map_err(|e| e.to_string())?;
 
-    if config.filename.ends_with(".safetensors") {
+    if config.arch == ModelArch::XLMRoberta {
         let repo = api.model(config.repo.clone());
-        let weights_path = repo
-            .get(&config.filename)
-            .map_err(|e| format!("Missing weights: {}", e))?;
-        let config_path = repo
-            .get("config.json")
-            .map_err(|e| format!("Missing config.json: {}", e))?;
-        let tokenizer_path = api
-            .model(config.tokenizer_repo.clone())
-            .get("tokenizer.json")
-            .map_err(|e| format!("Missing tokenizer: {}", e))?;
+        let filenames = crate::registry::get_split_filenames(&config.filename);
+        let mut weights_paths = Vec::new();
 
-        let config_str = std::fs::read_to_string(config_path)
+        for fname in &filenames {
+            let local_path = std::path::Path::new(downloads_dir).join(fname);
+            if let Ok(true) = tokio::fs::try_exists(&local_path).await {
+                weights_paths.push(local_path);
+            } else {
+                let cached_path = repo
+                    .get(fname)
+                    .await
+                    .map_err(|e| format!("Missing weights ({}): {}", fname, e))?;
+                weights_paths.push(cached_path);
+            }
+        }
+
+        if weights_paths.is_empty() {
+            return Err(format!(
+                "Could not find any of the files for model {} in the HF cache: {:?}",
+                config.id, filenames
+            ));
+        }
+
+        let cache = hf_hub::Cache::default();
+        let config_path = if let Some(p) = cache
+            .repo(hf_hub::Repo::model(config.repo.clone()))
+            .get("config.json")
+        {
+            p
+        } else {
+            repo.get("config.json")
+                .await
+                .map_err(|e| format!("Missing config.json: {}", e))?
+        };
+        let tokenizer_path = crate::fetch_tokenizer_path(&config.tokenizer_repo).await?;
+
+        let config_str = tokio::fs::read_to_string(config_path)
+            .await
             .map_err(|e| format!("Failed to read config: {}", e))?;
         let conf: BertConfig =
             serde_json::from_str(&config_str).map_err(|e| format!("Bad config JSON: {}", e))?;
@@ -87,50 +114,85 @@ pub fn load_engine(
 
         // SAFETY: The safetensors file being mapped is cached locally from Hugging Face and
         // its contents are not modified concurrently while memory mapped by the engine.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], dtype, device)
-                .map_err(|e| format!("Safetensors Mmap failed: {}", e))?
-        };
+        let device_clone = device.clone();
+        let model = tokio::task::spawn_blocking(move || {
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&weights_paths, dtype, &device_clone)
+                    .map_err(|e| format!("Safetensors Mmap failed: {}", e))?
+            };
+            ExtractiveCompressor::load(vb, &conf)
+                .map_err(|e| format!("Extractive load failed: {}", e))
+        })
+        .await
+        .map_err(|e| format!("Task failed: {}", e))??;
 
-        let model = ExtractiveCompressor::load(vb, &conf)
-            .map_err(|e| format!("Extractive load failed: {}", e))?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| format!("Tokenizer load failed: {}", e))?;
+        let tokenizer = tokio::task::spawn_blocking(move || {
+            Tokenizer::from_file(tokenizer_path)
+                .map_err(|e| format!("Tokenizer load failed: {}", e))
+        })
+        .await
+        .map_err(|e| format!("Task failed: {}", e))??;
 
         return Ok((DynamicModel::XLMRoberta(model), tokenizer, None));
     }
 
-    let weights_path = api
-        .model(config.repo.clone())
-        .get(&config.filename)
-        .map_err(|e| e.to_string())?;
-    let tokenizer_path = api
-        .model(config.tokenizer_repo.clone())
-        .get("tokenizer.json")
-        .map_err(|e| e.to_string())?;
-
-    let mut file = std::fs::File::open(&weights_path).map_err(|e| e.to_string())?;
-    let gguf_content =
-        candle_core::quantized::gguf_file::Content::read(&mut file).map_err(|e| e.to_string())?;
-
-    let model = match config.arch {
-        ModelArch::Llama => DynamicModel::Llama(
-            QuantizedLlamaModel::from_gguf(gguf_content, &mut file, device)
-                .map_err(|e| e.to_string())?,
-        ),
-        ModelArch::Qwen2 => DynamicModel::Qwen2(
-            QuantizedQwen2Model::from_gguf(gguf_content, &mut file, device)
-                .map_err(|e| e.to_string())?,
-        ),
-        _ => {
-            return Err(format!(
-                "Unsupported GGUF architecture for model: {}",
-                config.id
-            ));
+    let local_weights = std::path::Path::new(downloads_dir).join(&config.filename);
+    let weights_path = if let Ok(true) = tokio::fs::try_exists(&local_weights).await {
+        local_weights
+    } else {
+        let filenames = crate::registry::get_split_filenames(&config.filename);
+        let mut first_cached_path = None;
+        let repo = api.model(config.repo.clone());
+        for fname in &filenames {
+            let cached_path = repo.get(fname).await.map_err(|e| e.to_string())?;
+            if first_cached_path.is_none() {
+                first_cached_path = Some(cached_path);
+            }
         }
+        first_cached_path.ok_or_else(|| {
+            format!(
+                "Could not find any of the files for model {} in the HF cache: {:?}",
+                config.id, filenames
+            )
+        })?
     };
 
-    let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| e.to_string())?;
+    let tokenizer_path = crate::fetch_tokenizer_path(&config.tokenizer_repo).await?;
+
+    let config_arch = config.arch;
+    let config_id = config.id.clone();
+    let device_clone = device.clone();
+    let (model, file) = tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&weights_path).map_err(|e| e.to_string())?;
+        let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut file)
+            .map_err(|e| e.to_string())?;
+
+        let model = match config_arch {
+            ModelArch::Llama => DynamicModel::Llama(
+                QuantizedLlamaModel::from_gguf(gguf_content, &mut file, &device_clone)
+                    .map_err(|e| e.to_string())?,
+            ),
+            ModelArch::Qwen2 => DynamicModel::Qwen2(
+                QuantizedQwen2Model::from_gguf(gguf_content, &mut file, &device_clone)
+                    .map_err(|e| e.to_string())?,
+            ),
+            _ => {
+                return Err(format!(
+                    "Unsupported GGUF architecture for model: {}",
+                    config_id
+                ));
+            }
+        };
+        Ok((model, file))
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
+
+    let tokenizer = tokio::task::spawn_blocking(move || {
+        Tokenizer::from_file(tokenizer_path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
 
     Ok((model, tokenizer, Some(file)))
 }
@@ -488,6 +550,7 @@ impl InferenceBackend for CandleEngine {
     async fn load_model(
         &mut self,
         config: &ModelConfig,
+        downloads_dir: &str,
         status: Arc<Mutex<EngineStatus>>,
         _strategy: &MemoryStrategy,
         _required_ctx: usize,
@@ -505,7 +568,7 @@ impl InferenceBackend for CandleEngine {
             );
         }
 
-        let (m, t, f) = load_engine(config, &self.device)?;
+        let (m, t, f) = load_engine(config, downloads_dir, &self.device).await?;
         self.model = Some(m);
         self.tokenizer = Some(t);
         self._file = f;
@@ -526,7 +589,7 @@ impl InferenceBackend for CandleEngine {
                 0,
                 0,
             );
-            s.update_nvml(total, used_after, free_after);
+            s.update_nvml(total, used_after, free_after, None);
         }
         Ok(config.max_context_len)
     }

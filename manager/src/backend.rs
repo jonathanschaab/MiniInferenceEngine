@@ -11,6 +11,7 @@ pub trait InferenceBackend: Send + Sync {
     async fn load_model(
         &mut self,
         config: &ModelConfig,
+        downloads_dir: &str,
         status: Arc<Mutex<EngineStatus>>,
         strategy: &MemoryStrategy,
         required_ctx: usize,

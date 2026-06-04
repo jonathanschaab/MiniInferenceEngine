@@ -1,5 +1,6 @@
 benchmark_prompts
 target
+downloads
 api_keys.json
 client_secret.apps.googleusercontent.com.json
 config.json
@@ -9,3 +10,5 @@ node_modules
 test-results
 playwright-report
 database.jwt
+/test_downloads_cancel/model.safetensors
+/test_downloads_shutdown/model.safetensors

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VRAM Tracker</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.9/purify.min.js"></script>
+    <link rel="stylesheet" href="/css/common.css">
+</head>
+<body>
+    <header>
+        <h1>Live Memory Dashboard</h1>
+    </header>
+
+    <div class="tab-container">
+        <div class="tab active" id="tab-vram">GPU VRAM</div>
+        <div class="tab" id="tab-ram">System RAM</div>
+    </div>
+
+    <div id="vram-view" class="tab-content active">
+        <div class="container">
+            <h2>Physical VRAM Allocation</h2>
+            <div class="vram-bar-container">
+                <div id="bar-weights" class="vram-weights"></div>
+                <div id="bar-kv" class="vram-kv"></div>
+                <div id="bar-compute" class="vram-compute"></div>
+                <div id="bar-other" class="vram-other"></div>
+                <div id="bar-free" class="vram-free"></div>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-color bg-blue"></div><span id="txt-weights">Weights</span></div>
+                <div class="legend-item"><div class="legend-color bg-green"></div><span id="txt-kv">KV Cache</span></div>
+                <div class="legend-item"><div class="legend-color bg-yellow"></div><span id="txt-compute">Compute Margin</span></div>
+                <div class="legend-item"><div class="legend-color bg-red"></div><span id="txt-other">Other Processes</span></div>
+                <div class="legend-item"><div class="legend-color bg-crust border-outline"></div><span id="txt-free">Free VRAM</span></div>
+            </div>
+
+            <div id="loaded-models-container" class="model-cards"></div>
+
+            <table class="memory-table mt-50">
+                <thead>
+                    <tr>
+                        <th>Timestamp</th>
+                        <th>Action</th>
+                        <th>Subsystem</th>
+                        <th>Description</th>
+                        <th>Size (MB)</th>
+                    </tr>
+                </thead>
+                <tbody id="vram-log-body"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="ram-view" class="tab-content">
+        <div class="container">
+            <h2>System RAM Allocation</h2>
+            <div class="ram-bar-container">
+                <div id="bar-ram-process" class="ram-process"></div>
+                <div id="bar-ram-other" class="ram-other"></div>
+                <div id="bar-ram-free" class="ram-free"></div>
+            </div>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-color bg-green"></div><span id="txt-ram-process">Engine Process</span></div>
+                <div class="legend-item"><div class="legend-color bg-red"></div><span id="txt-ram-other">OS / Other Processes</span></div>
+                <div class="legend-item"><div class="legend-color bg-crust border-outline"></div><span id="txt-ram-free">Free RAM</span></div>
+            </div>
+
+            <table class="memory-table mt-50">
+                <thead>
+                    <tr>
+                        <th>Timestamp</th>
+                        <th>Action</th>
+                        <th>Subsystem</th>
+                        <th>Description</th>
+                        <th>Size (MB)</th>
+                    </tr>
+                </thead>
+                <tbody id="ram-log-body"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/memory.js"></script>
+</body>
+</html>

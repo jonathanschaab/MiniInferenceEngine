@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Clone, Debug)]
@@ -35,6 +36,7 @@ pub struct ModelMemory {
 pub struct EngineStatus {
     pub active_chat_model_id: Option<String>,
     pub last_compressor_model_id: Option<String>,
+    pub loading_model_id: Option<String>,
     pub active_backend: Option<String>,
     pub benchmark_running: bool,
     pub vram_events: Vec<VramEvent>,
@@ -43,6 +45,8 @@ pub struct EngineStatus {
     pub vram_used: u64,
     pub vram_free: u64,
     pub vram_engine_claimed: u64,
+    #[serde(default)]
+    pub vram_process_used: u64,
     pub vram_other_processes: u64,
     pub baseline_other_vram: u64,
     pub ram_total: u64,
@@ -51,6 +55,14 @@ pub struct EngineStatus {
     pub ram_process_used: u64,
     pub ram_other_processes: u64,
     pub models_vram: Vec<ModelMemory>,
+    #[serde(default)]
+    pub model_health: std::collections::HashMap<String, bool>,
+    #[serde(default)]
+    pub downloaded_models: std::collections::HashSet<String>,
+    #[serde(default)]
+    pub cached_models: std::collections::HashSet<String>,
+    #[serde(default)]
+    pub corrupted_models: std::collections::HashSet<String>,
 }
 
 impl EngineStatus {
@@ -59,6 +71,13 @@ impl EngineStatus {
             .iter()
             .map(|m| m.weights + m.kv_cache + m.compute)
             .sum()
+    }
+
+    pub fn is_model_in_use(&self, id: &str) -> bool {
+        self.models_vram.iter().any(|m| m.id == id)
+            || self.active_chat_model_id.as_deref() == Some(id)
+            || self.last_compressor_model_id.as_deref() == Some(id)
+            || self.loading_model_id.as_deref() == Some(id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -138,10 +157,14 @@ impl EngineStatus {
         }
     }
 
-    pub fn update_nvml(&mut self, total: u64, used: u64, free: u64) {
+    pub fn update_nvml(&mut self, total: u64, used: u64, free: u64, process_vram: Option<u64>) {
         self.vram_total = total;
         self.vram_used = used;
         self.vram_free = free;
+
+        if let Some(proc_vram) = process_vram {
+            self.vram_process_used = proc_vram;
+        }
 
         if self.baseline_other_vram == 0 {
             self.baseline_other_vram = used;
@@ -151,6 +174,10 @@ impl EngineStatus {
             self.baseline_other_vram = used;
             self.vram_other_processes = used;
             self.vram_engine_claimed = 0;
+            if process_vram.is_some() {
+                self.vram_other_processes = used.saturating_sub(self.vram_process_used);
+                self.baseline_other_vram = self.vram_other_processes;
+            }
         } else {
             let mut static_claimed = 0;
             for m in &self.models_vram {
@@ -167,25 +194,42 @@ impl EngineStatus {
                 .filter(|m| !m.is_statically_allocated && m.status == "Active")
                 .count() as u64;
 
-            if active_count == 0 {
-                self.baseline_other_vram = used.saturating_sub(static_claimed);
-            }
+            if process_vram.is_some() {
+                // Perfect Measurement Mode
+                self.vram_other_processes = used.saturating_sub(self.vram_process_used);
+                self.baseline_other_vram = self.vram_other_processes;
 
-            let dynamic_usage = used.saturating_sub(self.baseline_other_vram + static_claimed);
-            if let Some(usage_per_model) = dynamic_usage.checked_div(active_count) {
-                for m in self
-                    .models_vram
-                    .iter_mut()
-                    .filter(|m| !m.is_statically_allocated && m.status == "Active")
-                {
-                    m.kv_cache = usage_per_model;
+                let dynamic_usage = self.vram_process_used.saturating_sub(static_claimed);
+                if let Some(usage_per_model) = dynamic_usage.checked_div(active_count) {
+                    for m in self
+                        .models_vram
+                        .iter_mut()
+                        .filter(|m| !m.is_statically_allocated && m.status == "Active")
+                    {
+                        m.kv_cache = usage_per_model;
+                    }
+                }
+            } else {
+                // Estimation Fallback Mode
+                if active_count == 0 {
+                    self.baseline_other_vram = used.saturating_sub(static_claimed);
+                }
+                let dynamic_usage = used.saturating_sub(self.baseline_other_vram + static_claimed);
+                if let Some(usage_per_model) = dynamic_usage.checked_div(active_count) {
+                    for m in self
+                        .models_vram
+                        .iter_mut()
+                        .filter(|m| !m.is_statically_allocated && m.status == "Active")
+                    {
+                        m.kv_cache = usage_per_model;
+                    }
+                }
+                self.vram_other_processes = used.saturating_sub(self.total_engine_vram());
+                if self.vram_other_processes < self.baseline_other_vram {
+                    self.baseline_other_vram = self.vram_other_processes;
                 }
             }
             self.vram_engine_claimed = self.total_engine_vram();
-            self.vram_other_processes = used.saturating_sub(self.vram_engine_claimed);
-            if self.vram_other_processes < self.baseline_other_vram {
-                self.baseline_other_vram = self.vram_other_processes;
-            }
         }
     }
 
@@ -198,10 +242,24 @@ impl EngineStatus {
     }
 }
 
-pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'_, EngineStatus> {
-    status
+pub fn lock_mutex<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub fn lock_status(status: &Arc<Mutex<EngineStatus>>) -> std::sync::MutexGuard<'_, EngineStatus> {
+    lock_mutex(status)
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+pub struct DownloadStatus {
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+    pub start_time: u64,
+    pub current_speed_bps: f64,
+    #[serde(default)]
+    pub state: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
@@ -317,6 +375,18 @@ pub struct UserRequest {
     pub target_backend: Option<String>,
 }
 
+/// Resolves a given path to an absolute path.
+/// If the path is already absolute, it returns it as is.
+/// Otherwise, it joins it with the current working directory.
+pub fn resolve_absolute_path<P: AsRef<Path>>(path: P) -> PathBuf {
+    let p = path.as_ref();
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,7 +459,7 @@ mod tests {
         let mut status = EngineStatus::default();
 
         // 1. Simulate an idle system with 10GB total, 2GB used initially
-        status.update_nvml(10000, 2000, 8000);
+        status.update_nvml(10000, 2000, 8000, None);
         assert_eq!(status.baseline_other_vram, 2000);
 
         // 2. Add two models, one static (LlamaCpp), one dynamic (Candle)
@@ -413,7 +483,7 @@ mod tests {
         );
 
         // 3. Update NVML again. Assume total VRAM usage jumped to 5500.
-        status.update_nvml(10000, 5500, 4500);
+        status.update_nvml(10000, 5500, 4500, None);
 
         // The dynamic usage pool should be: 5500 (used) - 2000 (baseline) - 1500 (static_model) - 1000 (dynamic_weights) = 1000.
         let dyn_model = status
@@ -435,11 +505,11 @@ mod tests {
     fn test_update_nvml_baseline_ratchet() {
         let mut status = EngineStatus::default();
         // Start at 2000 used, no models
-        status.update_nvml(10000, 2000, 8000);
+        status.update_nvml(10000, 2000, 8000, None);
         assert_eq!(status.baseline_other_vram, 2000);
 
         // Now assume usage drops to 1500. The engine should ratchet the baseline down
-        status.update_nvml(10000, 1500, 8500);
+        status.update_nvml(10000, 1500, 8500, None);
         assert_eq!(status.baseline_other_vram, 1500);
     }
 
@@ -483,7 +553,7 @@ mod tests {
     #[test]
     fn test_update_nvml_zero_active_dynamic() {
         let mut status = EngineStatus::default();
-        status.update_nvml(10000, 2000, 8000);
+        status.update_nvml(10000, 2000, 8000, None);
 
         // Add a dynamic model but keep it "Idle" (active_count == 0)
         status.set_model_vram(
@@ -497,7 +567,18 @@ mod tests {
         );
 
         // With active_count == 0, the baseline recalculates: 3500 used - 1000 static weights = 2500
-        status.update_nvml(10000, 3500, 6500);
+        status.update_nvml(10000, 3500, 6500, None);
         assert_eq!(status.baseline_other_vram, 2500);
+    }
+
+    #[test]
+    fn test_resolve_absolute_path() {
+        let relative = Path::new("downloads");
+        let absolute = resolve_absolute_path(relative);
+        assert!(absolute.is_absolute());
+
+        let already_absolute = std::env::current_dir().unwrap().join("test");
+        let still_absolute = resolve_absolute_path(&already_absolute);
+        assert_eq!(already_absolute, still_absolute);
     }
 }

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Engine Console - Mini Inference Engine</title>
+    <link rel="stylesheet" href="/css/common.css">
+</head>
+<body>
+    <header>
+        <h1>System Console</h1>
+    </header>
+
+    <!-- Control Bar -->
+    <div class="control-bar">
+        <div class="control-group">
+            <select id="logLevel" class="control-select-bordered">
+                    <option value="trace">TRACE</option>
+                    <option value="debug">DEBUG</option>
+                    <option value="info">INFO</option>
+                    <option value="warn">WARN</option>
+                    <option value="error">ERROR</option>
+                </select>
+            <button id="applyLogLevel" class="btn-nav bg-sky">Apply Filter</button>
+        </div>
+        <div class="control-group">
+            <button id="clearLogs" class="btn-nav bg-red">🗑️ Clear Logs</button>
+        </div>
+    </div>
+
+    <div class="console-wrapper">
+        <div id="logContainer" class="console-output"></div>
+    </div>
+
+    <script src="/js/common.js"></script>
+    <script src="/js/console.js"></script>
+</body>
+</html>
