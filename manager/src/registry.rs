@@ -248,11 +248,12 @@ impl ModelConfig {
 pub fn get_split_filenames(first_filename: &str) -> Vec<String> {
     let pattern = "-00001-of-";
     if let Some(pos) = first_filename.find(pattern) {
-        let prefix = &first_filename[..pos];
+        let prefix = first_filename.get(..pos).unwrap_or("");
         let suffix_start = pos + pattern.len();
-        if let Some(end_pos) = first_filename[suffix_start..].find('.') {
-            let total_str = &first_filename[suffix_start..suffix_start + end_pos];
-            let ext = &first_filename[suffix_start + end_pos..];
+        let suffix = first_filename.get(suffix_start..).unwrap_or("");
+        if let Some(end_pos) = suffix.find('.') {
+            let total_str = suffix.get(..end_pos).unwrap_or("");
+            let ext = suffix.get(end_pos..).unwrap_or("");
             if let Ok(total) = total_str.parse::<usize>() {
                 let mut files = Vec::new();
                 let pad = total_str.len();
@@ -435,7 +436,7 @@ pub async fn get_model_registry(config: &crate::config::AppConfig) -> Vec<ModelC
         let mut builder = hf_hub::api::tokio::ApiBuilder::new().with_endpoint(hf_base_url.clone());
         if let Ok(token) = std::env::var("HF_TOKEN") {
             let masked = if token.len() > 4 {
-                format!("{}...", &token[..4])
+            format!("{}...", token.get(..4).unwrap_or(&token))
             } else {
                 "***".to_string()
             };
@@ -1392,12 +1393,14 @@ async fn background_resolve_model(
         // Safely update the registry without wiping out runtime state flags
         {
             let mut reg_lock = lock_clone.write().await;
-            if let Some(pos) = reg_lock.iter().position(|m| m.id == config.id) {
+            if let Some(pos) = reg_lock.iter().position(|m| m.id == config.id)
+                && let Some(existing) = reg_lock.get_mut(pos)
+            {
                 let mut updated = config.clone();
-                updated.is_downloaded = reg_lock[pos].is_downloaded;
-                updated.is_in_hf_cache = reg_lock[pos].is_in_hf_cache;
-                updated.is_corrupted = reg_lock[pos].is_corrupted;
-                reg_lock[pos] = updated;
+                updated.is_downloaded = existing.is_downloaded;
+                updated.is_in_hf_cache = existing.is_in_hf_cache;
+                updated.is_corrupted = existing.is_corrupted;
+                *existing = updated;
             }
         }
 
@@ -1436,6 +1439,12 @@ async fn background_resolve_model(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1656,14 +1665,20 @@ mod tests {
             for _ in 0..30 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 let current_registry = get_model_registry(&config).await;
-                let current_model = current_registry.iter().find(|m| m.id == target_id).unwrap();
+                let current_model = current_registry
+                    .iter()
+                    .find(|m| m.id == target_id)
+                    .expect("Target model missing from registry");
 
                 if current_model.provenance.get("arch").map(|s| s.as_str()) == Some("config.json") {
                     updated = true;
                     // Validate that the architecture was dynamically corrected by config.json!
                     assert_eq!(current_model.arch, ModelArch::Qwen2);
                     assert_ne!(
-                        current_model.provenance.get("size_on_disk_gb").unwrap(),
+                        current_model
+                            .provenance
+                            .get("size_on_disk_gb")
+                            .expect("Missing size_on_disk_gb provenance"),
                         "fallback"
                     );
                     break;
@@ -1695,7 +1710,7 @@ mod tests {
                     return axum::response::Response::builder()
                         .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                         .body(axum::body::Body::empty())
-                        .unwrap();
+                        .expect("Failed to build 500 response");
                 }
 
                 // If hf-hub is asking for the API metadata (like commit info), mock a valid ModelInfo response
@@ -1709,7 +1724,7 @@ mod tests {
                     return axum::response::Response::builder()
                         .header(axum::http::header::CONTENT_TYPE, "application/json")
                         .body(axum::body::Body::from(model_info.to_string()))
-                        .unwrap();
+                        .expect("Failed to build mock ModelInfo response");
                 }
 
                 let dummy_config = serde_json::json!({
@@ -1737,14 +1752,14 @@ mod tests {
                     && let Some(stripped) = range_str.strip_prefix("bytes=")
                 {
                     let parts: Vec<&str> = stripped.split('-').collect();
-                    let start = parts.first().unwrap_or(&"0").parse::<usize>().unwrap_or(0);
+                    let start = parts.first().unwrap_or(&"0").parse::<usize>().unwrap_or(0); // keep unwrap_or
 
                     if start >= len {
                         return axum::response::Response::builder()
                             .status(axum::http::StatusCode::RANGE_NOT_SATISFIABLE)
                             .header("Content-Range", format!("bytes */{}", len))
                             .body(axum::body::Body::empty())
-                            .unwrap();
+                            .expect("Failed to build 416 response");
                     }
 
                     let chunk_len = len - start;
@@ -1760,7 +1775,7 @@ mod tests {
                         )
                         .header(axum::http::header::CONTENT_LENGTH, chunk_len.to_string())
                         .body(axum::body::Body::from(body_str[start..].to_string()))
-                        .unwrap();
+                        .expect("Failed to build 206 response");
                 }
 
                 info!(
@@ -1769,7 +1784,7 @@ mod tests {
                 );
                 res.header(axum::http::header::CONTENT_LENGTH, len.to_string())
                     .body(axum::body::Body::from(body_str))
-                    .unwrap()
+                    .expect("Failed to build 200 response")
             })
             .head(move |req: axum::extract::Request| async move {
                 info!("[MOCK SERVER] Intercepted HEAD request to: {}", req.uri());
@@ -1778,18 +1793,23 @@ mod tests {
                     return axum::response::Response::builder()
                         .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
                         .body(axum::body::Body::empty())
-                        .unwrap();
+                        .expect("Failed to build 500 HEAD response");
                 }
                 info!("[MOCK SERVER] Serving X-Linked-Size header");
                 axum::response::Response::builder()
                     .header("X-Linked-Size", "8589934592") // Simulate an 8GB response
                     .body(axum::body::Body::empty())
-                    .unwrap()
+                    .expect("Failed to build HEAD response")
             }),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener
+            .local_addr()
+            .expect("Failed to get local address")
+            .port();
         let hf_base_url = format!("http://127.0.0.1:{}", port);
 
         tokio::spawn(async move {
@@ -1819,7 +1839,9 @@ mod tests {
             overrides: ModelOverrides::default(),
         };
 
-        let reqwest_client = reqwest::Client::builder().build().unwrap();
+        let reqwest_client = reqwest::Client::builder()
+            .build()
+            .expect("Failed to build reqwest client");
 
         // Use an isolated cache directory so we don't accidentally read from the global ~/.cache/huggingface
         let temp_cache_dir = std::env::temp_dir().join(format!("test_hf_cache_{}", port));
@@ -1830,7 +1852,7 @@ mod tests {
             .with_endpoint(hf_base_url.clone())
             .with_cache_dir(temp_cache_dir.clone())
             .build()
-            .unwrap();
+            .expect("Failed to build HF API client");
 
         // Run the worker directly with a 1-second initial backoff
         // This allows the 2 seconds of 500s to trigger retries until the mock server eventually passes
@@ -1855,7 +1877,13 @@ mod tests {
         assert_eq!(config.arch, ModelArch::Qwen2);
         assert_eq!(config.n_embd, 2048);
         assert_eq!(config.size_on_disk_gb, 8.0);
-        assert_ne!(config.provenance.get("arch").unwrap(), "fallback");
+        assert_ne!(
+            config
+                .provenance
+                .get("arch")
+                .expect("Missing arch provenance"),
+            "fallback"
+        );
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all(temp_cache_dir).await;

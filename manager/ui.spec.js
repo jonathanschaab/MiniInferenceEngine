@@ -51,6 +51,11 @@ async function mockStaticAssets(page) {
  * Mocks the Engine's JSON API responses to simulate a healthy, fully loaded GPU system.
  */
 async function mockEngineApis(page) {
+    const defaultModels = [
+        { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: true },
+        { id: 'mock-comp-1', name: 'Mock Compressor', roles: ['ContextCompressor'], supported_backends: ['Candle'], arch: 'XLMRoberta', parameters_billions: 0.5, size_on_disk_gb: 1.0, max_context_len: 1024, provenance: {}, is_downloaded: true }
+    ];
+
     await page.route('**/api/status', route => {
         route.fulfill({
             status: 200,
@@ -72,11 +77,21 @@ async function mockEngineApis(page) {
         if (route.request().method() === 'GET') {
             route.fulfill({
                 status: 200,
-                json: [
-                    { id: 'mock-model-1', name: 'Mock Chat Model', roles: ['GeneralChat'], supported_backends: ['Candle'], arch: 'Llama', parameters_billions: 8.0, size_on_disk_gb: 4.0, max_context_len: 8192, provenance: {}, is_downloaded: true },
-                    { id: 'mock-comp-1', name: 'Mock Compressor', roles: ['ContextCompressor'], supported_backends: ['Candle'], arch: 'XLMRoberta', parameters_billions: 0.5, size_on_disk_gb: 1.0, max_context_len: 1024, provenance: {}, is_downloaded: true }
-                ]
+                json: defaultModels
             });
+        } else {
+            route.fallback();
+        }
+    });
+
+    await page.route('**/api/models/*', route => {
+        if (route.request().method() === 'GET') {
+            const id = route.request().url().split('/').pop();
+            const model = defaultModels.find(m => m.id === id);
+            if (model) route.fulfill({ status: 200, json: model });
+            else route.fulfill({ status: 404 });
+        } else if (route.request().method() === 'DELETE') {
+            route.fulfill({ status: 200 });
         } else {
             route.fallback();
         }
@@ -105,8 +120,20 @@ async function mockEngineApis(page) {
     await page.route('**/api/chat/sessions', handleSessionsRoute);
     await page.route('**/api/chat/sessions?*', handleSessionsRoute);
 
-    await page.route('**/api/chat/sessions/*/messages*', route => {
-        route.fulfill({ status: 200 });
+    await page.route('**/api/chat/sessions/**', route => {
+        if (route.request().url().includes('/messages')) {
+            route.fulfill({ status: 200 });
+        } else if (route.request().method() === 'GET') {
+            const id = route.request().url().split('?')[0].split('/').pop();
+            route.fulfill({
+                status: 200,
+                json: { id, title: 'Mocked Session', updated_at: Math.floor(Date.now() / 1000), email: 'mock@example.com', messages: [] }
+            });
+        } else if (route.request().method() === 'DELETE') {
+            route.fulfill({ status: 200 });
+        } else {
+            route.fallback();
+        }
     });
 
     await page.route('**/api/console/loglevel', route => {
@@ -117,6 +144,44 @@ async function mockEngineApis(page) {
     await page.route('**/api/downloads', async route => {
         if (route.request().method() === 'GET') {
             await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+        } else if (route.request().method() === 'POST') {
+            await route.fulfill({ status: 202, body: '' });
+        } else if (route.request().method() === 'DELETE') {
+            await route.fulfill({ status: 200 });
+        } else {
+            route.fallback();
+        }
+    });
+
+    await page.route('**/api/downloads/*', async route => {
+        if (route.request().method() === 'DELETE' || route.request().method() === 'POST') {
+            await route.fulfill({ status: 200 });
+        } else {
+            route.fallback();
+        }
+    });
+
+    await page.route('**/api/settings/keys', route => {
+        if (route.request().method() === 'GET') {
+            route.fulfill({ status: 200, json: [{ name: 'Test Key', hash: 'abcdef1234567890', description: 'Used for Playwright' }] });
+        } else if (route.request().method() === 'POST') {
+            route.fulfill({ status: 200, json: "sk-mocked-api-key" });
+        } else {
+            route.fallback();
+        }
+    });
+
+    await page.route('**/api/settings/keys/*', route => {
+        if (route.request().method() === 'DELETE') {
+            route.fulfill({ status: 200 });
+        } else {
+            route.fallback();
+        }
+    });
+
+    await page.route('**/api/generate', route => {
+        if (route.request().method() === 'POST') {
+            route.fulfill({ status: 200, body: '{"token":"Mocked response token"}\n', contentType: 'text/plain' });
         } else {
             route.fallback();
         }
@@ -146,6 +211,18 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
 
                 // Ignore expected intentional errors from server drop tests
                 if (testInfo.title.includes('ServerDropped') && text.includes('Download was stopped on the server.')) {
+                    return;
+                }
+
+                // Ignore expected intentional errors from 401 redirect test
+                if (testInfo.title.includes('401 Unauthorized')) {
+                    if (text.includes('401 (Unauthorized)') || text.includes('Unauthorized') || text.includes('Engine status unavailable')) {
+                        return;
+                    }
+                }
+
+                // Ignore Chromium internal network errors for unmocked endpoints hitting dead localhost ports
+                if (text.includes('net::ERR_NO_BUFFER_SPACE') || text.includes('net::ERR_CONNECTION_REFUSED') || text.includes('Failed to append message')) {
                     return;
                 }
 
@@ -233,14 +310,6 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
                 route.fallback();
             }
         });
-        
-        await page.route('**/api/chat/sessions/session-meta/messages', async route => {
-            if (route.request().method() === 'POST') {
-                await route.fulfill({ status: 200 });
-            } else {
-                route.fallback();
-            }
-        });
 
         await page.goto('/');
         
@@ -290,14 +359,6 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
     });
 
     test('Settings UI loads API Keys and opens generation modal', async ({ page }) => {
-        await page.route('**/api/settings/keys', route => {
-            if (route.request().method() === 'GET') {
-                route.fulfill({ status: 200, json: [{ name: 'Test Key', hash: 'abcdef1234567890', description: 'Used for Playwright' }] });
-            } else {
-                route.fallback();
-            }
-        });
-
         await page.goto('/settings');
 
         await expect(page.locator('#keys-tbody')).toContainText('Test Key');
@@ -456,9 +517,6 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         };
         await page.route('**/api/chat/sessions', handleBranchSessionsRoute);
         await page.route('**/api/chat/sessions?*', handleBranchSessionsRoute);
-        await page.route('**/api/chat/sessions/session-branch/messages', route => {
-            route.fulfill({ status: 200 });
-        });
         await page.route('**/api/generate', route => {
             const streamResponse = 
                 '{"metadata":{"id":"msg-4","parent_id":"msg-3","timestamp":1003,"model":"mock-model-1"}}\n' +
@@ -535,9 +593,6 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         };
         await page.route('**/api/chat/sessions', handleRegenSessionsRoute);
         await page.route('**/api/chat/sessions?*', handleRegenSessionsRoute);
-        await page.route('**/api/chat/sessions/session-regen/messages', route => {
-            route.fulfill({ status: 200 });
-        });
         await page.route('**/api/generate', route => {
             const streamResponse = 
                 '{"metadata":{"id":"msg-3","parent_id":"msg-1","timestamp":1002,"model":"mock-model-1"}}\n' +
@@ -1475,5 +1530,22 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
 
         await expect(card.locator('.download-stats')).toContainText('Retrying', { timeout: 6000 });
         await expect(card.locator('.download-stats')).toContainText('50.0%', { timeout: 10000 });
+    });
+
+    test('UI redirects to login on 401 Unauthorized API response', async ({ page }) => {
+        // Mock a 401 response for the initial status check
+        await page.route('**/api/status', async route => {
+            await route.fulfill({ status: 401, body: 'Unauthorized' });
+        });
+
+        // Mock the destination login page so Playwright doesn't fail on an unhandled navigation
+        await page.route('**/auth/login', async route => {
+            await route.fulfill({ status: 200, contentType: 'text/html', body: '<html><body>Mock Login Page</body></html>' });
+        });
+
+        await page.goto('/');
+
+        // Verify the global fetchWithAuth helper caught the 401 and redirected the window
+        await expect(page).toHaveURL(/.*\/auth\/login/);
     });
 });

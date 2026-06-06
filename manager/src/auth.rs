@@ -387,6 +387,12 @@ pub async fn dual_auth_middleware(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
 
@@ -408,7 +414,11 @@ mod tests {
 
         let key2_hash = {
             store.generate_key("test@local", "Key2".into(), None);
-            store.api_keys["test@local"].last().unwrap().hash.clone()
+            store.api_keys["test@local"]
+                .last()
+                .expect("Expected at least one API key")
+                .hash
+                .clone()
         };
 
         // Simulate the manual deletion route
@@ -444,13 +454,20 @@ mod tests {
         use axum::http::Request;
 
         // 1. Test missing user extension (Should yield Unauthorized Rejection)
-        let req = Request::builder().body(()).unwrap();
+        let req = Request::builder()
+            .body(())
+            .expect("Failed to build request");
         let mut parts = req.into_parts().0;
         let result = CurrentUser::from_request_parts(&mut parts, &()).await;
-        assert_eq!(result.unwrap_err().0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            result.expect_err("Expected Unauthorized rejection").0,
+            StatusCode::UNAUTHORIZED
+        );
 
         // 2. Test successful extraction
-        let mut req = Request::builder().body(()).unwrap();
+        let mut req = Request::builder()
+            .body(())
+            .expect("Failed to build request");
         req.extensions_mut().insert(CurrentUser {
             email: "admin@local".to_string(),
             is_admin: true,
@@ -458,7 +475,7 @@ mod tests {
         let mut parts = req.into_parts().0;
         let result = CurrentUser::from_request_parts(&mut parts, &())
             .await
-            .unwrap();
+            .expect("Expected valid CurrentUser");
         assert_eq!(result.email, "admin@local");
         assert!(result.is_admin);
     }
@@ -466,8 +483,13 @@ mod tests {
     #[tokio::test]
     async fn test_auth_store_surrealdb_flow() {
         // Spin up an isolated, in-memory SurrealDB instance for testing
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to set DB namespace");
 
         let mut store = AuthStore::default();
         store.generate_key("db_test@local", "DB Key".into(), None);
@@ -483,7 +505,9 @@ mod tests {
             .content(user_keys)
             .await;
 
-        let loaded_store = AuthStore::load(&db).await.unwrap();
+        let loaded_store = AuthStore::load(&db)
+            .await
+            .expect("Failed to load AuthStore from DB");
         assert_eq!(loaded_store.api_keys.len(), 1);
         assert_eq!(loaded_store.api_keys["db_test@local"][0].name, "DB Key");
 

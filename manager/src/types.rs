@@ -423,6 +423,12 @@ pub fn resolve_absolute_path<P: AsRef<Path>>(path: P) -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
 
@@ -525,7 +531,7 @@ mod tests {
             .models_vram
             .iter()
             .find(|m| m.id == "dynamic_model")
-            .unwrap();
+            .expect("dynamic_model missing from vram list");
         assert_eq!(dyn_model.kv_cache, 1000);
     }
 
@@ -559,9 +565,11 @@ mod tests {
     #[test]
     fn test_memory_strategy_serde() {
         // Tests #[serde(rename_all = "lowercase")] ensuring UI compatibility
-        let json = serde_json::to_string(&MemoryStrategy::Offload).unwrap();
+        let json = serde_json::to_string(&MemoryStrategy::Offload)
+            .expect("Failed to serialize MemoryStrategy");
         assert_eq!(json, "\"offload\"");
-        let strategy: MemoryStrategy = serde_json::from_str("\"compress\"").unwrap();
+        let strategy: MemoryStrategy =
+            serde_json::from_str("\"compress\"").expect("Failed to deserialize MemoryStrategy");
         assert_eq!(strategy, MemoryStrategy::Compress);
     }
 
@@ -572,7 +580,7 @@ mod tests {
         // Poison the mutex on purpose inside a separate thread
         let status_clone = status.clone();
         let _ = std::thread::spawn(move || {
-            let mut guard = status_clone.lock().unwrap();
+            let mut guard = status_clone.lock().expect("Mutex poisoned");
             guard.benchmark_running = true;
             panic!("Intentional panic to poison the mutex");
         })
@@ -612,7 +620,9 @@ mod tests {
         let absolute = resolve_absolute_path(relative);
         assert!(absolute.is_absolute());
 
-        let already_absolute = std::env::current_dir().unwrap().join("test");
+        let already_absolute = std::env::current_dir()
+            .expect("Failed to get current directory")
+            .join("test");
         let still_absolute = resolve_absolute_path(&already_absolute);
         assert_eq!(already_absolute, still_absolute);
     }

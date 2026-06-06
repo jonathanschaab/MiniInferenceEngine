@@ -64,8 +64,8 @@ pub fn process_utf8_buffer(byte_buffer: &mut Vec<u8>) -> String {
                 let valid_len = e.valid_up_to();
                 if valid_len > 0 {
                     // SAFETY: e.valid_up_to() guarantees that the slice up to valid_len is valid UTF-8.
-                    let valid_str =
-                        unsafe { std::str::from_utf8_unchecked(&byte_buffer[..valid_len]) };
+                    let valid_slice = byte_buffer.get(..valid_len).unwrap_or_default();
+                    let valid_str = unsafe { std::str::from_utf8_unchecked(valid_slice) };
                     result.push_str(valid_str);
                     byte_buffer.drain(..valid_len);
                 }
@@ -82,6 +82,12 @@ pub fn process_utf8_buffer(byte_buffer: &mut Vec<u8>) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
 

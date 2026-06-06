@@ -1,3 +1,12 @@
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::indexing_slicing)]
+#![deny(clippy::out_of_bounds_indexing)]
+#![deny(clippy::panic)]
+#![deny(clippy::unreachable)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -694,15 +703,12 @@ pub async fn run_batcher_loop(
                 Some(b) => b,
                 None => {
                     // Compressor auto selection logic
-                    if comp_config
+                    if let Some(b) = comp_config
                         .supported_backends
-                        .contains(&BackendType::LlamaCpp)
+                        .iter()
+                        .find(|sb| **sb == BackendType::LlamaCpp)
                     {
-                        comp_config
-                            .supported_backends
-                            .iter()
-                            .find(|sb| **sb == BackendType::LlamaCpp)
-                            .unwrap()
+                        b
                     } else if let Some(b) = comp_config.supported_backends.first() {
                         b
                     } else {
@@ -1084,6 +1090,12 @@ pub async fn run_batcher_loop(
 } // Closes the run_batcher_loop function
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
 
