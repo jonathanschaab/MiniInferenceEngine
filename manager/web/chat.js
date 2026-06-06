@@ -6,6 +6,9 @@ const regenBtn = document.getElementById('regen-btn');
 const typingIndicator = document.getElementById('typing-indicator');
 
 let chatHistory = [];
+let messagesMap = new Map();
+let currentLeafId = null;
+let splitViewParentId = null;
 let currentAbortController = null;
 let currentSessionId = "";
 let currentSessionTitle = "";
@@ -24,7 +27,7 @@ const chatScrollObserver = new IntersectionObserver((entries) => {
     }
 }, {
     root: chatContainer,
-    rootMargin: '150px', // Trigger the fetch slightly before the user hits the very top
+    rootMargin: '150px', // Trigger slightly before the user hits the very top
     threshold: 0
 });
 
@@ -396,7 +399,11 @@ async function renameSession(id, newTitle) {
 async function loadSession(id, skipSessionListUpdate = false) {
     chatScrollObserver.disconnect();
     chatHistory = [];
+    messagesMap.clear();
+    currentLeafId = null;
+    splitViewParentId = null;
     hasMoreMessages = true;
+    isLoadingMessages = false;
     chatContainer.innerHTML = '';
     regenBtn.style.display = 'none';
     
@@ -411,9 +418,9 @@ async function loadSession(id, skipSessionListUpdate = false) {
 async function fetchMoreMessages(id, isInitialLoad = false) {
     if (isLoadingMessages || !hasMoreMessages) return false;
     isLoadingMessages = true;
-    
+
     try {
-        const offset = chatHistory.length;
+        const offset = messagesMap.size;
         const res = await fetchWithAuth(`/api/chat/sessions/${id}?limit=${MESSAGE_LIMIT}&offset=${offset}`);
         if (!res.ok) throw new Error("Failed to fetch session messages");
         const session = await res.json();
@@ -427,71 +434,413 @@ async function fetchMoreMessages(id, isInitialLoad = false) {
         const fetchedMessages = session.messages || [];
         hasMoreMessages = fetchedMessages.length === MESSAGE_LIMIT;
         
-        // Prepend older messages
-        chatHistory = [...fetchedMessages, ...chatHistory];
-        
         const oldScrollHeight = chatContainer.scrollHeight;
-        
-        prependMessagesToUI(fetchedMessages);
-        
+
+        buildTree(fetchedMessages, isInitialLoad);
+        renderActivePath();
+
         if (isInitialLoad) {
             requestAnimationFrame(() => {
                 chatContainer.scrollTop = chatContainer.scrollHeight;
             });
         } else {
-            // Maintain smooth scrolling point when older messages are injected
             requestAnimationFrame(() => {
                 chatContainer.scrollTop = chatContainer.scrollHeight - oldScrollHeight;
             });
         }
-        
-        if (chatHistory.length > 0) regenBtn.style.display = 'inline-flex';
+
         return true;
         
     } catch(e) { 
         console.error("Failed to fetch messages:", e); 
-        hasMoreMessages = false;
         return false;
     } finally {
         isLoadingMessages = false;
     }
 }
 
-function prependMessagesToUI(messages) {
+function buildTree(fetchedMessages, isInitialLoad) {
+    let rootNodes = [];
+    
+    fetchedMessages.forEach(msg => {
+        if (!msg.metadata) msg.metadata = {};
+        if (!msg.metadata.id) msg.metadata.id = crypto.randomUUID();
+    });
+
+    // Legacy linear history stitching (Legacy IDs contained underscores: sessionID_index)
+    let lastLegacyId = null;
+    fetchedMessages.forEach((msg) => {
+        const isLegacy = msg.metadata.id.includes('_');
+        if (isLegacy) {
+            if (msg.metadata.parent_id === null && lastLegacyId !== null) {
+                msg.metadata.parent_id = lastLegacyId;
+            }
+            lastLegacyId = msg.metadata.id;
+        }
+    });
+    
+    if (!isInitialLoad && fetchedMessages.length > 0 && messagesMap.size > 0) {
+        let earliestExisting = Array.from(messagesMap.values()).reduce((oldest, m) => 
+            (!oldest || m.metadata.timestamp < oldest.metadata.timestamp) ? m : oldest
+        , null);
+        
+        if (earliestExisting && earliestExisting.metadata.parent_id === null && earliestExisting.metadata.id.includes('_')) {
+            let latestFetchedLegacy = null;
+            for (let i = fetchedMessages.length - 1; i >= 0; i--) {
+                if (fetchedMessages[i].metadata.id.includes('_')) {
+                    latestFetchedLegacy = fetchedMessages[i];
+                    break;
+                }
+            }
+            if (latestFetchedLegacy) {
+                earliestExisting.metadata.parent_id = latestFetchedLegacy.metadata.id;
+            }
+        }
+    }
+
+    fetchedMessages.forEach(msg => {
+        if (!messagesMap.has(msg.metadata.id)) msg.children = [];
+        messagesMap.set(msg.metadata.id, msg);
+    });
+
+    // Re-link all children recursively for safety as older chunks arrive
+    Array.from(messagesMap.values()).forEach(m => m.children = []);
+    
+    Array.from(messagesMap.values()).forEach(msg => {
+        if (msg.metadata.parent_id && messagesMap.has(msg.metadata.parent_id)) {
+            messagesMap.get(msg.metadata.parent_id).children.push(msg.metadata.id);
+        } else {
+            rootNodes.push(msg.metadata.id);
+        }
+    });
+
+    if (isInitialLoad || !currentLeafId) {
+        currentLeafId = getDefaultLeaf(rootNodes);
+    }
+}
+
+function getDefaultLeaf(nodeIds) {
+    if (!nodeIds || nodeIds.length === 0) return null;
+
+    function evaluateSubtree(id) {
+        const node = messagesMap.get(id);
+        if (!node) return { maxScore: -1, maxTime: -1, leafId: null };
+
+        let maxScore = node.metadata.score || 0;
+        let maxTime = node.metadata.timestamp || 0;
+        let bestLeafId = null;
+
+        if (node.children.length === 0) {
+            bestLeafId = id;
+        } else {
+            let bestChildScore = -1;
+            let bestChildTime = -1;
+            
+            node.children.forEach(childId => {
+                const childEval = evaluateSubtree(childId);
+                
+                if (childEval.maxScore > maxScore) {
+                    maxScore = childEval.maxScore;
+                    maxTime = childEval.maxTime;
+                } else if (childEval.maxScore === maxScore && childEval.maxTime > maxTime) {
+                    maxTime = childEval.maxTime;
+                }
+
+                if (childEval.maxScore > bestChildScore) {
+                    bestChildScore = childEval.maxScore;
+                    bestChildTime = childEval.maxTime;
+                    bestLeafId = childEval.leafId;
+                } else if (childEval.maxScore === bestChildScore && childEval.maxTime >= bestChildTime) {
+                    bestChildTime = childEval.maxTime;
+                    bestLeafId = childEval.leafId;
+                }
+            });
+        }
+        return { maxScore, maxTime, leafId: bestLeafId };
+    }
+
+    let globalBestScore = -1;
+    let globalBestTime = -1;
+    let globalBestLeafId = null;
+
+    nodeIds.forEach(id => {
+        const ev = evaluateSubtree(id);
+        if (ev.maxScore > globalBestScore) {
+            globalBestScore = ev.maxScore;
+            globalBestTime = ev.maxTime;
+            globalBestLeafId = ev.leafId;
+        } else if (ev.maxScore === globalBestScore && ev.maxTime >= globalBestTime) {
+            globalBestTime = ev.maxTime;
+            globalBestLeafId = ev.leafId;
+        }
+    });
+
+    return globalBestLeafId;
+}
+
+function getActivePath(leafId) {
+    let path = [];
+    let curr = leafId;
+    while (curr && messagesMap.has(curr)) {
+        const node = messagesMap.get(curr);
+        path.unshift(node);
+        curr = node.metadata.parent_id;
+    }
+    return path;
+}
+
+function toggleSplitView(siblings, parentId) {
+    const key = parentId || 'root';
+    if (splitViewParentId === key) {
+        splitViewParentId = null;
+    } else {
+        splitViewParentId = key;
+    }
+    renderActivePath();
+}
+
+async function pruneBranch(msgId) {
+    if (!confirm("Are you sure you want to delete this branch and all its descendants? This cannot be undone.")) return;
+
+    const idsToDelete = [];
+    function traverse(id) {
+        idsToDelete.push(id);
+        const node = messagesMap.get(id);
+        if (node && node.children) {
+            node.children.forEach(traverse);
+        }
+    }
+    traverse(msgId);
+
+    // Remove from local map
+    const targetNode = messagesMap.get(msgId);
+    const parentId = targetNode ? targetNode.metadata.parent_id : null;
+    
+    if (parentId && messagesMap.has(parentId)) {
+        const pNode = messagesMap.get(parentId);
+        pNode.children = pNode.children.filter(id => id !== msgId);
+    }
+
+    idsToDelete.forEach(id => messagesMap.delete(id));
+
+    // Select a new leaf
+    let rootNodes = [];
+    Array.from(messagesMap.values()).forEach(msg => {
+        if (!msg.metadata.parent_id || !messagesMap.has(msg.metadata.parent_id)) {
+            rootNodes.push(msg.metadata.id);
+        }
+    });
+
+    currentLeafId = getDefaultLeaf(rootNodes);
+    renderActivePath();
+
+    // Send to backend
+    try {
+        await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message_ids: idsToDelete })
+        });
+    } catch(e) {
+        console.error("Failed to delete branch in DB:", e);
+    }
+}
+
+function renderActivePath() {
+    chatContainer.innerHTML = '';
     chatScrollObserver.disconnect();
-    
-    const existingSentinel = document.getElementById('chat-sentinel');
-    if (existingSentinel) existingSentinel.remove();
-    
-    const fragment = document.createDocumentFragment();
-    
+
     if (hasMoreMessages) {
         const sentinel = document.createElement('div');
         sentinel.id = 'chat-sentinel';
         sentinel.className = 'chat-sentinel';
         sentinel.textContent = 'Loading older messages...';
-        fragment.appendChild(sentinel);
+        chatContainer.appendChild(sentinel);
         chatScrollObserver.observe(sentinel);
     }
+
+    const path = getActivePath(currentLeafId);
+    chatHistory = path;
     
-    messages.forEach(msg => {
-        const div = document.createElement('div');
-        div.className = `message ${msg.role === 'user' ? 'user-message' : 'ai-message'}`;
-        div.textContent = msg.content;
-        fragment.appendChild(div);
+    path.forEach((msg) => {
+        const wrapper = document.createElement('div');
+        wrapper.id = `msg-wrapper-${msg.metadata.id}`;
+        wrapper.style.display = 'flex';
+        wrapper.style.flexDirection = 'column';
+        wrapper.style.alignItems = msg.role === 'user' ? 'flex-end' : 'flex-start';
+        wrapper.style.width = '100%';
+        
+        let siblings = [];
+        if (msg.metadata.parent_id) {
+            siblings = messagesMap.get(msg.metadata.parent_id).children;
+        } else {
+            siblings = Array.from(messagesMap.values()).filter(m => !m.metadata.parent_id).map(m => m.metadata.id);
+        }
+
+        const parentKey = msg.metadata.parent_id || 'root';
+
+        if (siblings.length > 1) {
+            const currentIndex = siblings.indexOf(msg.metadata.id);
+            const branchCtrl = document.createElement('div');
+            branchCtrl.className = 'branch-controls text-subtext0 text-085 mb-4';
+            branchCtrl.style.alignSelf = msg.role === 'user' ? 'flex-end' : 'flex-start';
+            
+            const prevBtn = document.createElement('span');
+            prevBtn.textContent = '◀';
+            prevBtn.onclick = () => {
+                const prevId = siblings[(currentIndex - 1 + siblings.length) % siblings.length];
+                currentLeafId = getDefaultLeaf([prevId]);
+                renderActivePath();
+            };
+            
+            const nextBtn = document.createElement('span');
+            nextBtn.textContent = '▶';
+            nextBtn.onclick = () => {
+                const nextId = siblings[(currentIndex + 1) % siblings.length];
+                currentLeafId = getDefaultLeaf([nextId]);
+                renderActivePath();
+            };
+
+            const expandBtn = document.createElement('span');
+            expandBtn.textContent = splitViewParentId === parentKey ? ' ⊟ Collapse' : ' ◫ Split View';
+            expandBtn.onclick = () => toggleSplitView(siblings, msg.metadata.parent_id);
+
+            const pruneBtn = document.createElement('span');
+            pruneBtn.innerHTML = '&nbsp; 🗑️ Prune';
+            pruneBtn.title = 'Delete this branch and all its descendants';
+            pruneBtn.onclick = () => pruneBranch(msg.metadata.id);
+
+            branchCtrl.appendChild(prevBtn);
+            branchCtrl.appendChild(document.createTextNode(` ${currentIndex + 1} of ${siblings.length} `));
+            branchCtrl.appendChild(nextBtn);
+            branchCtrl.appendChild(expandBtn);
+            branchCtrl.appendChild(pruneBtn);
+            wrapper.appendChild(branchCtrl);
+        }
+
+        if (splitViewParentId === parentKey) {
+            const splitContainer = document.createElement('div');
+            splitContainer.className = 'split-container';
+            
+            siblings.forEach(sibId => {
+                const sibMsg = messagesMap.get(sibId);
+                const sibWrapper = document.createElement('div');
+                sibWrapper.className = `split-item ${sibId === msg.metadata.id ? 'active-split' : ''}`;
+                sibWrapper.onclick = () => {
+                    splitViewParentId = null;
+                    currentLeafId = getDefaultLeaf([sibId]);
+                    renderActivePath();
+                };
+
+                const div = document.createElement('div');
+                div.className = `message ${sibMsg.role === 'user' ? 'user-message' : 'ai-message'}`;
+                div.style.maxWidth = '100%';
+                div.textContent = sibMsg.content;
+                sibWrapper.appendChild(div);
+                
+                const metaDiv = renderMetadataDiv(sibMsg);
+                if (metaDiv) sibWrapper.appendChild(metaDiv);
+                splitContainer.appendChild(sibWrapper);
+            });
+            wrapper.appendChild(splitContainer);
+        } else {
+            const div = document.createElement('div');
+            div.className = `message ${msg.role === 'user' ? 'user-message' : 'ai-message'} mb-15`;
+            
+            if (msg.role === 'user') {
+                const textSpan = document.createElement('span');
+                textSpan.textContent = msg.content;
+                div.appendChild(textSpan);
+                
+                const editBtn = document.createElement('button');
+                editBtn.className = 'session-action-btn ml-10';
+                editBtn.style.display = 'inline-block';
+                editBtn.textContent = '✎';
+                editBtn.title = 'Edit Prompt (Creates New Branch)';
+                editBtn.onclick = () => {
+                    inputField.value = msg.content;
+                    inputField.focus();
+                    window.branchingParentId = msg.metadata.parent_id;
+                };
+                div.appendChild(editBtn);
+            } else {
+                div.textContent = msg.content;
+            }
+            wrapper.appendChild(div);
+            
+            const metaDiv = renderMetadataDiv(msg);
+            if (metaDiv) wrapper.appendChild(metaDiv);
+        }
+        chatContainer.appendChild(wrapper);
     });
+
+    if (path.length > 0) {
+        regenBtn.style.display = 'inline-flex';
+    } else {
+        regenBtn.style.display = 'none';
+    }
+}
+
+function renderMetadataDiv(msg) {
+    if (!msg.metadata) return null;
     
-    chatContainer.prepend(fragment);
+    const metaDiv = document.createElement('div');
+    metaDiv.className = 'msg-metadata text-subtext0 text-085 mt-10 mb-15';
+    metaDiv.style.alignSelf = msg.role === 'user' ? 'flex-end' : 'flex-start';
+    
+    let tokenCountStr = Object.entries(msg.metadata.token_counts || {}).map(([m, c]) => `${m}: ${c}`).join(', ');
+    
+    if (msg.role === 'user') {
+        metaDiv.innerHTML = `<strong>Tokens:</strong> ${tokenCountStr}`;
+        const scoreSelect = createScoreSelect(msg);
+        metaDiv.appendChild(scoreSelect);
+    } else {
+        let timeStr = msg.metadata.generation_time_ms ? (msg.metadata.generation_time_ms / 1000).toFixed(2) + 's' : 'N/A';
+        let modelStr = msg.metadata.model || 'Unknown';
+        metaDiv.innerHTML = `
+            <strong>Model:</strong> ${modelStr} | 
+            <strong>Time:</strong> ${timeStr} | 
+            <strong>Tokens:</strong> ${tokenCountStr}
+        `;
+        
+        const scoreSelect = createScoreSelect(msg);
+        metaDiv.appendChild(scoreSelect);
+    }
+    return metaDiv;
+}
+
+function createScoreSelect(msg) {
+    const scoreSelect = document.createElement('select');
+    scoreSelect.className = 'control-select-bordered ml-10';
+    scoreSelect.style.fontSize = '0.75rem';
+    scoreSelect.style.padding = '2px';
+    scoreSelect.innerHTML = `
+        <option value="">Rate...</option>
+        <option value="1">1 - Poor</option>
+        <option value="2">2 - Fair</option>
+        <option value="3">3 - Good</option>
+        <option value="4">4 - Very Good</option>
+        <option value="5">5 - Excellent</option>
+    `;
+    if (msg.metadata.score) {
+        scoreSelect.value = msg.metadata.score;
+    }
+    scoreSelect.onchange = async () => {
+        msg.metadata.score = parseInt(scoreSelect.value) || null;
+        await appendMessageToDB(msg.role, msg.content, msg.metadata.id, msg.metadata);
+    };
+    return scoreSelect;
 }
 
 function startNewSession() {
-    chatScrollObserver.disconnect();
     currentSessionId = "";
     currentSessionTitle = "";
     localStorage.removeItem('mini_inference_last_chat_id');
     chatHistory = [];
-    hasMoreMessages = false;
-    chatContainer.innerHTML = '<div class="message ai-message">System: New chat session started. How can I help you?</div>';
+    messagesMap.clear();
+    currentLeafId = null;
+    splitViewParentId = null;
+    chatContainer.innerHTML = '<div style="display: flex; flex-direction: column; align-items: flex-start;"><div class="message ai-message mb-15">System: New chat session started. How can I help you?</div></div>';
     regenBtn.style.display = 'none';
     updateActiveSessionClass();
 }
@@ -502,7 +851,7 @@ inputField.addEventListener('input', function() {
 });
 
 async function clearChat() {
-    if (chatHistory.length === 0) {
+    if (messagesMap.size === 0) {
         startNewSession();
         return;
     }
@@ -517,12 +866,21 @@ async function clearChat() {
     }
 }
 
-function appendMessage(text, isUser) {
+function appendMessage(text, isUser, index = null) {
+    const wrapper = document.createElement('div');
+    if (index !== null) wrapper.id = `msg-wrapper-${index}`;
+    wrapper.style.display = 'flex';
+    wrapper.style.flexDirection = 'column';
+    wrapper.style.alignItems = isUser ? 'flex-end' : 'flex-start';
+    
     const div = document.createElement('div');
-    div.className = `message ${isUser ? 'user-message' : 'ai-message'}`;
+    div.className = `message ${isUser ? 'user-message' : 'ai-message'} mb-15`;
     div.textContent = text;
-    chatContainer.appendChild(div);
+    wrapper.appendChild(div);
+    
+    chatContainer.appendChild(wrapper);
     chatContainer.scrollTop = chatContainer.scrollHeight;
+    return wrapper;
 }
 
 async function ensureSession(firstMessageText) {
@@ -544,29 +902,31 @@ async function ensureSession(firstMessageText) {
     } catch(e) { console.error("Failed to create session", e); }
 }
 
-async function appendMessageToDB(role, content, index) {
+async function appendMessageToDB(role, content, id, metadata = null) {
     if (!currentSessionId) return;
     try {
+        const payload = {
+            session_id: currentSessionId,
+            id: id,
+            parent_id: metadata ? metadata.parent_id : null,
+            role: role,
+            content: content
+        };
+        
+        if (metadata) {
+            payload.timestamp = metadata.timestamp;
+            payload.model = metadata.model;
+            payload.generation_time_ms = metadata.generation_time_ms;
+            payload.token_counts = metadata.token_counts;
+            payload.score = metadata.score;
+            payload.parameters = metadata.parameters;
+        }
         await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                session_id: currentSessionId,
-                message_index: index,
-                role: role,
-                content: content
-            })
+            body: JSON.stringify(payload)
         });
     } catch(e) { console.error("Failed to append message", e); }
-}
-
-async function truncateMessagesInDB(fromIndex) {
-    if (!currentSessionId) return;
-    try {
-        await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages/${fromIndex}`, {
-            method: 'DELETE'
-        });
-    } catch(e) { console.error("Failed to truncate messages", e); }
 }
 
 async function startChatDownload(modelId, modelName) {
@@ -688,10 +1048,29 @@ async function sendMessage() {
 
     await ensureSession(text);
 
-    const userIndex = chatHistory.length;
-    appendMessage(text, true);
-    chatHistory.push({ role: "user", content: text });
-    await appendMessageToDB("user", text, userIndex);
+    const newId = crypto.randomUUID();
+    const parentId = window.branchingParentId !== undefined ? window.branchingParentId : currentLeafId;
+    window.branchingParentId = undefined; // Reset state
+
+    const msgObj = {
+        role: "user",
+        content: text,
+        metadata: {
+            id: newId,
+            parent_id: parentId,
+            timestamp: Math.floor(Date.now() / 1000)
+        },
+        children: []
+    };
+    messagesMap.set(newId, msgObj);
+    if (parentId && messagesMap.has(parentId)) {
+        messagesMap.get(parentId).children.push(newId);
+    }
+    currentLeafId = newId;
+    
+    renderActivePath();
+
+    await appendMessageToDB("user", text, newId, msgObj.metadata);
     
     inputField.value = '';
     inputField.style.height = 'auto'; 
@@ -747,13 +1126,32 @@ async function requestAiResponse() {
     const generatingSessionEl = document.querySelector(`.session-item[data-id="${generatingSessionId}"]`);
     if (generatingSessionEl) generatingSessionEl.classList.add('generating');
 
-    let aiMessageDiv = document.createElement('div');
-    aiMessageDiv.className = 'message ai-message';
-    chatContainer.appendChild(aiMessageDiv);
+    const aiMessageId = crypto.randomUUID();
+    const parentId = currentLeafId;
+
+    let aiMetadata = { id: aiMessageId, parent_id: parentId, timestamp: Math.floor(Date.now() / 1000) };
+    const aiMsgObj = {
+        role: "assistant",
+        content: "",
+        metadata: aiMetadata,
+        children: []
+    };
+    
+    messagesMap.set(aiMessageId, aiMsgObj);
+    if (parentId && messagesMap.has(parentId)) {
+        messagesMap.get(parentId).children.push(aiMessageId);
+    }
+    currentLeafId = aiMessageId;
+    
+    renderActivePath();
+    
+    const wrapper = document.getElementById(`msg-wrapper-${aiMessageId}`);
+    const aiMessageDiv = wrapper ? wrapper.querySelector('.ai-message') : null;
 
     try {
         // Grab parameters
         const parameters = getGenerationParameters();
+        const requestMessages = chatHistory.slice(0, -1); // Exclude the blank msg we just created
 
         const response = await fetchWithAuth('/api/generate', {
             method: 'POST',
@@ -761,7 +1159,8 @@ async function requestAiResponse() {
             body: JSON.stringify({ 
                 chat_model_id: chatModelId,
                 compressor_model_id: compModelId,
-                messages: chatHistory,
+                messages: requestMessages,
+                parent_message_id: parentId,
                 parameters: parameters,
                 target_backend: targetBackend !== "" ? targetBackend : null
             }),
@@ -777,34 +1176,99 @@ async function requestAiResponse() {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let fullAnswer = "";
+        let buffer = "";
         
         while (true) {
             const { done, value } = await reader.read();
             if (done) {
-                fullAnswer += decoder.decode();
-                aiMessageDiv.textContent = fullAnswer;
+                if (buffer.length > 0) {
+                    const lines = buffer.split('\n');
+                    for (const line of lines) {
+                        if (line.trim()) {
+                            try {
+                                const obj = JSON.parse(line.trim());
+                                if (obj.token !== undefined) {
+                                    fullAnswer += obj.token;
+                                } else if (obj.metadata !== undefined) {
+                                    if (obj.metadata.generation_time_ms !== undefined || obj.metadata.model) {
+                                        Object.assign(aiMetadata, obj.metadata);
+                                        aiMetadata.id = aiMessageId;
+                                        aiMetadata.parent_id = parentId;
+                                    } else {
+                                        const pMsg = messagesMap.get(parentId);
+                                        if (pMsg && pMsg.metadata) {
+                                            Object.assign(pMsg.metadata, obj.metadata);
+                                            pMsg.metadata.id = parentId;
+                                        }
+                                    }
+                                } else if (obj.error !== undefined) {
+                                    fullAnswer += "\nError: " + obj.error;
+                                }
+                            } catch (e) {
+                                console.error("Failed to parse stream line:", line, e);
+                            }
+                        }
+                    }
+                }
+                if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
+                aiMsgObj.content = fullAnswer;
                 break;
             }
-            fullAnswer += decoder.decode(value, { stream: true });
-            aiMessageDiv.textContent = fullAnswer;
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+            buffer += decoder.decode(value, { stream: true });
+            
+            let newlineIdx;
+            while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
+                const line = buffer.slice(0, newlineIdx).trim();
+                buffer = buffer.slice(newlineIdx + 1);
+                if (line) {
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj.token !== undefined) {
+                            fullAnswer += obj.token;
+                            if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
+                            aiMsgObj.content = fullAnswer;
+                            chatContainer.scrollTop = chatContainer.scrollHeight;
+                        } else if (obj.metadata !== undefined) {
+                            if (obj.metadata.generation_time_ms !== undefined || obj.metadata.model) {
+                                Object.assign(aiMetadata, obj.metadata);
+                                aiMetadata.id = aiMessageId;
+                                aiMetadata.parent_id = parentId;
+                            } else {
+                                const pMsg = messagesMap.get(parentId);
+                                if (pMsg && pMsg.metadata) {
+                                    Object.assign(pMsg.metadata, obj.metadata);
+                                    pMsg.metadata.id = parentId;
+                                }
+                            }
+                        } else if (obj.error !== undefined) {
+                            fullAnswer += "\nError: " + obj.error;
+                            if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
+                            aiMsgObj.content = fullAnswer;
+                            chatContainer.scrollTop = chatContainer.scrollHeight;
+                        }
+                    } catch (e) {
+                        console.error("Failed to parse stream line:", line, e);
+                    }
+                }
+            }
         }
         
-        const aiIndex = chatHistory.length;
-        chatHistory.push({ role: "assistant", content: fullAnswer });
+        aiMsgObj.metadata = aiMetadata;
+        renderActivePath();
         updateStatus();
-        await appendMessageToDB("assistant", fullAnswer, aiIndex);
+        await appendMessageToDB("assistant", fullAnswer, aiMessageId, aiMetadata);
 
     } catch (err) {
         if (err.name === 'AbortError') {
-            aiMessageDiv.textContent += " [Stopped]";
-            const aiIndex = chatHistory.length;
-            chatHistory.push({ role: "assistant", content: aiMessageDiv.textContent });
+            if (aiMessageDiv) aiMessageDiv.textContent += " [Stopped]";
+            aiMsgObj.content += " [Stopped]";
+            renderActivePath();
             updateStatus();
-            await appendMessageToDB("assistant", aiMessageDiv.textContent, aiIndex);
+            await appendMessageToDB("assistant", aiMsgObj.content, aiMessageId, aiMetadata);
         } else {
-            aiMessageDiv.textContent = "Error: Failed to connect to engine.";
-            chatHistory.pop(); 
+            if (aiMessageDiv) aiMessageDiv.textContent = "Error: Failed to connect to engine.";
+            aiMsgObj.content = "Error: Failed to connect to engine.";
+            renderActivePath();
         }
     }
     
@@ -825,19 +1289,59 @@ async function requestAiResponse() {
 }
 
 async function regenerateLast() {
-    if (chatHistory.length === 0) return;
+    if (!currentLeafId) return;
+    const leafNode = messagesMap.get(currentLeafId);
     
-    // Remove the assistant's last message
-    if (chatHistory[chatHistory.length - 1].role === 'assistant') {
-        chatHistory.pop();
-        chatContainer.removeChild(chatContainer.lastChild);
-        await truncateMessagesInDB(chatHistory.length);
-    }
-    
-    // If the last remaining message is from the user, request a new response
-    if (chatHistory.length > 0 && chatHistory[chatHistory.length - 1].role === 'user') {
+    if (leafNode.role === 'assistant') {
+        currentLeafId = leafNode.metadata.parent_id;
+        renderActivePath(); 
+        await requestAiResponse();
+    } else {
         await requestAiResponse();
     }
+}
+
+function showExportModal() {
+    if (chatHistory.length === 0) {
+        alert("No messages to export.");
+        return;
+    }
+    document.getElementById('export-modal').style.display = 'flex';
+}
+
+function hideExportModal() {
+    document.getElementById('export-modal').style.display = 'none';
+}
+
+function exportChat(format) {
+    const title = (currentSessionTitle || "chat").replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const filename = `${title}_${new Date().toISOString().slice(0,10)}.${format}`;
+    let content = "";
+    let mimeType = "";
+    
+    if (format === 'json') {
+        content = JSON.stringify(chatHistory, null, 2);
+        mimeType = 'application/json';
+    } else if (format === 'md') {
+        content = `# ${currentSessionTitle || "Chat Export"}\n\n`;
+        chatHistory.forEach(msg => {
+            const role = msg.role === 'user' ? 'User' : 'Assistant';
+            content += `### ${role}\n${msg.content}\n\n`;
+        });
+        mimeType = 'text/markdown';
+    }
+    
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    hideExportModal();
 }
 
 sendBtn.addEventListener('click', sendMessage);
@@ -861,6 +1365,10 @@ document.getElementById('toggle-parameters-btn')?.addEventListener('click', () =
     panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
 });
 document.getElementById('clear-chat-btn')?.addEventListener('click', clearChat);
+document.getElementById('export-chat-btn')?.addEventListener('click', showExportModal);
+document.getElementById('export-cancel-btn')?.addEventListener('click', hideExportModal);
+document.getElementById('export-md-btn')?.addEventListener('click', () => exportChat('md'));
+document.getElementById('export-json-btn')?.addEventListener('click', () => exportChat('json'));
 document.getElementById('param-temp')?.addEventListener('input', function() {
     document.getElementById('val-temp').innerText = this.value;
 });

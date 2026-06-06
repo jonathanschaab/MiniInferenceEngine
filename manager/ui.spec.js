@@ -171,8 +171,12 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
 
     test('Chat UI streams a mock generation', async ({ page }) => {
         await page.route('**/api/generate', route => {
-            // Mocks the chunked HTTP stream by instantly fulfilling a single text payload
-            route.fulfill({ status: 200, body: 'Hello! I am a simulated AI response.', contentType: 'text/plain' });
+            // Mocks the chunked HTTP stream
+            const streamResponse = 
+                '{"metadata":{"id":"mock-prompt-id","timestamp":1000,"token_counts":{"mock-model-1":5}}}\n' +
+                '{"token":"Hello! I am a simulated AI response."}\n' +
+                '{"metadata":{"id":"mock-ai-id","parent_id":"mock-prompt-id","timestamp":1002,"model":"mock-model-1","generation_time_ms":100,"token_counts":{"mock-model-1":15},"parameters":{}}}\n';
+            route.fulfill({ status: 200, body: streamResponse, contentType: 'text/plain' });
         });
 
         await page.goto('/');
@@ -190,7 +194,81 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         // Verify the DOM inserts the correct elements
         await expect(page.locator('.user-message').last()).toContainText('Can you hear me?');
         await expect(page.locator('.ai-message').last()).toContainText('Hello! I am a simulated AI response.');
+        await expect(page.locator('.msg-metadata').first()).toContainText('Tokens: mock-model-1: 5');
+        await expect(page.locator('.msg-metadata').last()).toContainText('Tokens: mock-model-1: 15');
         await expect(page.locator('#regen-btn')).toBeVisible();
+    });
+
+    test('Chat UI renders message metadata correctly and handles scoring updates', async ({ page }) => {
+        // Setup initial state with a session having metadata
+        const handleMetaSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: [{ id: 'session-meta', title: 'Meta Chat', updated_at: 1678886400, email: 'mock@example.com' }]
+                });
+            } else {
+                route.fallback();
+            }
+        };
+        await page.route('**/api/chat/sessions', handleMetaSessionRoute);
+        await page.route('**/api/chat/sessions?*', handleMetaSessionRoute);
+
+        await page.route('**/api/chat/sessions/session-meta*', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-meta', title: 'Meta Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'What is Rust?',
+                            metadata: { id: 'mock-msg-1', parent_id: null, timestamp: 1234, token_counts: { 'mock-model-1': 10 } }
+                        }, {
+                            role: 'assistant', content: 'Rust is a systems programming language.',
+                            metadata: { id: 'mock-msg-2', parent_id: 'mock-msg-1', timestamp: 1235, model: 'mock-model-1', generation_time_ms: 1500, token_counts: { 'mock-model-1': 25 } }
+                        }]
+                    }
+                });
+            } else {
+                route.fallback();
+            }
+        });
+        
+        await page.route('**/api/chat/sessions/session-meta/messages', async route => {
+            if (route.request().method() === 'POST') {
+                await route.fulfill({ status: 200 });
+            } else {
+                route.fallback();
+            }
+        });
+
+        await page.goto('/');
+        
+        await page.locator('.session-item', { hasText: 'Meta Chat' }).click();
+        
+        // Wait for UI to populate
+        await expect(page.locator('.user-message').last()).toContainText('What is Rust?');
+        
+        // Verify User Metadata
+        const userMeta = page.locator('.msg-metadata').first();
+        await expect(userMeta).toContainText('Tokens: mock-model-1: 10');
+        
+        // Verify AI Metadata
+        const aiMeta = page.locator('.msg-metadata').last();
+        await expect(aiMeta).toContainText('Model: mock-model-1');
+        await expect(aiMeta).toContainText('Time: 1.50s');
+        await expect(aiMeta).toContainText('Tokens: mock-model-1: 25');
+        
+        // Test Scoring
+        const scoreSelect = aiMeta.locator('select');
+        
+        const [request] = await Promise.all([
+            page.waitForRequest(req => req.url().includes('/api/chat/sessions/session-meta/messages') && req.method() === 'POST'),
+            scoreSelect.selectOption('5')
+        ]);
+        
+        const postData = JSON.parse(request.postData());
+        expect(postData.score).toBe(5);
     });
 
     test('Memory view tabs switch content correctly', async ({ page }) => {
@@ -352,6 +430,386 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         await expect(page.locator('.ai-message').last()).toContainText('Persistent message');
     });
 
+    test('Chat UI can create a branch, navigate branches, and use split view', async ({ page }) => {
+        const handleSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-branch', title: 'Branch Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Original Prompt',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'Original Response',
+                            metadata: { id: 'msg-2', parent_id: 'msg-1', timestamp: 1001, model: 'mock-model-1' }
+                        }]
+                    }
+                });
+            } else {
+                route.fallback();
+            }
+        };
+        await page.route('**/api/chat/sessions/session-branch*', handleSessionRoute);
+        const handleBranchSessionsRoute = route => {
+            route.fulfill({ status: 200, json: [{ id: 'session-branch', title: 'Branch Chat', updated_at: 1678886400, email: 'mock@example.com' }] });
+        };
+        await page.route('**/api/chat/sessions', handleBranchSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handleBranchSessionsRoute);
+        await page.route('**/api/chat/sessions/session-branch/messages', route => {
+            route.fulfill({ status: 200 });
+        });
+        await page.route('**/api/generate', route => {
+            const streamResponse = 
+                '{"metadata":{"id":"msg-4","parent_id":"msg-3","timestamp":1003,"model":"mock-model-1"}}\n' +
+                '{"token":"New Response"}\n';
+            route.fulfill({ status: 200, body: streamResponse, contentType: 'text/plain' });
+        });
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Branch Chat' }).click();
+
+        // 1. Edit the prompt to create a branch
+        await expect(page.locator('.user-message').first()).toContainText('Original Prompt');
+        const editBtn = page.locator('button[title="Edit Prompt (Creates New Branch)"]');
+        await expect(editBtn).toBeVisible();
+        await editBtn.click();
+
+        const input = page.locator('#prompt-input');
+        await expect(input).toHaveValue('Original Prompt');
+        await input.fill('New Prompt');
+        await page.locator('#send-btn').click();
+
+        // Wait for generation
+        await expect(page.locator('.user-message').last()).toContainText('New Prompt');
+        await expect(page.locator('.ai-message').last()).toContainText('New Response');
+
+        // Verify Branch Controls appear
+        const branchControls = page.locator('.branch-controls');
+        await expect(branchControls).toBeVisible();
+        await expect(branchControls).toContainText('2 of 2');
+
+        // 2. Navigate back to the original branch
+        await branchControls.locator('span', { hasText: '◀' }).click();
+        await expect(page.locator('.user-message').last()).toContainText('Original Prompt');
+        await expect(page.locator('.ai-message').last()).toContainText('Original Response');
+        await expect(branchControls).toContainText('1 of 2');
+
+        // 3. Toggle Split View
+        await branchControls.locator('span', { hasText: '◫ Split View' }).click();
+        const splitContainer = page.locator('.split-container');
+        await expect(splitContainer).toBeVisible();
+        await expect(splitContainer.locator('.split-item').first()).toContainText('Original Prompt');
+        await expect(splitContainer.locator('.split-item').last()).toContainText('New Prompt');
+
+        // Click a split item to select it
+        await splitContainer.locator('.split-item').last().click();
+        await expect(splitContainer).not.toBeVisible();
+        await expect(branchControls).toContainText('2 of 2');
+    });
+
+    test('Chat UI creates a sibling branch when regenerating a response', async ({ page }) => {
+        const handleRegenSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-regen', title: 'Regenerate Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Original Prompt',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'Original Response',
+                            metadata: { id: 'msg-2', parent_id: 'msg-1', timestamp: 1001, model: 'mock-model-1' }
+                        }]
+                    }
+                });
+            } else {
+                route.fallback();
+            }
+        };
+
+        await page.route('**/api/chat/sessions/session-regen*', handleRegenSessionRoute);
+        const handleRegenSessionsRoute = route => {
+            route.fulfill({ status: 200, json: [{ id: 'session-regen', title: 'Regenerate Chat', updated_at: 1678886400, email: 'mock@example.com' }] });
+        };
+        await page.route('**/api/chat/sessions', handleRegenSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handleRegenSessionsRoute);
+        await page.route('**/api/chat/sessions/session-regen/messages', route => {
+            route.fulfill({ status: 200 });
+        });
+        await page.route('**/api/generate', route => {
+            const streamResponse = 
+                '{"metadata":{"id":"msg-3","parent_id":"msg-1","timestamp":1002,"model":"mock-model-1"}}\n' +
+                '{"token":"Regenerated Response"}\n';
+            route.fulfill({ status: 200, body: streamResponse, contentType: 'text/plain' });
+        });
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Regenerate Chat' }).click();
+
+        await expect(page.locator('.ai-message').last()).toContainText('Original Response');
+        
+        // Click Regenerate
+        await page.locator('#regen-btn').click();
+
+        // Verify the new response is rendered
+        await expect(page.locator('.ai-message').last()).toContainText('Regenerated Response');
+        
+        // Verify branch controls appear on the new AI message (since it's a sibling of msg-2)
+        const branchControls = page.locator('.branch-controls').last();
+        await expect(branchControls).toBeVisible();
+        await expect(branchControls).toContainText('2 of 2');
+    });
+
+    test('Chat UI correctly stitches legacy linear chat histories missing parent_ids', async ({ page }) => {
+        const handleLegacySessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-legacy', title: 'Legacy Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Message 1',
+                            metadata: { id: 'session-legacy_0', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'Message 2',
+                            metadata: { id: 'session-legacy_1', parent_id: null, timestamp: 1001 }
+                        }, {
+                            role: 'user', content: 'Message 3',
+                            metadata: { id: 'session-legacy_2', parent_id: null, timestamp: 1002 }
+                        }]
+                    }
+                });
+            } else {
+                route.fallback();
+            }
+        };
+
+        await page.route('**/api/chat/sessions/session-legacy*', handleLegacySessionRoute);
+        const handleLegacySessionsList = route => {
+            route.fulfill({ status: 200, json: [{ id: 'session-legacy', title: 'Legacy Chat', updated_at: 1678886400, email: 'mock@example.com' }] });
+        };
+        await page.route('**/api/chat/sessions', handleLegacySessionsList);
+        await page.route('**/api/chat/sessions?*', handleLegacySessionsList);
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Legacy Chat' }).click();
+
+        // If stitching fails, only Message 3 will render. If successful, all 3 render in sequence!
+        await expect(page.locator('.message')).toHaveCount(3);
+        await expect(page.locator('.message').nth(0)).toContainText('Message 1');
+        await expect(page.locator('.message').nth(1)).toContainText('Message 2');
+        await expect(page.locator('.message').nth(2)).toContainText('Message 3');
+    });
+
+    test('Chat UI can prune a branch', async ({ page }) => {
+        await page.route('**/api/chat/sessions/session-prune*', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-prune', title: 'Prune Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Prompt 1',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'user', content: 'Prompt 2',
+                            metadata: { id: 'msg-2', parent_id: null, timestamp: 1001 }
+                        }]
+                    }
+                });
+            } else {
+                route.fallback();
+            }
+        });
+
+        const handlePruneSessionsRoute = route => {
+            route.fulfill({ status: 200, json: [{ id: 'session-prune', title: 'Prune Chat', updated_at: 1678886400, email: 'mock@example.com' }] });
+        };
+        await page.route('**/api/chat/sessions', handlePruneSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handlePruneSessionsRoute);
+
+        let deleteRequestReceived = false;
+        await page.route('**/api/chat/sessions/session-prune/messages', async route => {
+            if (route.request().method() === 'DELETE') {
+                deleteRequestReceived = true;
+                const body = JSON.parse(route.request().postData());
+                expect(body.message_ids).toContain('msg-2');
+                await route.fulfill({ status: 200 });
+            } else {
+                route.fallback();
+            }
+        });
+
+        page.on('dialog', dialog => dialog.accept()); // Accept the pruning confirmation dialog
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Prune Chat' }).click();
+
+        const branchControls = page.locator('.branch-controls');
+        await expect(branchControls).toBeVisible();
+        await expect(page.locator('.user-message').last()).toContainText('Prompt 2');
+
+        await branchControls.locator('span', { hasText: '🗑️ Prune' }).click();
+
+        await expect(page.locator('.user-message').last()).toContainText('Prompt 1');
+        expect(deleteRequestReceived).toBe(true);
+        await expect(branchControls).not.toBeVisible();
+    });
+
+    test('Chat UI selects the highest scored branch as the default path', async ({ page }) => {
+        const handleScoreSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-score', title: 'Score Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Root Prompt',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'High Score Branch',
+                            // Even though this branch is older, the score of 5 should make it the default leaf
+                            metadata: { id: 'msg-2', parent_id: 'msg-1', timestamp: 1001, score: 5 }
+                        }, {
+                            role: 'assistant', content: 'Recent Low Score Branch',
+                            metadata: { id: 'msg-3', parent_id: 'msg-1', timestamp: 1002, score: 1 }
+                        }]
+                    }
+                });
+            } else {
+                route.fallback();
+            }
+        };
+
+        await page.route('**/api/chat/sessions/session-score*', handleScoreSessionRoute);
+        const handleScoreSessionsList = route => {
+            route.fulfill({ status: 200, json: [{ id: 'session-score', title: 'Score Chat', updated_at: 1678886400, email: 'mock@example.com' }] });
+        };
+        await page.route('**/api/chat/sessions', handleScoreSessionsList);
+        await page.route('**/api/chat/sessions?*', handleScoreSessionsList);
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Score Chat' }).click();
+
+        // Should automatically render the High Score Branch
+        await expect(page.locator('.ai-message').last()).toContainText('High Score Branch');
+        const branchControls = page.locator('.branch-controls');
+        await expect(branchControls).toBeVisible();
+        await expect(branchControls).toContainText('1 of 2');
+    });
+
+    test('Chat UI recursively gathers descendants when pruning a branch', async ({ page }) => {
+        const handleDeepPruneSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-deep-prune', title: 'Deep Prune Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Root',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'Branch A',
+                            metadata: { id: 'msg-2', parent_id: 'msg-1', timestamp: 1001 }
+                        }, {
+                            role: 'assistant', content: 'Branch B',
+                            metadata: { id: 'msg-3', parent_id: 'msg-1', timestamp: 1002 }
+                        }, {
+                            role: 'user', content: 'Child of Branch A',
+                            metadata: { id: 'msg-4', parent_id: 'msg-2', timestamp: 1003 }
+                        }]
+                    }
+                });
+            } else {
+                route.fallback();
+            }
+        };
+
+        await page.route('**/api/chat/sessions/session-deep-prune*', handleDeepPruneSessionRoute);
+        const handleDeepPruneSessionsList = route => {
+            route.fulfill({ status: 200, json: [{ id: 'session-deep-prune', title: 'Deep Prune Chat', updated_at: 1678886400, email: 'mock@example.com' }] });
+        };
+        await page.route('**/api/chat/sessions', handleDeepPruneSessionsList);
+        await page.route('**/api/chat/sessions?*', handleDeepPruneSessionsList);
+
+        let deletePayload = null;
+        await page.route('**/api/chat/sessions/session-deep-prune/messages', async route => {
+            if (route.request().method() === 'DELETE') {
+                deletePayload = JSON.parse(route.request().postData());
+                await route.fulfill({ status: 200 });
+            } else {
+                route.fallback();
+            }
+        });
+
+        page.on('dialog', dialog => dialog.accept());
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Deep Prune Chat' }).click();
+
+        // Path defaults to Branch A because msg-4 has the latest timestamp
+        await expect(page.locator('.user-message').last()).toContainText('Child of Branch A');
+        
+        const branchControls = page.locator('#msg-wrapper-msg-2 .branch-controls');
+        await expect(branchControls).toBeVisible();
+        
+        // Prune the parent of the current leaf
+        await branchControls.locator('span', { hasText: '🗑️ Prune' }).click();
+
+        expect(deletePayload).not.toBeNull();
+        expect(deletePayload.message_ids).toContain('msg-2');
+        expect(deletePayload.message_ids).toContain('msg-4'); // Child was successfully gathered!
+        expect(deletePayload.message_ids).not.toContain('msg-1');
+        expect(deletePayload.message_ids).not.toContain('msg-3');
+
+        // Validates that after dropping the branch, the UI safely falls back to the remaining sibling branch
+        await expect(page.locator('.ai-message').last()).toContainText('Branch B');
+    });
+
+    test('Chat UI can export chat history', async ({ page }) => {
+        await page.route('**/api/chat/sessions/session-export*', async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-export', title: 'Export Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Test Prompt',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'Test Response',
+                            metadata: { id: 'msg-2', parent_id: 'msg-1', timestamp: 1001 }
+                        }]
+                    }
+                });
+            } else {
+                route.fallback();
+            }
+        });
+
+        const handleExportSessionsRoute = route => {
+            route.fulfill({ status: 200, json: [{ id: 'session-export', title: 'Export Chat', updated_at: 1678886400, email: 'mock@example.com' }] });
+        };
+        await page.route('**/api/chat/sessions', handleExportSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handleExportSessionsRoute);
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Export Chat' }).click();
+
+        await page.locator('#export-chat-btn').click();
+        const exportModal = page.locator('#export-modal');
+        await expect(exportModal).toBeVisible();
+
+        const downloadPromise = page.waitForEvent('download');
+        await page.locator('#export-md-btn').click();
+        const download = await downloadPromise;
+        
+        expect(download.suggestedFilename()).toContain('.md');
+        await expect(exportModal).not.toBeVisible();
+    });
+
     test('Chat UI resists XSS payloads in session titles and messages', async ({ page }) => {
         // Intercept session list to inject XSS in the title
         await page.route('**/api/chat/sessions?*', async route => {
@@ -511,10 +969,17 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
     });
 
     test('Chat UI auto-scrolls to the newest message in a long session', async ({ page }) => {
-        const longMessages = Array.from({ length: 50 }, (_, i) => ({
-            role: i % 2 === 0 ? 'user' : 'assistant',
-            content: `Message number ${i}\nThis is a bit longer to take up vertical space.\nLine 3.`
-        }));
+        const longMessages = [];
+        let lastId = null;
+        for (let i = 0; i < 50; i++) {
+            const id = `msg-${i}`;
+            longMessages.push({
+                role: i % 2 === 0 ? 'user' : 'assistant',
+                content: `Message number ${i}\nThis is a bit longer to take up vertical space.\nLine 3.`,
+                metadata: { id, parent_id: lastId, timestamp: 1000 + i }
+            });
+            lastId = id;
+        }
 
         await page.route('**/api/chat/sessions/session-long*', route => {
             route.fulfill({
@@ -666,7 +1131,7 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
 
         // Mock generate
         await page.route('**/api/generate', route => {
-            route.fulfill({ status: 200, body: 'Generation after download.', contentType: 'text/plain' });
+            route.fulfill({ status: 200, body: '{"token":"Generation after download."}\n', contentType: 'text/plain' });
         });
 
         await page.goto('/');

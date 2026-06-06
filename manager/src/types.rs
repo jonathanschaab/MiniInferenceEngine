@@ -262,10 +262,29 @@ pub struct DownloadStatus {
     pub state: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct MessageMetadata {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_time_ms: Option<u64>,
+    #[serde(default)]
+    pub token_counts: std::collections::HashMap<String, usize>,
+    #[serde(default)]
+    pub score: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<GenerationParameters>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MessageMetadata>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -301,10 +320,23 @@ pub struct ChatSessionRecord {
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ChatMessageRecord {
+    pub id: String,
     pub session_id: String,
-    pub message_index: usize,
+    pub parent_id: Option<String>,
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub generation_time_ms: Option<u64>,
+    #[serde(default)]
+    pub token_counts: Option<std::collections::HashMap<String, usize>>,
+    #[serde(default)]
+    pub score: Option<u8>,
+    #[serde(default)]
+    pub parameters: Option<GenerationParameters>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
@@ -314,7 +346,7 @@ pub enum MemoryStrategy {
     Compress,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct GenerationParameters {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -346,6 +378,7 @@ pub struct ApiRequest {
     pub chat_model_id: String,
     pub compressor_model_id: String,
     pub messages: Vec<Message>,
+    pub parent_message_id: Option<String>,
     pub parameters: Option<GenerationParameters>,
     pub target_backend: Option<String>,
 }
@@ -363,12 +396,14 @@ pub enum StreamEvent {
     TokenizationTime(u128),
     Done,
     Error(String),
+    Metadata(Box<MessageMetadata>),
 }
 
 pub struct UserRequest {
     pub chat_model_id: String,
     pub compressor_model_id: String,
     pub messages: Vec<Message>,
+    pub parent_message_id: Option<String>,
     pub responder: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     pub force_compression: bool,
     pub parameters: GenerationParameters,

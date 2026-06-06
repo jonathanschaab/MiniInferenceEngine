@@ -175,6 +175,23 @@ th { background: #11111b; font-weight: bold; color: #89b4fa; }
 .dl-pause-btn-sm { padding: 3px 8px; background: #f9e2af; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold; }
 .dl-cancel-btn-sm { padding: 3px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold; }
 
+/* Branch Controls */
+.branch-controls {
+    display: flex;
+    align-items: center;
+    user-select: none;
+}
+.branch-controls span {
+    padding: 0 5px;
+    cursor: pointer;
+}
+.branch-controls span:hover {
+    color: #cdd6f4;
+}
+.split-container { display: flex; gap: 15px; overflow-x: auto; width: 100%; padding-bottom: 10px; }
+.split-item { flex: 0 0 350px; border: 1px solid #45475a; border-radius: 8px; padding: 10px; background: #181825; cursor: pointer; }
+.split-item.active-split { border: 2px solid #89b4fa; }
+
 /* --- index.html (Chat) --- */
 body.chat-layout { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .status { color: #a6e3a1; font-size: 0.9rem; font-weight: normal; margin-top: 4px; }

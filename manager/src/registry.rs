@@ -1485,6 +1485,7 @@ mod tests {
         let msgs = vec![Message {
             role: "user".into(),
             content: "Hello".into(),
+            metadata: None,
         }];
         let prompt = arch.format_chat(&msgs);
         assert_eq!(
@@ -1499,6 +1500,7 @@ mod tests {
         let msgs = vec![Message {
             role: "user".into(),
             content: "Hi".into(),
+            metadata: None,
         }];
         let prompt = arch.format_chat(&msgs);
         assert_eq!(
@@ -1513,6 +1515,7 @@ mod tests {
         let msgs = vec![Message {
             role: "user".into(),
             content: "Hi".into(),
+            metadata: None,
         }];
         let prompt = arch.format_chat(&msgs);
         assert_eq!(
@@ -1527,6 +1530,7 @@ mod tests {
         let msgs = vec![Message {
             role: "user".into(),
             content: "Hi".into(),
+            metadata: None,
         }];
         let prompt = arch.format_chat(&msgs);
         assert_eq!(prompt, "<s>[INST] Hi [/INST]");
@@ -1538,6 +1542,7 @@ mod tests {
         let msgs = vec![Message {
             role: "user".into(),
             content: "Hi".into(),
+            metadata: None,
         }];
         let prompt = arch.format_chat(&msgs);
         assert_eq!(prompt, "<｜begin of sentence｜><｜User｜>Hi<｜Assistant｜>");
@@ -1549,6 +1554,7 @@ mod tests {
         let msgs = vec![Message {
             role: "user".into(),
             content: "Hi".into(),
+            metadata: None,
         }];
         let prompt = arch.format_chat(&msgs);
         assert_eq!(
@@ -1563,6 +1569,7 @@ mod tests {
         let msgs = vec![Message {
             role: "system".into(),
             content: "test".into(),
+            metadata: None,
         }];
         let prompt = arch.format_chat(&msgs);
         assert_eq!(prompt, "system: test\nassistant: ");

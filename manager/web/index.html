@@ -20,6 +20,7 @@
             <select id="backend-select" class="control-select"></select>
         </div>
         <div class="control-group">
+            <button id="export-chat-btn" class="btn-nav bg-mauve">💾 Export</button>
             <button id="toggle-parameters-btn" class="btn-nav bg-sky">🎛️ Parameters</button>
             <button id="clear-chat-btn" class="btn-nav bg-red">🗑️ Clear Chat</button>
         </div>
@@ -103,6 +104,20 @@
             <div class="modal-actions">
                 <button class="btn-cancel" id="delete-cancel-btn">Cancel</button>
                 <button class="btn-run bg-red text-base" id="delete-confirm-btn">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="export-modal" class="modal-overlay">
+        <div class="modal-content">
+            <h2>Export Chat</h2>
+            <p class="mb-20">Choose the format to export the current conversation branch:</p>
+            <div class="modal-actions">
+                <button class="btn-cancel" id="export-cancel-btn">Cancel</button>
+                <div>
+                    <button class="btn-run bg-blue mr-5" id="export-md-btn">Markdown</button>
+                    <button class="btn-run bg-yellow" id="export-json-btn">JSON</button>
+                </div>
             </div>
         </div>
     </div>

@@ -8,14 +8,14 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 
 use crate::{
     AppConfig, AppState, LogReloadHandle, SharedLogBuffer, append_chat_message, auth,
-    cancel_all_downloads, cancel_download, clear_console_logs, delete_chat_session, delete_model,
-    get_chat_session, get_console_loglevel, get_console_logs, get_download_progress, get_model,
-    get_models, get_stats_data, get_status, handle_generate, list_chat_sessions, pause_download,
-    save_chat_session, serve_chat_js, serve_common_css, serve_common_js, serve_console_js,
-    serve_console_ui, serve_memory_js, serve_memory_ui, serve_models_js, serve_models_ui,
-    serve_queue_js, serve_queue_ui, serve_settings_js, serve_settings_ui, serve_stats_js,
-    serve_stats_ui, serve_ui, set_console_loglevel, trigger_benchmark, trigger_download,
-    truncate_chat_messages,
+    cancel_all_downloads, cancel_download, clear_console_logs, delete_chat_messages,
+    delete_chat_session, delete_model, get_chat_session, get_console_loglevel, get_console_logs,
+    get_download_progress, get_model, get_models, get_stats_data, get_status, handle_generate,
+    list_chat_sessions, pause_download, save_chat_session, serve_chat_js, serve_common_css,
+    serve_common_js, serve_console_js, serve_console_ui, serve_memory_js, serve_memory_ui,
+    serve_models_js, serve_models_ui, serve_queue_js, serve_queue_ui, serve_settings_js,
+    serve_settings_ui, serve_stats_js, serve_stats_ui, serve_ui, set_console_loglevel,
+    trigger_benchmark, trigger_download,
 };
 
 pub async fn init_db(
@@ -80,7 +80,7 @@ pub async fn init_db(
 
     let index_queries = "
         DEFINE INDEX IF NOT EXISTS chat_sessions_email_idx ON TABLE chat_sessions COLUMNS email;
-        DEFINE INDEX IF NOT EXISTS chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id, message_index;
+        DEFINE INDEX IF NOT EXISTS chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id;
         DEFINE INDEX IF NOT EXISTS telemetry_loads_timestamp_idx ON TABLE telemetry_loads COLUMNS timestamp;
         DEFINE INDEX IF NOT EXISTS telemetry_generations_timestamp_idx ON TABLE telemetry_generations COLUMNS timestamp;
     ";
@@ -184,11 +184,7 @@ pub fn build_engine_api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route(
             "/api/chat/sessions/{id}/messages",
-            post(append_chat_message),
-        )
-        .route(
-            "/api/chat/sessions/{id}/messages/{index}",
-            delete(truncate_chat_messages),
+            post(append_chat_message).delete(delete_chat_messages),
         )
         .route("/api/models", get(get_models))
         .route("/api/models/{id}", get(get_model).delete(delete_model))

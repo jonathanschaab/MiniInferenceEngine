@@ -816,6 +816,7 @@ pub async fn run_batcher_loop(
                 let compression_messages = vec![Message {
                     role: "user".to_string(),
                     content: format!("Summarize this text to be shorter:\n{}", formatted_prompt),
+                    metadata: None,
                 }];
                 let compression_prompt = comp_config.arch.format_chat(&compression_messages);
                 let params = GenerationParameters {
@@ -918,6 +919,7 @@ pub async fn run_batcher_loop(
                 new_messages.push(Message {
                     role: "system".to_string(),
                     content: format!("Compressed Context:\n{}", summary.trim()),
+                    metadata: None,
                 });
                 new_messages.push(last_message);
             } else {
@@ -925,6 +927,7 @@ pub async fn run_batcher_loop(
                 new_messages.push(Message {
                     role: "user".to_string(),
                     content: format!("Review this compressed context:\n{}", summary.trim()),
+                    metadata: None,
                 });
             }
 
@@ -938,6 +941,26 @@ pub async fn run_batcher_loop(
         let (inner_tx, mut inner_rx) = tokio::sync::mpsc::unbounded_channel();
         let responder = request.responder;
 
+        let msg_index = request.messages.len();
+        if msg_index > 0 {
+            let mut prompt_tokens = std::collections::HashMap::new();
+            prompt_tokens.insert(active_model_id.clone(), token_count);
+            let prompt_meta = MessageMetadata {
+                id: request.parent_message_id.clone().unwrap_or_default(),
+                parent_id: None,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                model: None,
+                generation_time_ms: None,
+                token_counts: prompt_tokens,
+                score: None,
+                parameters: None,
+            };
+            let _ = responder.send(StreamEvent::Metadata(Box::new(prompt_meta)));
+        }
+
         let backend_mut = match active_backend.as_mut() {
             Some(b) => b,
             None => {
@@ -948,23 +971,36 @@ pub async fn run_batcher_loop(
             }
         };
 
-        let gen_fut = backend_mut.generate_stream(&formatted_prompt, &request.parameters, inner_tx);
+        let mut params = request.parameters.clone();
+        if params.seed.is_none() {
+            params.seed = Some(rand::random::<i64>());
+        }
+
+        let gen_fut = backend_mut.generate_stream(&formatted_prompt, &params, inner_tx);
 
         // Concurrently run the backend generator and dynamically intercept internal stream
         // events like 'TokenizationTime' so they don't leak into the web HTTP chunked response!
         let fwd_fut = async {
             let mut terminal_received = false;
+            let mut is_error = false;
             let mut tok_time: u128 = 0;
+            let mut generated_tokens = 0;
             while let Some(ev) = inner_rx.recv().await {
                 match ev {
                     StreamEvent::TokenizationTime(t) => tok_time = t,
+                    StreamEvent::Token(t) => {
+                        generated_tokens += 1;
+                        if responder.send(StreamEvent::Token(t)).is_err() {
+                            break; // Client disconnected, stop forwarding
+                        }
+                    }
                     StreamEvent::Done => {
                         terminal_received = true;
-                        let _ = responder.send(StreamEvent::Done);
                         break;
                     }
                     StreamEvent::Error(e) => {
                         terminal_received = true;
+                        is_error = true;
                         let _ = responder.send(StreamEvent::Error(e));
                         set_model_health(&status, &active_model_id, false);
                         break;
@@ -977,18 +1013,35 @@ pub async fn run_batcher_loop(
                 }
             }
 
-            // If the backend panicked or dropped the channel without sending a terminal event,
-            // synthesize one here so the HTTP stream closes gracefully and the UI doesn't hang.
-            if !terminal_received {
-                let _ = responder.send(StreamEvent::Done);
-            }
-
-            tok_time
+            (tok_time, generated_tokens, terminal_received, is_error)
         };
 
-        let (_, tokenization_time_ms) = tokio::join!(gen_fut, fwd_fut);
+        let (_, (tokenization_time_ms, generated_tokens, terminal_received, is_error)) =
+            tokio::join!(gen_fut, fwd_fut);
 
         let elapsed = gen_start.elapsed().as_millis();
+
+        if terminal_received && !is_error {
+            let mut token_counts = std::collections::HashMap::new();
+            token_counts.insert(active_model_id.clone(), generated_tokens);
+
+            let meta = MessageMetadata {
+                id: "ai_generation".to_string(),
+                parent_id: request.parent_message_id.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                model: Some(active_model_id.clone()),
+                generation_time_ms: Some(elapsed as u64),
+                token_counts,
+                score: None,
+                parameters: Some(params.clone()),
+            };
+            let _ = responder.send(StreamEvent::Metadata(Box::new(meta)));
+        }
+        let _ = responder.send(StreamEvent::Done);
+
         info!(
             "Generation completed in {} ms (Tokenization: {} ms)",
             elapsed, tokenization_time_ms
@@ -1076,7 +1129,9 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
+                metadata: None,
             }],
+            parent_message_id: None,
             responder: resp_tx,
             force_compression: false,
             parameters: GenerationParameters::default(),

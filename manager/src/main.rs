@@ -204,6 +204,7 @@ pub(crate) async fn handle_generate(
         chat_model_id: payload.chat_model_id,
         compressor_model_id: payload.compressor_model_id,
         messages: payload.messages,
+        parent_message_id: payload.parent_message_id,
         responder: response_tx,
         force_compression: false,
         parameters: payload.parameters.unwrap_or_default(),
@@ -215,10 +216,35 @@ pub(crate) async fn handle_generate(
 
     // Map the incoming channel into an HTTP streaming body
     let stream = UnboundedReceiverStream::new(response_rx).map(|event| match event {
-        StreamEvent::Token(t) => Ok::<_, std::convert::Infallible>(Bytes::from(t)),
+        StreamEvent::Token(t) => {
+            #[derive(Serialize)]
+            struct TokenMsg<'a> {
+                token: &'a str,
+            }
+            let mut s = serde_json::to_string(&TokenMsg { token: &t }).unwrap();
+            s.push('\n');
+            Ok::<_, std::convert::Infallible>(Bytes::from(s))
+        }
+        StreamEvent::Metadata(m) => {
+            #[derive(Serialize)]
+            struct MetaMsg<'a> {
+                metadata: &'a manager::MessageMetadata,
+            }
+            let mut s = serde_json::to_string(&MetaMsg { metadata: &m }).unwrap();
+            s.push('\n');
+            Ok(Bytes::from(s))
+        }
+        StreamEvent::Error(e) => {
+            #[derive(Serialize)]
+            struct ErrorMsg<'a> {
+                error: &'a str,
+            }
+            let mut s = serde_json::to_string(&ErrorMsg { error: &e }).unwrap();
+            s.push('\n');
+            Ok(Bytes::from(s))
+        }
         StreamEvent::TokenizationTime(_) => Ok(Bytes::new()),
         StreamEvent::Done => Ok(Bytes::new()),
-        StreamEvent::Error(e) => Ok(Bytes::from(format!("Error: {}", e))),
     });
 
     axum::response::Response::builder()
@@ -797,7 +823,9 @@ pub(crate) async fn trigger_benchmark(
                             messages: vec![Message {
                                 role: "user".to_string(),
                                 content: prompt_instruction,
+                                metadata: None,
                             }],
+                            parent_message_id: None,
                             responder: seed_tx,
                             force_compression: false,
                             parameters: params.clone(),
@@ -815,6 +843,7 @@ pub(crate) async fn trigger_benchmark(
                                 break;
                             }
                             StreamEvent::TokenizationTime(_) => {} // Ignore for seed generation
+                            StreamEvent::Metadata(_) => {}         // Ignore for seed generation
                         }
                     }
 
@@ -973,7 +1002,9 @@ pub(crate) async fn trigger_benchmark(
                             messages: vec![Message {
                                 role: "user".to_string(),
                                 content: exact_prompt.clone(),
+                                metadata: None,
                             }],
+                            parent_message_id: None,
                             responder: response_tx,
                             force_compression: false,
                             parameters: params.clone(),
@@ -1032,7 +1063,9 @@ pub(crate) async fn trigger_benchmark(
                             messages: vec![Message {
                                 role: "user".to_string(),
                                 content: exact_prompt.clone(),
+                                metadata: None,
                             }],
+                            parent_message_id: None,
                             responder: response_tx,
                             force_compression: true,
                             parameters: params.clone(),
@@ -1285,8 +1318,7 @@ pub(crate) async fn get_chat_session(
 
     let mut response = state
                 .db
-                // Order DESC to get the latest messages first, then we'll reverse them
-                .query("SELECT role, content, message_index FROM chat_messages WHERE session_id = $session_id ORDER BY message_index DESC LIMIT $limit START $offset")
+                .query("SELECT type::string(meta::id(id)) AS id, session_id, parent_id, role, content, timestamp, model, generation_time_ms, token_counts, score, parameters FROM chat_messages WHERE session_id = $session_id ORDER BY timestamp DESC LIMIT $limit START $offset")
                 .bind(("session_id", id.clone()))
                 .bind(("limit", limit))
                 .bind(("offset", offset))
@@ -1296,15 +1328,37 @@ pub(crate) async fn get_chat_session(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-    let mut db_messages: Vec<manager::Message> = response.take(0).unwrap_or_default();
-    db_messages.reverse(); // Reverse back to chronological order
+    let mut db_messages: Vec<manager::ChatMessageRecord> = response.take(0).unwrap_or_default();
+    db_messages.reverse(); // Reverse back to chronological order for the frontend
+
+    let messages = db_messages
+        .into_iter()
+        .map(|m| {
+            let metadata = Some(manager::MessageMetadata {
+                id: m.id,
+                parent_id: m.parent_id,
+                timestamp: m.timestamp.unwrap_or_default(),
+                model: m.model,
+                generation_time_ms: m.generation_time_ms,
+                token_counts: m.token_counts.unwrap_or_default(),
+                score: m.score,
+                parameters: m.parameters,
+            });
+
+            manager::Message {
+                role: m.role,
+                content: m.content,
+                metadata,
+            }
+        })
+        .collect();
 
     Ok(Json(manager::ChatSession {
         id: s.id,
         email: s.email,
         updated_at: s.updated_at,
         title: s.title,
-        messages: db_messages,
+        messages,
     }))
 }
 
@@ -1384,34 +1438,39 @@ pub(crate) async fn append_chat_message(
 ) -> Result<StatusCode, StatusCode> {
     verify_session_ownership(&state.db, &id, &user.email).await?;
 
-    let mut last_msg_response = state
-        .db
-        .query("SELECT * FROM chat_messages WHERE session_id = $session_id ORDER BY message_index DESC LIMIT 1")
-        .bind(("session_id", id.clone()))
-        .await
-        .map_err(|e| {
-            error!("DB Query Error (last message): {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let last_msg: Option<manager::ChatMessageRecord> =
-        last_msg_response.take(0).unwrap_or_default();
-    let expected_index = last_msg.map(|m| m.message_index + 1).unwrap_or(0);
-
-    if payload.message_index > expected_index {
-        error!(
-            "Invalid message_index for session {}: expected <= {}, got {}",
-            id, expected_index, payload.message_index
-        );
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     payload.session_id = id.clone();
-    let message_id = format!("{}_{}", id, payload.message_index);
+    if payload.id.is_empty() {
+        payload.id = uuid::Uuid::new_v4().to_string();
+    }
+    let message_id = payload.id.clone();
+
     if let Err(e) = state
         .db
-        .upsert::<Option<manager::ChatMessageRecord>>(("chat_messages", &message_id))
-        .content(payload)
+        .query(
+            "UPSERT type::thing('chat_messages', $id) MERGE {
+                session_id: $session_id,
+                parent_id: $parent_id,
+                role: $role,
+                content: $content,
+                timestamp: $timestamp,
+                model: $model,
+                generation_time_ms: $generation_time_ms,
+                token_counts: $token_counts,
+                score: $score,
+                parameters: $parameters
+            }",
+        )
+        .bind(("id", message_id))
+        .bind(("session_id", payload.session_id))
+        .bind(("parent_id", payload.parent_id))
+        .bind(("role", payload.role))
+        .bind(("content", payload.content))
+        .bind(("timestamp", payload.timestamp))
+        .bind(("model", payload.model))
+        .bind(("generation_time_ms", payload.generation_time_ms))
+        .bind(("token_counts", payload.token_counts))
+        .bind(("score", payload.score))
+        .bind(("parameters", payload.parameters))
         .await
     {
         error!("DB Upsert Error (chat_messages): {}", e);
@@ -1423,24 +1482,48 @@ pub(crate) async fn append_chat_message(
     Ok(StatusCode::OK)
 }
 
-pub(crate) async fn truncate_chat_messages(
+#[derive(Deserialize)]
+pub struct DeleteMessagesRequest {
+    pub message_ids: Vec<String>,
+}
+
+pub(crate) async fn delete_chat_messages(
     user: auth::CurrentUser,
-    Path((id, index)): Path<(String, usize)>,
+    Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
+    Json(payload): Json<DeleteMessagesRequest>,
 ) -> Result<StatusCode, StatusCode> {
     verify_session_ownership(&state.db, &id, &user.email).await?;
 
-    if let Err(e) = state
-        .db
-        .query(
-            "DELETE FROM chat_messages WHERE session_id = $session_id AND message_index >= $index",
-        )
-        .bind(("session_id", id.clone()))
-        .bind(("index", index))
-        .await
-    {
-        error!("DB Delete Error (truncate chat_messages): {}", e);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    // Prevent pruning root messages to avoid breaking the session tree
+    for msg_id in &payload.message_ids {
+        let mut response = state
+            .db
+            .query("SELECT type::string(meta::id(id)) AS id, session_id, parent_id, role, content, timestamp, model, generation_time_ms, token_counts, score, parameters FROM type::thing('chat_messages', $msg_id)")
+            .bind(("msg_id", msg_id.clone()))
+            .await
+            .map_err(|e| {
+                error!("DB Query Error: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let msg: Option<manager::ChatMessageRecord> = response.take(0).unwrap_or_default();
+        if let Some(m) = msg
+            && m.parent_id.is_none()
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    for msg_id in payload.message_ids {
+        if let Err(e) = state
+            .db
+            .query("DELETE type::thing('chat_messages', $msg_id)")
+            .bind(("msg_id", msg_id))
+            .await
+        {
+            error!("DB Delete Error (delete chat_messages): {}", e);
+        }
     }
 
     touch_session_updated_at(&state.db, &id).await;
@@ -2158,9 +2241,11 @@ mod tests {
         db.query("DEFINE INDEX chat_sessions_email_idx ON TABLE chat_sessions COLUMNS email;")
             .await
             .unwrap();
-        db.query("DEFINE INDEX chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id, message_index;")
-            .await
-            .unwrap();
+        db.query(
+            "DEFINE INDEX chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id;",
+        )
+        .await
+        .unwrap();
         db.query("DEFINE INDEX telemetry_loads_timestamp_idx ON TABLE telemetry_loads COLUMNS timestamp;")
             .await
             .unwrap();
@@ -2285,10 +2370,17 @@ mod tests {
 
         // 4. Append a message
         let message_payload = manager::ChatMessageRecord {
+            id: "msg1".to_string(),
             session_id: session_id.clone(),
-            message_index: 0,
+            parent_id: None,
             role: "user".to_string(),
             content: "Hello AI".to_string(),
+            timestamp: None,
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
         let append_res = append_chat_message(
             user.clone(),
@@ -2301,10 +2393,17 @@ mod tests {
 
         // 5. Append another message
         let message_payload_2 = manager::ChatMessageRecord {
+            id: "msg2".to_string(),
             session_id: session_id.clone(),
-            message_index: 1,
+            parent_id: Some("msg1".to_string()),
             role: "assistant".to_string(),
             content: "Hello human".to_string(),
+            timestamp: None,
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
         let append_res_2 = append_chat_message(
             user.clone(),
@@ -2332,14 +2431,17 @@ mod tests {
         assert_eq!(session_detail_with_msgs.messages[0].content, "Hello AI");
         assert_eq!(session_detail_with_msgs.messages[1].content, "Hello human");
 
-        // 7. Truncate messages (e.g., regenerate from a point)
-        let truncate_res = truncate_chat_messages(
+        // 7. Delete message (e.g., prune a branch)
+        let delete_res = delete_chat_messages(
             user.clone(),
-            Path((session_id.clone(), 1)),
+            Path(session_id.clone()),
             State(state.clone()),
+            Json(DeleteMessagesRequest {
+                message_ids: vec!["msg2".to_string()],
+            }),
         )
         .await;
-        assert_eq!(truncate_res, Ok(StatusCode::OK));
+        assert_eq!(delete_res, Ok(StatusCode::OK));
 
         // 8. Verify truncation
         let session_after_truncate = get_chat_session(
@@ -2456,7 +2558,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "Requires Oauth Token (Suite 2)"]
-    async fn test_chat_session_gap_rejection() {
+    async fn test_chat_session_branching_and_pruning() {
         let state = create_test_app_state().await;
         let user_email = "test@example.com";
         let user = mock_user(user_email, false);
@@ -2465,7 +2567,7 @@ mod tests {
             id: "".to_string(),
             email: user_email.to_string(),
             updated_at: 0,
-            title: "Gap Test Session".to_string(),
+            title: "Branching Test Session".to_string(),
         };
         let response = save_chat_session(
             user.clone(),
@@ -2475,28 +2577,42 @@ mod tests {
         .await;
         let session_id = response.unwrap().0.id;
 
-        // 1. Append message 0 (Valid)
-        let msg0 = manager::ChatMessageRecord {
+        // 1. Append message 1 (Root)
+        let msg1 = manager::ChatMessageRecord {
+            id: "msg1".to_string(),
             session_id: session_id.clone(),
-            message_index: 0,
+            parent_id: None,
             role: "user".to_string(),
-            content: "Message 0".to_string(),
+            content: "Root message".to_string(),
+            timestamp: Some(1000),
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
-        let res0 = append_chat_message(
+        let res1 = append_chat_message(
             user.clone(),
             Path(session_id.clone()),
             State(state.clone()),
-            Json(msg0),
+            Json(msg1),
         )
         .await;
-        assert_eq!(res0, Ok(StatusCode::OK));
+        assert_eq!(res1, Ok(StatusCode::OK));
 
-        // 2. Append message 2 (Invalid Gap -> Should return BAD_REQUEST)
+        // 2. Append message 2 (Branch A)
         let msg2 = manager::ChatMessageRecord {
+            id: "msg2".to_string(),
             session_id: session_id.clone(),
-            message_index: 2,
-            role: "user".to_string(),
-            content: "Message 2".to_string(),
+            parent_id: Some("msg1".to_string()),
+            role: "assistant".to_string(),
+            content: "Branch A".to_string(),
+            timestamp: Some(1001),
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
         let res2 = append_chat_message(
             user.clone(),
@@ -2505,33 +2621,93 @@ mod tests {
             Json(msg2),
         )
         .await;
-        assert_eq!(res2, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(res2, Ok(StatusCode::OK));
 
-        // 3. Append message 1 (Valid sequence)
-        let msg1 = manager::ChatMessageRecord {
+        // 3. Append message 3 (Branch B)
+        let msg3 = manager::ChatMessageRecord {
+            id: "msg3".to_string(),
             session_id: session_id.clone(),
-            message_index: 1,
+            parent_id: Some("msg1".to_string()),
             role: "assistant".to_string(),
-            content: "Message 1".to_string(),
+            content: "Branch B".to_string(),
+            timestamp: Some(1002),
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
-        let res1 = append_chat_message(
+        let res3 = append_chat_message(
             user.clone(),
             Path(session_id.clone()),
             State(state.clone()),
-            Json(msg1.clone()),
+            Json(msg3),
         )
         .await;
-        assert_eq!(res1, Ok(StatusCode::OK));
+        assert_eq!(res3, Ok(StatusCode::OK));
 
-        // 4. Retry appending message 1 (Valid Overwrite/Upsert)
-        let res1_retry = append_chat_message(
+        // 4. Fetch session to verify branching
+        let session_detail = get_chat_session(
+            user.clone(),
+            Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(session_detail.messages.len(), 3);
+
+        // Ensure chronological sorting works correctly
+        assert_eq!(session_detail.messages[0].content, "Root message");
+        assert_eq!(session_detail.messages[1].content, "Branch A");
+        assert_eq!(session_detail.messages[2].content, "Branch B");
+
+        // 5. Delete Branch A
+        let delete_res = delete_chat_messages(
             user.clone(),
             Path(session_id.clone()),
             State(state.clone()),
-            Json(msg1),
+            Json(DeleteMessagesRequest {
+                message_ids: vec!["msg2".to_string()],
+            }),
         )
         .await;
-        assert_eq!(res1_retry, Ok(StatusCode::OK));
+        assert_eq!(delete_res, Ok(StatusCode::OK));
+
+        // 6. Verify Branch A is removed
+        let session_after = get_chat_session(
+            user.clone(),
+            Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(session_after.messages.len(), 2);
+        assert_eq!(session_after.messages[0].content, "Root message");
+        assert_eq!(session_after.messages[1].content, "Branch B");
+
+        // 7. Attempt to delete the root message (msg1) -> Should return BAD_REQUEST
+        let delete_root_res = delete_chat_messages(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(DeleteMessagesRequest {
+                message_ids: vec!["msg1".to_string()],
+            }),
+        )
+        .await;
+        assert_eq!(delete_root_res, Err(StatusCode::BAD_REQUEST));
     }
 
     #[tokio::test]
