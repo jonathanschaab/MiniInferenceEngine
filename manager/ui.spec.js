@@ -222,7 +222,7 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
                 }
 
                 // Ignore Chromium internal network errors for unmocked endpoints hitting dead localhost ports
-                if (text.includes('net::ERR_NO_BUFFER_SPACE') || text.includes('net::ERR_CONNECTION_REFUSED') || text.includes('Failed to append message')) {
+                if (text.includes('net::ERR_NO_BUFFER_SPACE') || text.includes('net::ERR_CONNECTION_REFUSED') || text.includes('Failed to append message') || text.includes('Failed to fetch')) {
                     return;
                 }
 

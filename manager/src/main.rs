@@ -1747,19 +1747,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut s = manager::lock_status(&status_for_nvml);
 
+            let mut proc_memory = 0;
             if let Some(pid) = pid_opt {
                 sys.refresh_process(pid);
                 if let Some(process) = sys.process(pid) {
-                    s.update_sysinfo(
-                        sys.total_memory(),
-                        sys.used_memory(),
-                        sys.free_memory(),
-                        process.memory(),
-                    );
+                    proc_memory = process.memory();
                 }
-            } else {
-                s.update_sysinfo(sys.total_memory(), sys.used_memory(), sys.free_memory(), 0);
             }
+            s.update_sysinfo(
+                sys.total_memory(),
+                sys.used_memory(),
+                sys.free_memory(),
+                proc_memory,
+            );
 
             if let Some((used, total, free)) =
                 manager::get_vram_info(nvml.as_ref(), vram_tracker_gpu_idx)

@@ -543,6 +543,23 @@ mod tests {
     }
 
     #[test]
+    fn test_update_sysinfo_process_lost() {
+        let mut status = EngineStatus::default();
+
+        // Simulate the case where the PID fails to resolve, yielding 0 for process_used.
+        // The overall system totals should remain accurate.
+        status.update_sysinfo(16000, 8000, 8000, 0);
+        assert_eq!(status.ram_total, 16000);
+        assert_eq!(status.ram_used, 8000);
+        assert_eq!(status.ram_free, 8000);
+        assert_eq!(status.ram_process_used, 0);
+        assert_eq!(
+            status.ram_other_processes, 8000,
+            "All used RAM should gracefully fallback to other processes"
+        );
+    }
+
+    #[test]
     fn test_update_nvml_baseline_ratchet() {
         let mut status = EngineStatus::default();
         // Start at 2000 used, no models
