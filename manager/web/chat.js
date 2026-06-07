@@ -41,6 +41,16 @@ const sessionScrollObserver = new IntersectionObserver((entries) => {
     threshold: 0
 });
 
+function generateUUID() {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+        return crypto.randomUUID();
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+    });
+}
+
 window.onload = initializeUI;
 
 function showRenameModal(currentTitle) {
@@ -402,6 +412,7 @@ async function loadSession(id, skipSessionListUpdate = false) {
     messagesMap.clear();
     currentLeafId = null;
     splitViewParentId = null;
+    window.branchingParentId = undefined;
     hasMoreMessages = true;
     isLoadingMessages = false;
     chatContainer.innerHTML = '';
@@ -464,7 +475,7 @@ function buildTree(fetchedMessages, isInitialLoad) {
     
     fetchedMessages.forEach(msg => {
         if (!msg.metadata) msg.metadata = {};
-        if (!msg.metadata.id) msg.metadata.id = crypto.randomUUID();
+        if (!msg.metadata.id) msg.metadata.id = generateUUID();
     });
 
     // Legacy linear history stitching (Legacy IDs contained underscores: sessionID_index)
@@ -472,7 +483,7 @@ function buildTree(fetchedMessages, isInitialLoad) {
     fetchedMessages.forEach((msg) => {
         const isLegacy = msg.metadata.id.includes('_');
         if (isLegacy) {
-            if (msg.metadata.parent_id === null && lastLegacyId !== null) {
+            if (msg.metadata.parent_id == null && lastLegacyId !== null) {
                 msg.metadata.parent_id = lastLegacyId;
             }
             lastLegacyId = msg.metadata.id;
@@ -484,7 +495,7 @@ function buildTree(fetchedMessages, isInitialLoad) {
             (!oldest || m.metadata.timestamp < oldest.metadata.timestamp) ? m : oldest
         , null);
         
-        if (earliestExisting && earliestExisting.metadata.parent_id === null && earliestExisting.metadata.id.includes('_')) {
+        if (earliestExisting && earliestExisting.metadata.parent_id == null && earliestExisting.metadata.id.includes('_')) {
             let latestFetchedLegacy = null;
             for (let i = fetchedMessages.length - 1; i >= 0; i--) {
                 if (fetchedMessages[i].metadata.id.includes('_')) {
@@ -840,6 +851,7 @@ function startNewSession() {
     messagesMap.clear();
     currentLeafId = null;
     splitViewParentId = null;
+    window.branchingParentId = undefined;
     chatContainer.innerHTML = '<div style="display: flex; flex-direction: column; align-items: flex-start;"><div class="message ai-message mb-15">System: New chat session started. How can I help you?</div></div>';
     regenBtn.style.display = 'none';
     updateActiveSessionClass();
@@ -1048,7 +1060,7 @@ async function sendMessage() {
 
     await ensureSession(text);
 
-    const newId = crypto.randomUUID();
+    const newId = generateUUID();
     const parentId = window.branchingParentId !== undefined ? window.branchingParentId : currentLeafId;
     window.branchingParentId = undefined; // Reset state
 
@@ -1126,7 +1138,7 @@ async function requestAiResponse() {
     const generatingSessionEl = document.querySelector(`.session-item[data-id="${generatingSessionId}"]`);
     if (generatingSessionEl) generatingSessionEl.classList.add('generating');
 
-    const aiMessageId = crypto.randomUUID();
+    const aiMessageId = generateUUID();
     const parentId = currentLeafId;
 
     let aiMetadata = { id: aiMessageId, parent_id: parentId, timestamp: Math.floor(Date.now() / 1000) };
@@ -1291,6 +1303,7 @@ async function requestAiResponse() {
 async function regenerateLast() {
     if (!currentLeafId) return;
     const leafNode = messagesMap.get(currentLeafId);
+    if (!leafNode) return;
     
     if (leafNode.role === 'assistant') {
         currentLeafId = leafNode.metadata.parent_id;

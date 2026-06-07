@@ -1545,38 +1545,45 @@ pub(crate) async fn delete_chat_messages(
 ) -> Result<StatusCode, StatusCode> {
     verify_session_ownership(&state.db, &id, &user.email).await?;
 
-    // Prevent pruning root messages to avoid breaking the session tree
-    for msg_id in &payload.message_ids {
+    if !payload.message_ids.is_empty() {
+        #[derive(Deserialize)]
+        struct MessageParentCheck {
+            parent_id: Option<String>,
+        }
+
+        // Prevent pruning root messages to avoid breaking the session tree
         let mut response = state
             .db
-            .query("SELECT type::string(meta::id(id)) AS id, session_id, parent_id, role, content, timestamp, model, generation_time_ms, token_counts, score, parameters FROM type::thing('chat_messages', $msg_id)")
-            .bind(("msg_id", msg_id.clone()))
+            .query("SELECT parent_id FROM chat_messages WHERE session_id = $session_id AND type::string(meta::id(id)) IN $msg_ids")
+            .bind(("session_id", id.clone()))
+            .bind(("msg_ids", payload.message_ids.clone()))
             .await
             .map_err(|e| {
                 error!("DB Query Error: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        let msg: Option<manager::ChatMessageRecord> = response.take(0).map_err(|e| {
+        let messages: Vec<MessageParentCheck> = response.take(0).map_err(|e| {
             error!("DB Parse Error (chat_messages): {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        if let Some(m) = msg
-            && m.parent_id.is_none()
-        {
-            return Err(StatusCode::BAD_REQUEST);
+
+        for m in messages {
+            if m.parent_id.is_none() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
         }
     }
 
-    for msg_id in payload.message_ids {
-        if let Err(e) = state
+    if !payload.message_ids.is_empty()
+        && let Err(e) = state
             .db
-            .query("DELETE type::thing('chat_messages', $msg_id)")
-            .bind(("msg_id", msg_id))
+            .query("DELETE chat_messages WHERE session_id = $session_id AND type::string(meta::id(id)) IN $msg_ids")
+            .bind(("session_id", id.clone()))
+            .bind(("msg_ids", payload.message_ids))
             .await
-        {
-            error!("DB Delete Error (delete chat_messages): {}", e);
-        }
+    {
+        error!("DB Delete Error (delete chat_messages): {}", e);
     }
 
     touch_session_updated_at(&state.db, &id).await;
@@ -3375,6 +3382,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
     async fn test_stream_serialization_no_panic() {
         let (queue_tx, mut queue_rx) = mpsc::channel(1);
         let state = create_test_app_state().await;

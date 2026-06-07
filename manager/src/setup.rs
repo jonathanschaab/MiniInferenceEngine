@@ -80,7 +80,7 @@ pub async fn init_db(
 
     let index_queries = "
         DEFINE INDEX IF NOT EXISTS chat_sessions_email_idx ON TABLE chat_sessions COLUMNS email;
-        DEFINE INDEX IF NOT EXISTS chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id;
+        DEFINE INDEX IF NOT EXISTS chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id, timestamp;
         DEFINE INDEX IF NOT EXISTS telemetry_loads_timestamp_idx ON TABLE telemetry_loads COLUMNS timestamp;
         DEFINE INDEX IF NOT EXISTS telemetry_generations_timestamp_idx ON TABLE telemetry_generations COLUMNS timestamp;
     ";
