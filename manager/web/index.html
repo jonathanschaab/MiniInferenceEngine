@@ -12,12 +12,13 @@
         <h1>Mini Inference Engine <span id="engine-status-indicator" class="status"></span></h1>
     </header>
     
+    <main class="app-main">
     <!-- Session Control Bar -->
     <div class="control-bar">
         <div class="control-group">
-            <select id="chat-model-select" class="control-select"></select>
-            <select id="compressor-model-select" class="control-select"></select>
-            <select id="backend-select" class="control-select"></select>
+            <select id="chat-model-select" class="control-select" aria-label="Chat Model"></select>
+            <select id="compressor-model-select" class="control-select" aria-label="Context Compressor Model"></select>
+            <select id="backend-select" class="control-select" aria-label="Inference Backend"></select>
         </div>
         <div class="control-group">
             <button id="export-chat-btn" class="btn-nav bg-mauve">💾 Export</button>
@@ -53,7 +54,7 @@
         </div>
         <div class="param-group">
             <label for="param-memory-strategy">Llama.cpp Strategy:</label>
-            <select id="param-memory-strategy" class="control-select-bordered">
+            <select id="param-memory-strategy" class="control-select-bordered" aria-label="Memory Strategy">
                 <option value="offload">CPU Offload (Max Context)</option>
                 <option value="compress">Compression (Max Speed)</option>
             </select>
@@ -84,6 +85,7 @@
             </div>
         </div>
     </div>
+    </main>
 
     <!-- Custom Modals -->
     <div id="rename-modal" class="modal-overlay">

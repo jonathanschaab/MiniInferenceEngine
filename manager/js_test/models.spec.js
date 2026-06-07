@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { AxeBuilder } from '@axe-core/playwright';
 import { mockStaticAssets, mockEngineApis, setupPageErrorHandlers } from './utils.js';
 
 test.describe('Mini Inference Engine - Models Directory UI', () => {
@@ -13,6 +14,13 @@ test.describe('Mini Inference Engine - Models Directory UI', () => {
         const modelCards = page.locator('.model-dir-card');
         await expect(modelCards).toHaveCount(2);
         await expect(modelCards.first()).toContainText('Mock Chat Model');
+    });
+
+    test('Models Directory should not have any automatically detectable accessibility issues', async ({ page }) => {
+        await page.goto('/models');
+        await expect(page.locator('.model-dir-card')).toHaveCount(2);
+        const accessibilityScanResults = await new AxeBuilder({ page }).analyze();
+        expect(accessibilityScanResults.violations).toEqual([]);
     });
 
     test('Models Directory renders even if status API fails or is slow', async ({ page }) => {

@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { AxeBuilder } from '@axe-core/playwright';
 import { mockStaticAssets, mockEngineApis, setupPageErrorHandlers } from './utils.js';
 
 test.describe('Mini Inference Engine - Queue UI', () => {
@@ -58,6 +59,13 @@ test.describe('Mini Inference Engine - Queue UI', () => {
 
         await page.locator('#clear-all-btn').click();
         expect(clearAllCalled).toBe(true);
+    });
+
+    test('Queue UI should not have any automatically detectable accessibility issues', async ({ page }) => {
+        await page.goto('/queue');
+        await expect(page.locator('#queue-tbody')).toContainText('No active or queued downloads.');
+        const accessibilityScanResults = await new AxeBuilder({ page }).analyze();
+        expect(accessibilityScanResults.violations).toEqual([]);
     });
 
     test('Queue UI sanitizes malicious XSS payloads in model IDs and status', async ({ page }) => {

@@ -684,10 +684,10 @@ function renderActivePath() {
         wrapper.style.width = '100%';
         
         let siblings = [];
-        if (msg.metadata.parent_id) {
+        if (msg.metadata.parent_id && messagesMap.has(msg.metadata.parent_id)) {
             siblings = messagesMap.get(msg.metadata.parent_id).children;
         } else {
-            siblings = Array.from(messagesMap.values()).filter(m => !m.metadata.parent_id).map(m => m.metadata.id);
+            siblings = Array.from(messagesMap.values()).filter(m => !m.metadata.parent_id || !messagesMap.has(m.metadata.parent_id)).map(m => m.metadata.id);
         }
 
         const parentKey = msg.metadata.parent_id || 'root';
@@ -731,7 +731,7 @@ function renderActivePath() {
             wrapper.appendChild(branchCtrl);
         }
 
-        if (splitViewParentId === parentKey) {
+        if (splitViewParentId === parentKey && siblings.length > 1) {
             const splitContainer = document.createElement('div');
             splitContainer.className = 'split-container';
             
@@ -757,6 +757,8 @@ function renderActivePath() {
             });
             wrapper.appendChild(splitContainer);
         } else {
+            if (splitViewParentId === parentKey) splitViewParentId = null;
+            
             const div = document.createElement('div');
             div.className = `message ${msg.role === 'user' ? 'user-message' : 'ai-message'} mb-15`;
             
@@ -1303,7 +1305,10 @@ async function requestAiResponse() {
         aiMsgObj.metadata = aiMetadata;
         renderActivePath();
         updateStatus();
-        await appendMessageToDB("assistant", fullAnswer, aiMessageId, aiMetadata);
+        const dbSuccess = await appendMessageToDB("assistant", fullAnswer, aiMessageId, aiMetadata);
+        if (!dbSuccess) {
+            throw new Error("DB_SAVE_FAILED");
+        }
 
     } catch (err) {
         if (err.name === 'AbortError') {
@@ -1311,11 +1316,30 @@ async function requestAiResponse() {
             aiMsgObj.content += " [Stopped]";
             renderActivePath();
             updateStatus();
-            await appendMessageToDB("assistant", aiMsgObj.content, aiMessageId, aiMetadata);
+            const dbSuccess = await appendMessageToDB("assistant", aiMsgObj.content, aiMessageId, aiMetadata);
+            if (!dbSuccess) {
+                messagesMap.delete(aiMessageId);
+                if (parentId && messagesMap.has(parentId)) {
+                    const pNode = messagesMap.get(parentId);
+                    pNode.children = pNode.children.filter(childId => childId !== aiMessageId);
+                }
+                currentLeafId = parentId;
+                renderActivePath();
+                alert("Error: Failed to save the stopped response to the database.");
+            }
         } else {
-            if (aiMessageDiv) aiMessageDiv.textContent = "Error: Failed to connect to engine.";
-            aiMsgObj.content = "Error: Failed to connect to engine.";
+            messagesMap.delete(aiMessageId);
+            if (parentId && messagesMap.has(parentId)) {
+                const pNode = messagesMap.get(parentId);
+                pNode.children = pNode.children.filter(childId => childId !== aiMessageId);
+            }
+            currentLeafId = parentId;
             renderActivePath();
+            if (err.message === "DB_SAVE_FAILED") {
+                alert("Error: Failed to save AI response to the database.");
+            } else {
+                alert("Error: Failed to connect to engine or generate response.");
+            }
         }
     }
     

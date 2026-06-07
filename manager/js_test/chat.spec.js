@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { AxeBuilder } from '@axe-core/playwright';
 import { mockStaticAssets, mockEngineApis, setupPageErrorHandlers } from './utils.js';
 
 test.describe('Mini Inference Engine - Chat UI', () => {
@@ -16,6 +17,13 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         await expect(chatBtn).toBeVisible();
     });
     
+    test('Chat UI should not have any automatically detectable accessibility issues', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.locator('#chat-model-select option')).not.toHaveCount(0);
+        const accessibilityScanResults = await new AxeBuilder({ page }).analyze();
+        expect(accessibilityScanResults.violations).toEqual([]);
+    });
+
     test('Chat UI streams a mock generation', async ({ page }) => {
         await page.route('**/api/generate', route => {
             const streamResponse = 
@@ -107,6 +115,103 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         
         const postData = JSON.parse(request.postData());
         expect(postData.score).toBe(5);
+    });
+
+    test('Chat UI rolls back AI message score if saving to DB fails', async ({ page }) => {
+        const handleScoreDbFailSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-score-db-fail', title: 'Score DB Fail Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Prompt 1',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'Response 1',
+                            metadata: { id: 'msg-2', parent_id: 'msg-1', timestamp: 1001, model: 'mock-model-1', score: 3 }
+                        }]
+                    }
+                });
+            } else { route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions/session-score-db-fail*', handleScoreDbFailSessionRoute);
+        const handleScoreDbFailSessionsRoute = route => { route.fulfill({ status: 200, json: [{ id: 'session-score-db-fail', title: 'Score DB Fail Chat', updated_at: 1678886400, email: 'mock@example.com' }] }); };
+        await page.route('**/api/chat/sessions', handleScoreDbFailSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handleScoreDbFailSessionsRoute);
+
+        await page.route('**/api/chat/sessions/session-score-db-fail/messages', async route => {
+            if (route.request().method() === 'POST') {
+                await route.fulfill({ status: 500, body: 'Internal Server Error' });
+            } else { route.fallback(); }
+        });
+
+        let alertText = null;
+        page.on('dialog', dialog => { if (dialog.type() === 'alert') { alertText = dialog.message(); dialog.accept(); } });
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Score DB Fail Chat' }).click();
+
+        const aiMeta = page.locator('.msg-metadata').last();
+        const scoreSelect = aiMeta.locator('select');
+        await expect(scoreSelect).toHaveValue('3');
+
+        await scoreSelect.selectOption('5');
+
+        await expect.poll(() => alertText).toContain('Failed to save score. Please check your connection.');
+        
+        // Assert the DOM select element rolled back to the previous score
+        await expect(scoreSelect).toHaveValue('3');
+    });
+
+    test('Chat UI safely handles corrupted trees with orphaned nodes from the backend', async ({ page }) => {
+        const handleCorruptTreeSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-corrupt-tree', title: 'Corrupt Tree Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Valid Root Prompt',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'Valid Response',
+                            metadata: { id: 'msg-2', parent_id: 'msg-1', timestamp: 1001, model: 'mock-model-1' }
+                        }, {
+                            role: 'user', content: 'Orphaned Prompt',
+                            metadata: { id: 'msg-4', parent_id: 'msg-missing', timestamp: 1002 } // Missing parent
+                        }, {
+                            role: 'assistant', content: 'Orphaned Response',
+                            metadata: { id: 'msg-5', parent_id: 'msg-4', timestamp: 1003, model: 'mock-model-1' }
+                        }]
+                    }
+                });
+            } else { route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions/session-corrupt-tree*', handleCorruptTreeSessionRoute);
+        const handleCorruptSessionsRoute = route => { route.fulfill({ status: 200, json: [{ id: 'session-corrupt-tree', title: 'Corrupt Tree Chat', updated_at: 1678886400, email: 'mock@example.com' }] }); };
+        await page.route('**/api/chat/sessions', handleCorruptSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handleCorruptSessionsRoute);
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Corrupt Tree Chat' }).click();
+
+        // The orphaned node should be treated as a second root branch.
+        // Because its timestamp (1003) is newer, getDefaultLeaf should select it as the active path.
+        await expect(page.locator('.user-message').first()).toContainText('Orphaned Prompt');
+        await expect(page.locator('.ai-message').last()).toContainText('Orphaned Response');
+        
+        // Since it's treated as a root node and there is another root node (msg-1), 
+        // the branch controls should show 2 of 2 roots.
+        const branchControls = page.locator('.branch-controls').first();
+        await expect(branchControls).toBeVisible();
+        await expect(branchControls).toContainText('2 of 2');
+        
+        // Switch to the first root branch
+        await branchControls.locator('span', { hasText: '◀' }).click();
+        await expect(page.locator('.user-message').first()).toContainText('Valid Root Prompt');
+        await expect(page.locator('.ai-message').last()).toContainText('Valid Response');
+        await expect(branchControls).toContainText('1 of 2');
     });
 
     test('Chat UI loads existing sessions and allows switching', async ({ page }) => {
@@ -603,6 +708,116 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         await expect(page.locator('.ai-message').last()).toContainText('Branch B');
     });
 
+    test('Chat UI can prune a root branch and correctly falls back to a sibling root', async ({ page }) => {
+        const handleRootPruneSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-root-prune', title: 'Root Prune Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Root Prompt A',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'user', content: 'Root Prompt B',
+                            metadata: { id: 'msg-2', parent_id: null, timestamp: 1001 }
+                        }]
+                    }
+                });
+            } else { route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions/session-root-prune*', handleRootPruneSessionRoute);
+        const handleRootPruneSessionsList = route => { route.fulfill({ status: 200, json: [{ id: 'session-root-prune', title: 'Root Prune Chat', updated_at: 1678886400, email: 'mock@example.com' }] }); };
+        await page.route('**/api/chat/sessions', handleRootPruneSessionsList);
+        await page.route('**/api/chat/sessions?*', handleRootPruneSessionsList);
+
+        let deletePayload = null;
+        await page.route('**/api/chat/sessions/session-root-prune/messages', async route => {
+            if (route.request().method() === 'DELETE') {
+                deletePayload = JSON.parse(route.request().postData());
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        page.on('dialog', dialog => dialog.accept());
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Root Prune Chat' }).click();
+
+        // Active path should default to Root Prompt B (newer timestamp)
+        await expect(page.locator('.user-message').first()).toContainText('Root Prompt B');
+        const branchControls = page.locator('.branch-controls').first();
+        await expect(branchControls).toBeVisible();
+        await expect(branchControls).toContainText('2 of 2');
+
+        // Prune Root Prompt B
+        await branchControls.locator('span', { hasText: '🗑️ Prune' }).click();
+
+        // Verify Delete API payload
+        expect(deletePayload).not.toBeNull();
+        expect(deletePayload.message_ids).toContain('msg-2');
+        expect(deletePayload.message_ids).not.toContain('msg-1');
+
+        // UI should fall back to Root Prompt A and remove branch controls since no siblings remain
+        await expect(page.locator('.user-message').first()).toContainText('Root Prompt A');
+        await expect(page.locator('.branch-controls')).not.toBeVisible();
+    });
+
+    test('Chat UI automatically collapses Split View when pruning leaves only one sibling', async ({ page }) => {
+        const handleSplitPruneSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-split-prune', title: 'Split Prune Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Root Prompt',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'Response A',
+                            metadata: { id: 'msg-2', parent_id: 'msg-1', timestamp: 1001, model: 'mock-model-1' }
+                        }, {
+                            role: 'assistant', content: 'Response B',
+                            metadata: { id: 'msg-3', parent_id: 'msg-1', timestamp: 1002, model: 'mock-model-1' }
+                        }]
+                    }
+                });
+            } else { route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions/session-split-prune*', handleSplitPruneSessionRoute);
+        const handleSplitPruneSessionsList = route => { route.fulfill({ status: 200, json: [{ id: 'session-split-prune', title: 'Split Prune Chat', updated_at: 1678886400, email: 'mock@example.com' }] }); };
+        await page.route('**/api/chat/sessions', handleSplitPruneSessionsList);
+        await page.route('**/api/chat/sessions?*', handleSplitPruneSessionsList);
+
+        await page.route('**/api/chat/sessions/session-split-prune/messages', async route => {
+            if (route.request().method() === 'DELETE') { await route.fulfill({ status: 200 }); } else { route.fallback(); }
+        });
+
+        page.on('dialog', dialog => dialog.accept());
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Split Prune Chat' }).click();
+
+        // Active path should default to Response B (newer timestamp)
+        await expect(page.locator('.ai-message').last()).toContainText('Response B');
+        const branchControls = page.locator('.branch-controls').last();
+        await expect(branchControls).toBeVisible();
+
+        // Open Split View
+        await branchControls.locator('span', { hasText: '◫ Split View' }).click();
+        const splitContainer = page.locator('.split-container');
+        await expect(splitContainer).toBeVisible();
+        await expect(splitContainer.locator('.split-item')).toHaveCount(2);
+
+        // Prune Response B
+        await branchControls.locator('span', { hasText: '🗑️ Prune' }).click();
+
+        // UI should fall back to Response A and Split View should be removed
+        await expect(page.locator('.ai-message').last()).toContainText('Response A');
+        await expect(page.locator('.split-container')).toHaveCount(0); 
+        await expect(page.locator('.branch-controls')).toHaveCount(0); 
+    });
+
     test('Chat UI resists UI state corruption when branch pruning fails on the backend', async ({ page }) => {
         await page.route('**/api/chat/sessions/session-prune-fail*', async route => {
             if (route.request().method() === 'GET') {
@@ -734,6 +949,173 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         await expect(page.locator('.user-message').last()).toContainText('Prompt 1');
         await expect(input).toHaveValue('This message will fail to save');
         await expect(page.locator('#send-btn')).toBeEnabled();
+    });
+
+    test('Chat UI rolls back optimistic AI message node if generation fails', async ({ page }) => {
+        const handleGenFailSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-gen-fail', title: 'Gen Fail Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Prompt 1',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }]
+                    }
+                });
+            } else { route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions/session-gen-fail*', handleGenFailSessionRoute);
+        const handleGenFailSessionsRoute = route => { route.fulfill({ status: 200, json: [{ id: 'session-gen-fail', title: 'Gen Fail Chat', updated_at: 1678886400, email: 'mock@example.com' }] }); };
+        await page.route('**/api/chat/sessions', handleGenFailSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handleGenFailSessionsRoute);
+
+        await page.route('**/api/chat/sessions/session-gen-fail/messages', async route => {
+            if (route.request().method() === 'POST') {
+                await route.fulfill({ status: 200 }); // User message saves successfully
+            } else { route.fallback(); }
+        });
+
+        let resolveGenerate;
+        const generatePromise = new Promise(res => resolveGenerate = res);
+        await page.route('**/api/generate', async route => {
+            await generatePromise;
+            await route.fulfill({ status: 500, body: 'Internal Server Error' });
+        });
+
+        let alertText = null;
+        page.on('dialog', dialog => { if (dialog.type() === 'alert') { alertText = dialog.message(); dialog.accept(); } });
+
+        await page.goto('/');
+        await expect(page.locator('#chat-model-select option')).not.toHaveCount(0);
+        await page.locator('.session-item', { hasText: 'Gen Fail Chat' }).click();
+        await expect(page.locator('.user-message').last()).toContainText('Prompt 1');
+
+        const input = page.locator('#prompt-input');
+        await input.fill('Trigger generation failure');
+        await page.locator('#send-btn').click();
+
+        await expect(page.locator('.user-message').last()).toContainText('Trigger generation failure');
+        
+        resolveGenerate();
+        await expect.poll(() => alertText).toContain('Failed to connect to engine or generate response');
+
+        await expect(page.locator('.ai-message')).toHaveCount(0); // Ensure the AI node was purged
+        await expect(page.locator('.user-message')).toHaveCount(2); // 'Prompt 1' + new prompt
+        await expect(page.locator('#send-btn')).toBeEnabled();
+    });
+
+    test('Chat UI rolls back AI message if saving to DB fails after generation', async ({ page }) => {
+        const handleDbFailSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-ai-db-fail', title: 'AI DB Fail Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Prompt 1',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }]
+                    }
+                });
+            } else { route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions/session-ai-db-fail*', handleDbFailSessionRoute);
+        const handleDbFailSessionsRoute = route => { route.fulfill({ status: 200, json: [{ id: 'session-ai-db-fail', title: 'AI DB Fail Chat', updated_at: 1678886400, email: 'mock@example.com' }] }); };
+        await page.route('**/api/chat/sessions', handleDbFailSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handleDbFailSessionsRoute);
+
+        await page.route('**/api/generate', route => {
+            const streamResponse = '{"token":"Successfully generated but database save will fail"}\n';
+            route.fulfill({ status: 200, body: streamResponse, contentType: 'text/plain' });
+        });
+
+        let postCount = 0;
+        await page.route('**/api/chat/sessions/session-ai-db-fail/messages', async route => {
+            if (route.request().method() === 'POST') {
+                postCount++;
+                if (postCount === 1) {
+                    await route.fulfill({ status: 200 }); // User message saves successfully
+                } else {
+                    await route.fulfill({ status: 500, body: 'Internal Server Error' }); // AI message DB save fails
+                }
+            } else { route.fallback(); }
+        });
+
+        let alertText = null;
+        page.on('dialog', dialog => { if (dialog.type() === 'alert') { alertText = dialog.message(); dialog.accept(); } });
+
+        await page.goto('/');
+        await expect(page.locator('#chat-model-select option')).not.toHaveCount(0);
+        await page.locator('.session-item', { hasText: 'AI DB Fail Chat' }).click();
+
+        await page.locator('#prompt-input').fill('Trigger AI DB fail');
+        await page.locator('#send-btn').click();
+
+        await expect.poll(() => alertText).toContain('Failed to save AI response to the database');
+        
+        await expect(page.locator('.ai-message')).toHaveCount(0); // Ensure the AI node was purged
+        await expect(page.locator('.user-message')).toHaveCount(2); // 'Prompt 1' + new prompt
+        await expect(page.locator('#send-btn')).toBeEnabled();
+    });
+
+    test('Chat UI rolls back AI message if saving to DB fails after Stop is clicked', async ({ page }) => {
+        const handleAbortDbFailSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-abort-db-fail', title: 'Abort DB Fail Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Prompt 1',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }]
+                    }
+                });
+            } else { route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions/session-abort-db-fail*', handleAbortDbFailSessionRoute);
+        const handleAbortDbFailSessionsRoute = route => { route.fulfill({ status: 200, json: [{ id: 'session-abort-db-fail', title: 'Abort DB Fail Chat', updated_at: 1678886400, email: 'mock@example.com' }] }); };
+        await page.route('**/api/chat/sessions', handleAbortDbFailSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handleAbortDbFailSessionsRoute);
+
+        let continueStream;
+        const streamPromise = new Promise(res => continueStream = res);
+        await page.route('**/api/generate', async route => {
+            await streamPromise;
+            route.fulfill({ status: 200, body: '{"token":"Partial"}\n', contentType: 'text/plain' });
+        });
+
+        let postCount = 0;
+        await page.route('**/api/chat/sessions/session-abort-db-fail/messages', async route => {
+            if (route.request().method() === 'POST') {
+                postCount++;
+                if (postCount === 1) {
+                    await route.fulfill({ status: 200 }); // User message
+                } else {
+                    await route.fulfill({ status: 500, body: 'Internal Server Error' }); // AI message DB save fails
+                }
+            } else { route.fallback(); }
+        });
+
+        let alertText = null;
+        page.on('dialog', dialog => { if (dialog.type() === 'alert') { alertText = dialog.message(); dialog.accept(); } });
+
+        await page.goto('/');
+        await expect(page.locator('#chat-model-select option')).not.toHaveCount(0);
+        await page.locator('.session-item', { hasText: 'Abort DB Fail Chat' }).click();
+
+        await page.locator('#prompt-input').fill('Trigger abort DB fail');
+        await page.locator('#send-btn').click();
+
+        await expect(page.locator('#stop-btn')).toBeVisible();
+        await page.locator('#stop-btn').click();
+        continueStream(); // Unblock the route so the fetch aborts naturally
+
+        await expect.poll(() => alertText).toContain('Failed to save the stopped response to the database');
+        await expect(page.locator('.ai-message')).toHaveCount(0);
+        await expect(page.locator('.user-message')).toHaveCount(2);
     });
 
     test('Chat UI can export chat history', async ({ page }) => {

@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { AxeBuilder } from '@axe-core/playwright';
 import { mockStaticAssets, mockEngineApis, setupPageErrorHandlers } from './utils.js';
 
 test.describe('Mini Inference Engine - Memory UI', () => {
@@ -24,5 +25,12 @@ test.describe('Mini Inference Engine - Memory UI', () => {
         await expect(ramTab).toHaveClass(/active/);
         await expect(ramView).toHaveClass(/active/);
         await expect(vramView).not.toHaveClass(/active/);
+    });
+
+    test('Memory UI should not have any automatically detectable accessibility issues', async ({ page }) => {
+        await page.goto('/memory');
+        await expect(page.locator('#txt-weights')).toContainText('Weights');
+        const accessibilityScanResults = await new AxeBuilder({ page }).analyze();
+        expect(accessibilityScanResults.violations).toEqual([]);
     });
 });

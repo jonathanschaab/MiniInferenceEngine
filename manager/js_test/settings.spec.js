@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { AxeBuilder } from '@axe-core/playwright';
 import { mockStaticAssets, mockEngineApis, setupPageErrorHandlers } from './utils.js';
 
 test.describe('Mini Inference Engine - Settings UI', () => {
@@ -19,6 +20,13 @@ test.describe('Mini Inference Engine - Settings UI', () => {
 
         await page.locator('#new-key-modal .btn-cancel').click();
         await expect(page.locator('#new-key-modal')).not.toBeVisible();
+    });
+
+    test('Settings UI should not have any automatically detectable accessibility issues', async ({ page }) => {
+        await page.goto('/settings');
+        await expect(page.locator('#keys-tbody')).toContainText('Test Key');
+        const accessibilityScanResults = await new AxeBuilder({ page }).analyze();
+        expect(accessibilityScanResults.violations).toEqual([]);
     });
 
     test('Settings UI resists XSS payloads in API Key names and descriptions', async ({ page }) => {

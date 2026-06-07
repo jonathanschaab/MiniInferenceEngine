@@ -11,10 +11,11 @@
         <h1>System Console</h1>
     </header>
 
+    <main>
     <!-- Control Bar -->
     <div class="control-bar">
         <div class="control-group">
-            <select id="logLevel" class="control-select-bordered">
+            <select id="logLevel" class="control-select-bordered" aria-label="Log Level">
                     <option value="trace">TRACE</option>
                     <option value="debug">DEBUG</option>
                     <option value="info">INFO</option>
@@ -31,6 +32,7 @@
     <div class="console-wrapper">
         <div id="logContainer" class="console-output"></div>
     </div>
+    </main>
 
     <script src="/js/common.js"></script>
     <script src="/js/console.js"></script>
