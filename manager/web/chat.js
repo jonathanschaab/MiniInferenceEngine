@@ -552,8 +552,8 @@ function getDefaultLeaf(nodeIds) {
                 
                 if (childEval.maxScore > maxScore) {
                     maxScore = childEval.maxScore;
-                    maxTime = childEval.maxTime;
-                } else if (childEval.maxScore === maxScore && childEval.maxTime > maxTime) {
+                }
+                if (childEval.maxTime > maxTime) {
                     maxTime = childEval.maxTime;
                 }
 
@@ -624,37 +624,38 @@ async function pruneBranch(msgId) {
     }
     traverse(msgId);
 
-    // Remove from local map
-    const targetNode = messagesMap.get(msgId);
-    const parentId = targetNode ? targetNode.metadata.parent_id : null;
-    
-    if (parentId && messagesMap.has(parentId)) {
-        const pNode = messagesMap.get(parentId);
-        pNode.children = pNode.children.filter(id => id !== msgId);
-    }
-
-    idsToDelete.forEach(id => messagesMap.delete(id));
-
-    // Select a new leaf
-    let rootNodes = [];
-    Array.from(messagesMap.values()).forEach(msg => {
-        if (!msg.metadata.parent_id || !messagesMap.has(msg.metadata.parent_id)) {
-            rootNodes.push(msg.metadata.id);
-        }
-    });
-
-    currentLeafId = getDefaultLeaf(rootNodes);
-    renderActivePath();
-
-    // Send to backend
+    // Send to backend first to confirm deletion is allowed
     try {
         await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages`, {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message_ids: idsToDelete })
         });
+
+        // Remove from local map only on success
+        const targetNode = messagesMap.get(msgId);
+        const parentId = targetNode ? targetNode.metadata.parent_id : null;
+        
+        if (parentId && messagesMap.has(parentId)) {
+            const pNode = messagesMap.get(parentId);
+            pNode.children = pNode.children.filter(id => id !== msgId);
+        }
+
+        idsToDelete.forEach(id => messagesMap.delete(id));
+
+        // Select a new leaf
+        let rootNodes = [];
+        Array.from(messagesMap.values()).forEach(msg => {
+            if (!msg.metadata.parent_id || !messagesMap.has(msg.metadata.parent_id)) {
+                rootNodes.push(msg.metadata.id);
+            }
+        });
+
+        currentLeafId = getDefaultLeaf(rootNodes);
+        renderActivePath();
     } catch(e) {
         console.error("Failed to delete branch in DB:", e);
+        alert("Failed to delete branch. Please check your connection or try refreshing the page.");
     }
 }
 
@@ -838,8 +839,14 @@ function createScoreSelect(msg) {
         scoreSelect.value = msg.metadata.score;
     }
     scoreSelect.onchange = async () => {
+        const previousScore = msg.metadata.score;
         msg.metadata.score = parseInt(scoreSelect.value) || null;
-        await appendMessageToDB(msg.role, msg.content, msg.metadata.id, msg.metadata);
+        const success = await appendMessageToDB(msg.role, msg.content, msg.metadata.id, msg.metadata);
+        if (!success) {
+            msg.metadata.score = previousScore;
+            scoreSelect.value = previousScore || "";
+            alert("Failed to save score. Please check your connection.");
+        }
     };
     return scoreSelect;
 }
@@ -872,7 +879,13 @@ async function clearChat() {
     const confirmed = await showDeleteModal();
     if (confirmed) {
         if (currentSessionId) {
-            await fetchWithAuth(`/api/chat/sessions/${currentSessionId}`, { method: 'DELETE' });
+            try {
+                await fetchWithAuth(`/api/chat/sessions/${currentSessionId}`, { method: 'DELETE' });
+            } catch (e) {
+                console.error("Failed to clear chat in DB:", e);
+                alert("Failed to delete chat session. Please check your connection or try again.");
+                return;
+            }
         }
         startNewSession();
         loadSessions();
@@ -916,7 +929,7 @@ async function ensureSession(firstMessageText) {
 }
 
 async function appendMessageToDB(role, content, id, metadata = null) {
-    if (!currentSessionId) return;
+    if (!currentSessionId) return false;
     try {
         const payload = {
             session_id: currentSessionId,
@@ -939,7 +952,11 @@ async function appendMessageToDB(role, content, id, metadata = null) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-    } catch(e) { console.error("Failed to append message", e); }
+        return true;
+    } catch(e) { 
+        console.error("Failed to append message", e); 
+        return false;
+    }
 }
 
 async function startChatDownload(modelId, modelName) {
@@ -1059,6 +1076,8 @@ async function sendMessage() {
     const text = inputField.value.trim();
     if (!text) return;
 
+    sendBtn.disabled = true;
+
     await ensureSession(text);
 
     const newId = generateUUID();
@@ -1083,7 +1102,19 @@ async function sendMessage() {
     
     renderActivePath();
 
-    await appendMessageToDB("user", text, newId, msgObj.metadata);
+    const success = await appendMessageToDB("user", text, newId, msgObj.metadata);
+    if (!success) {
+        messagesMap.delete(newId);
+        if (parentId && messagesMap.has(parentId)) {
+            const pNode = messagesMap.get(parentId);
+            pNode.children = pNode.children.filter(childId => childId !== newId);
+        }
+        currentLeafId = parentId;
+        renderActivePath();
+        sendBtn.disabled = false;
+        alert("Failed to send message to server. Please check your connection.");
+        return;
+    }
     
     inputField.value = '';
     inputField.style.height = 'auto'; 
@@ -1104,6 +1135,7 @@ async function requestAiResponse() {
         chatSelect.options[chatSelect.selectedIndex]?.disabled || 
         backendSelect.options[backendSelect.selectedIndex]?.disabled) {
         alert("Please select a valid chat model and compressor model. Check your backend compatibility if options are disabled.");
+        resetChatUI();
         return;
     }
 
