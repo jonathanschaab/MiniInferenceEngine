@@ -1545,7 +1545,13 @@ pub(crate) async fn delete_chat_messages(
 ) -> Result<StatusCode, StatusCode> {
     verify_session_ownership(&state.db, &id, &user.email).await?;
 
-    if !payload.message_ids.is_empty() {
+    let msg_things: Vec<surrealdb::sql::Thing> = payload
+        .message_ids
+        .into_iter()
+        .map(|msg_id| surrealdb::sql::Thing::from(("chat_messages".to_string(), msg_id)))
+        .collect();
+
+    if !msg_things.is_empty() {
         #[derive(Deserialize)]
         struct MessageParentCheck {
             parent_id: Option<String>,
@@ -1554,9 +1560,9 @@ pub(crate) async fn delete_chat_messages(
         // Prevent pruning root messages to avoid breaking the session tree
         let mut response = state
             .db
-            .query("SELECT parent_id FROM chat_messages WHERE session_id = $session_id AND type::string(meta::id(id)) IN $msg_ids")
+            .query("SELECT parent_id FROM chat_messages WHERE session_id = $session_id AND id IN $msg_ids")
             .bind(("session_id", id.clone()))
-            .bind(("msg_ids", payload.message_ids.clone()))
+            .bind(("msg_ids", msg_things.clone()))
             .await
             .map_err(|e| {
                 error!("DB Query Error: {}", e);
@@ -1575,12 +1581,12 @@ pub(crate) async fn delete_chat_messages(
         }
     }
 
-    if !payload.message_ids.is_empty()
+    if !msg_things.is_empty()
         && let Err(e) = state
             .db
-            .query("DELETE chat_messages WHERE session_id = $session_id AND type::string(meta::id(id)) IN $msg_ids")
+            .query("DELETE chat_messages WHERE session_id = $session_id AND id IN $msg_ids")
             .bind(("session_id", id.clone()))
-            .bind(("msg_ids", payload.message_ids))
+            .bind(("msg_ids", msg_things))
             .await
     {
         error!("DB Delete Error (delete chat_messages): {}", e);

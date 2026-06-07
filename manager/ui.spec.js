@@ -752,6 +752,55 @@ test.describe('Mini Inference Engine - UI Functionality', () => {
         await expect(page.locator('#prompt-input')).toBeVisible();
     });
 
+    test('Chat UI correctly applies metadata to a parent message missing metadata during streaming', async ({ page }) => {
+        const handleMissingMetaSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-missing-meta', title: 'Missing Meta Chat', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'user', content: 'Original Prompt',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }, {
+                            role: 'assistant', content: 'Original Response',
+                            metadata: { id: 'msg-2', parent_id: 'msg-1', timestamp: 1001, model: 'mock-model-1' }
+                        }]
+                    }
+                });
+            } else {
+                route.fallback();
+            }
+        };
+
+        await page.route('**/api/chat/sessions/session-missing-meta*', handleMissingMetaSessionRoute);
+        const handleMissingMetaSessionsRoute = route => {
+            route.fulfill({ status: 200, json: [{ id: 'session-missing-meta', title: 'Missing Meta Chat', updated_at: 1678886400, email: 'mock@example.com' }] });
+        };
+        await page.route('**/api/chat/sessions', handleMissingMetaSessionsRoute);
+        await page.route('**/api/chat/sessions?*', handleMissingMetaSessionsRoute);
+
+        await page.route('**/api/generate', route => {
+            const streamResponse = 
+                '{"metadata":{"token_counts":{"mock-model-1":42}}}\n' +
+                '{"token":"Regenerated Response"}\n';
+            route.fulfill({ status: 200, body: streamResponse, contentType: 'text/plain' });
+        });
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Missing Meta Chat' }).click();
+        await expect(page.locator('.ai-message').last()).toContainText('Original Response');
+        
+        await page.evaluate(() => {
+            // eslint-disable-next-line no-undef
+            messagesMap.get('msg-1').metadata = undefined;
+        });
+
+        await page.locator('#regen-btn').click();
+        await expect(page.locator('.ai-message').last()).toContainText('Regenerated Response');
+        await expect(page.locator('.msg-metadata').first()).toContainText('Tokens: mock-model-1: 42');
+    });
+
     test('Chat UI correctly stitches legacy linear chat histories missing parent_ids', async ({ page }) => {
         const handleLegacySessionRoute = async route => {
             if (route.request().method() === 'GET') {

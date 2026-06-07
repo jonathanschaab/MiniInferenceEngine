@@ -594,6 +594,7 @@ function getActivePath(leafId) {
     let curr = leafId;
     while (curr && messagesMap.has(curr)) {
         const node = messagesMap.get(curr);
+        if (!node.metadata) node.metadata = { id: curr };
         path.unshift(node);
         curr = node.metadata.parent_id;
     }
@@ -1208,7 +1209,8 @@ async function requestAiResponse() {
                                         aiMetadata.parent_id = parentId;
                                     } else {
                                         const pMsg = messagesMap.get(parentId);
-                                        if (pMsg && pMsg.metadata) {
+                                        if (pMsg) {
+                                            pMsg.metadata = pMsg.metadata || {};
                                             Object.assign(pMsg.metadata, obj.metadata);
                                             pMsg.metadata.id = parentId;
                                         }
@@ -1247,7 +1249,8 @@ async function requestAiResponse() {
                                 aiMetadata.parent_id = parentId;
                             } else {
                                 const pMsg = messagesMap.get(parentId);
-                                if (pMsg && pMsg.metadata) {
+                                if (pMsg) {
+                                    pMsg.metadata = pMsg.metadata || {};
                                     Object.assign(pMsg.metadata, obj.metadata);
                                     pMsg.metadata.id = parentId;
                                 }
@@ -1306,7 +1309,7 @@ async function regenerateLast() {
     if (!leafNode) return;
     
     if (leafNode.role === 'assistant') {
-        currentLeafId = leafNode.metadata.parent_id;
+        currentLeafId = leafNode.metadata ? leafNode.metadata.parent_id : null;
         renderActivePath(); 
         await requestAiResponse();
     } else {
