@@ -320,6 +320,7 @@ pub struct ChatSessionRecord {
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ChatMessageRecord {
+    #[serde(default)]
     pub id: String,
     pub session_id: String,
     pub parent_id: Option<String>,
@@ -642,5 +643,19 @@ mod tests {
             .join("test");
         let still_absolute = resolve_absolute_path(&already_absolute);
         assert_eq!(already_absolute, still_absolute);
+    }
+
+    #[test]
+    fn test_chat_message_record_missing_id_deserialization() {
+        let json = r#"{
+            "session_id": "test_session",
+            "parent_id": null,
+            "role": "user",
+            "content": "test content"
+        }"#;
+
+        let record: ChatMessageRecord =
+            serde_json::from_str(json).expect("Failed to deserialize ChatMessageRecord");
+        assert_eq!(record.id, "");
     }
 }

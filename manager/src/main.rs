@@ -2340,7 +2340,7 @@ mod tests {
             .await
             .expect("Failed to define chat_sessions index");
         db.query(
-            "DEFINE INDEX chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id;",
+            "DEFINE INDEX chat_messages_session_timestamp_idx ON TABLE chat_messages COLUMNS session_id, timestamp;",
         )
         .await
         .expect("Failed to define chat_messages index");
@@ -2592,6 +2592,76 @@ mod tests {
             other_user_session_update_res.expect_err("Expected FORBIDDEN error"),
             StatusCode::FORBIDDEN
         ); // Expect a FORBIDDEN status
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
+    async fn test_append_chat_message_generates_id() {
+        let state = create_test_app_state().await;
+        let user_email = "test@example.com";
+        let user = mock_user(user_email, false);
+
+        let new_session_payload = manager::ChatSessionRecord {
+            id: "".to_string(),
+            email: user_email.to_string(),
+            updated_at: 0,
+            title: "Auto-ID Test Session".to_string(),
+        };
+        let response = save_chat_session(
+            user.clone(),
+            State(state.clone()),
+            Json(new_session_payload),
+        )
+        .await;
+        let session_id = response.expect("Failed to save session").0.id;
+
+        let msg = manager::ChatMessageRecord {
+            id: "".to_string(),
+            session_id: session_id.clone(),
+            parent_id: None,
+            role: "user".to_string(),
+            content: "Generate my ID please".to_string(),
+            timestamp: None,
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
+        };
+        let res = append_chat_message(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(msg),
+        )
+        .await;
+        assert_eq!(res, Ok(StatusCode::OK));
+
+        let session_detail = get_chat_session(
+            user.clone(),
+            Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("Failed to fetch session")
+        .0;
+
+        assert_eq!(session_detail.messages.len(), 1);
+        let generated_id = session_detail.messages[0]
+            .metadata
+            .as_ref()
+            .expect("Message should have metadata")
+            .id
+            .clone();
+        assert!(!generated_id.is_empty());
+        assert!(
+            uuid::Uuid::parse_str(&generated_id).is_ok(),
+            "Generated ID should be a valid UUID"
+        );
     }
 
     #[tokio::test]

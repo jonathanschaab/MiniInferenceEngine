@@ -1384,7 +1384,7 @@ function exportChat(format) {
     } else if (format === 'md') {
         content = `# ${currentSessionTitle || "Chat Export"}\n\n`;
         chatHistory.forEach(msg => {
-            const role = msg.role === 'user' ? 'User' : 'Assistant';
+            const role = msg.role === 'user' ? 'User' : (msg.role === 'system' ? 'System' : 'Assistant');
             content += `### ${role}\n${msg.content}\n\n`;
         });
         mimeType = 'text/markdown';
