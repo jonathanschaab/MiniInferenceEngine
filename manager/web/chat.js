@@ -626,11 +626,12 @@ async function pruneBranch(msgId) {
 
     // Send to backend first to confirm deletion is allowed
     try {
-        await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages`, {
+        const res = await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages`, {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message_ids: idsToDelete })
         });
+        if (!res.ok) throw new Error("Failed to delete branch in DB");
 
         // Remove from local map only on success
         const targetNode = messagesMap.get(msgId);
@@ -882,7 +883,8 @@ async function clearChat() {
     if (confirmed) {
         if (currentSessionId) {
             try {
-                await fetchWithAuth(`/api/chat/sessions/${currentSessionId}`, { method: 'DELETE' });
+                const res = await fetchWithAuth(`/api/chat/sessions/${currentSessionId}`, { method: 'DELETE' });
+                if (!res.ok) throw new Error("Failed to clear chat in DB");
             } catch (e) {
                 console.error("Failed to clear chat in DB:", e);
                 alert("Failed to delete chat session. Please check your connection or try again.");
@@ -949,12 +951,12 @@ async function appendMessageToDB(role, content, id, metadata = null) {
             payload.score = metadata.score;
             payload.parameters = metadata.parameters;
         }
-        await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages`, {
+        const res = await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        return true;
+        return res.ok;
     } catch(e) { 
         console.error("Failed to append message", e); 
         return false;
@@ -1225,6 +1227,33 @@ async function requestAiResponse() {
         let fullAnswer = "";
         let buffer = "";
         
+        const processStreamObj = (obj) => {
+            if (obj.token !== undefined) {
+                fullAnswer += obj.token;
+                if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
+                aiMsgObj.content = fullAnswer;
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            } else if (obj.metadata) {
+                if (obj.metadata.generation_time_ms !== undefined || obj.metadata.model) {
+                    Object.assign(aiMetadata, obj.metadata);
+                    aiMetadata.id = aiMessageId;
+                    aiMetadata.parent_id = parentId;
+                } else {
+                    const pMsg = messagesMap.get(parentId);
+                    if (pMsg) {
+                        pMsg.metadata = pMsg.metadata || {};
+                        Object.assign(pMsg.metadata, obj.metadata);
+                        pMsg.metadata.id = parentId;
+                    }
+                }
+            } else if (obj.error !== undefined) {
+                fullAnswer += "\nError: " + obj.error;
+                if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
+                aiMsgObj.content = fullAnswer;
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+        };
+
         while (true) {
             const { done, value } = await reader.read();
             if (done) {
@@ -1233,25 +1262,7 @@ async function requestAiResponse() {
                     for (const line of lines) {
                         if (line.trim()) {
                             try {
-                                const obj = JSON.parse(line.trim());
-                                if (obj.token !== undefined) {
-                                    fullAnswer += obj.token;
-                                } else if (obj.metadata !== undefined) {
-                                    if (obj.metadata.generation_time_ms !== undefined || obj.metadata.model) {
-                                        Object.assign(aiMetadata, obj.metadata);
-                                        aiMetadata.id = aiMessageId;
-                                        aiMetadata.parent_id = parentId;
-                                    } else {
-                                        const pMsg = messagesMap.get(parentId);
-                                        if (pMsg) {
-                                            pMsg.metadata = pMsg.metadata || {};
-                                            Object.assign(pMsg.metadata, obj.metadata);
-                                            pMsg.metadata.id = parentId;
-                                        }
-                                    }
-                                } else if (obj.error !== undefined) {
-                                    fullAnswer += "\nError: " + obj.error;
-                                }
+                                processStreamObj(JSON.parse(line.trim()));
                             } catch (e) {
                                 console.error("Failed to parse stream line:", line, e);
                             }
@@ -1270,31 +1281,7 @@ async function requestAiResponse() {
                 buffer = buffer.slice(newlineIdx + 1);
                 if (line) {
                     try {
-                        const obj = JSON.parse(line);
-                        if (obj.token !== undefined) {
-                            fullAnswer += obj.token;
-                            if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
-                            aiMsgObj.content = fullAnswer;
-                            chatContainer.scrollTop = chatContainer.scrollHeight;
-                        } else if (obj.metadata !== undefined) {
-                            if (obj.metadata.generation_time_ms !== undefined || obj.metadata.model) {
-                                Object.assign(aiMetadata, obj.metadata);
-                                aiMetadata.id = aiMessageId;
-                                aiMetadata.parent_id = parentId;
-                            } else {
-                                const pMsg = messagesMap.get(parentId);
-                                if (pMsg) {
-                                    pMsg.metadata = pMsg.metadata || {};
-                                    Object.assign(pMsg.metadata, obj.metadata);
-                                    pMsg.metadata.id = parentId;
-                                }
-                            }
-                        } else if (obj.error !== undefined) {
-                            fullAnswer += "\nError: " + obj.error;
-                            if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
-                            aiMsgObj.content = fullAnswer;
-                            chatContainer.scrollTop = chatContainer.scrollHeight;
-                        }
+                        processStreamObj(JSON.parse(line));
                     } catch (e) {
                         console.error("Failed to parse stream line:", line, e);
                     }

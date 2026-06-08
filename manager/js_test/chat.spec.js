@@ -50,6 +50,20 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         await expect(page.locator('#regen-btn')).toBeVisible();
     });
 
+    test('Chat UI safely ignores null metadata in streaming response', async ({ page }) => {
+        await page.route('**/api/generate', route => {
+            const streamResponse = 
+                '{"metadata":null}\n' +
+                '{"token":"Response with null metadata"}\n';
+            route.fulfill({ status: 200, body: streamResponse, contentType: 'text/plain' });
+        });
+
+        await page.goto('/');
+        await page.locator('#prompt-input').fill('Test null metadata');
+        await page.locator('#send-btn').click();
+        await expect(page.locator('.ai-message').last()).toContainText('Response with null metadata');
+    });
+
     test('Chat UI generates fallback UUID in non-secure contexts', async ({ page }) => {
         await page.addInitScript(() => {
             if (window.crypto) window.crypto.randomUUID = undefined;
