@@ -64,6 +64,20 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         await expect(page.locator('.ai-message').last()).toContainText('Response with null metadata');
     });
 
+    test('Chat UI handles error messages emitted mid-stream', async ({ page }) => {
+        await page.route('**/api/generate', route => {
+            const streamResponse = 
+                '{"token":"Partial response"}\n' +
+                '{"error":"Context length exceeded"}\n';
+            route.fulfill({ status: 200, body: streamResponse, contentType: 'text/plain' });
+        });
+
+        await page.goto('/');
+        await page.locator('#prompt-input').fill('Test stream error');
+        await page.locator('#send-btn').click();
+        await expect(page.locator('.ai-message').last()).toContainText('Partial response\nError: Context length exceeded');
+    });
+
     test('Chat UI generates fallback UUID in non-secure contexts', async ({ page }) => {
         await page.addInitScript(() => {
             if (window.crypto) window.crypto.randomUUID = undefined;
@@ -1063,6 +1077,8 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         await page.goto('/');
         await expect(page.locator('#chat-model-select option')).not.toHaveCount(0);
         await page.locator('.session-item', { hasText: 'AI DB Fail Chat' }).click();
+        
+        await expect(page.locator('.user-message').last()).toContainText('Prompt 1');
 
         await page.locator('#prompt-input').fill('Trigger AI DB fail');
         await page.locator('#send-btn').click();
@@ -1119,6 +1135,8 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         await page.goto('/');
         await expect(page.locator('#chat-model-select option')).not.toHaveCount(0);
         await page.locator('.session-item', { hasText: 'Abort DB Fail Chat' }).click();
+        
+        await expect(page.locator('.user-message').last()).toContainText('Prompt 1');
 
         await page.locator('#prompt-input').fill('Trigger abort DB fail');
         await page.locator('#send-btn').click();
@@ -1238,6 +1256,34 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         await expect(sessionItem).toContainText('Renamed Chat Session');
     });
 
+    test('Chat UI alerts user if renaming a session fails', async ({ page }) => {
+        const handleSessionRenameFailRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, json: [{ id: 'session-rename-fail', title: 'Original Title', updated_at: 1678886400, email: 'mock@example.com' }] });
+            } else if (route.request().method() === 'POST') {
+                await route.fulfill({ status: 500, body: 'Internal Server Error' });
+            } else { await route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions', handleSessionRenameFailRoute);
+        await page.route('**/api/chat/sessions?*', handleSessionRenameFailRoute);
+
+        let alertText = null;
+        page.on('dialog', dialog => { if (dialog.type() === 'alert') { alertText = dialog.message(); dialog.accept(); } });
+
+        await page.goto('/');
+        const sessionItem = page.locator('.session-item').first();
+        await expect(sessionItem).toContainText('Original Title');
+        
+        await sessionItem.hover();
+        await sessionItem.locator('button[title="Rename Chat"]').click();
+        
+        await page.locator('#rename-input').fill('New Title');
+        await page.locator('#rename-confirm-btn').click();
+        
+        await expect.poll(() => alertText).toContain('Failed to rename chat session');
+        await expect(sessionItem).toContainText('Original Title');
+    });
+
     test('Chat UI can delete a session via custom modal', async ({ page }) => {
         let fetchCount = 0;
         let deleteCalled = false;
@@ -1340,5 +1386,223 @@ test.describe('Mini Inference Engine - Chat UI', () => {
         delete downloadState['mock-model-1'];
         modelState[0].is_downloaded = true;
         await expect(page.locator('.ai-message').last()).toContainText('Generation after download.');
+    });
+
+    test('Chat UI aborts active generation when switching sessions', async ({ page }) => {
+        const handleSwitchSessionRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({
+                    status: 200,
+                    json: {
+                        id: 'session-switch-target', title: 'Target Session', updated_at: 1678886400, email: 'mock@example.com',
+                        messages: [{
+                            role: 'assistant', content: 'Target loaded',
+                            metadata: { id: 'msg-1', parent_id: null, timestamp: 1000 }
+                        }]
+                    }
+                });
+            } else { route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions/session-switch-target*', handleSwitchSessionRoute);
+        
+        const handleSessionsList = route => { 
+            route.fulfill({ 
+                status: 200, 
+                json: [
+                    { id: 'session-switch-active', title: 'Active Session', updated_at: 1678886400, email: 'mock@example.com' },
+                    { id: 'session-switch-target', title: 'Target Session', updated_at: 1678886500, email: 'mock@example.com' }
+                ] 
+            }); 
+        };
+        await page.route('**/api/chat/sessions', handleSessionsList);
+        await page.route('**/api/chat/sessions?*', handleSessionsList);
+
+        let continueGenerate;
+        const generatePromise = new Promise(res => continueGenerate = res);
+        
+        await page.route('**/api/generate', async route => {
+            await generatePromise;
+            route.fulfill({ status: 200, body: '{"token":"Late"}\n', contentType: 'text/plain' }).catch(() => {});
+        });
+
+        let savedAbortedMessage = null;
+        await page.route('**/api/chat/sessions/session-switch-active/messages', async route => {
+            if (route.request().method() === 'POST') {
+                const body = JSON.parse(route.request().postData());
+                if (body.role === 'assistant') { savedAbortedMessage = body.content; }
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Active Session' }).click();
+
+        await page.locator('#prompt-input').fill('Tell me a long story');
+        await page.locator('#send-btn').click();
+        await expect(page.locator('#stop-btn')).toBeVisible();
+
+        await page.locator('.session-item', { hasText: 'Target Session' }).click();
+        await expect(page.locator('.ai-message').last()).toContainText('Target loaded');
+
+        continueGenerate();
+        await expect.poll(() => savedAbortedMessage).toContain('[Stopped]');
+    });
+
+    test('Chat UI aborts active generation when starting a new session', async ({ page }) => {
+        const handleSessionsList = route => { 
+            route.fulfill({ 
+                status: 200, 
+                json: [
+                    { id: 'session-new-chat-active', title: 'Active Session', updated_at: 1678886400, email: 'mock@example.com' }
+                ] 
+            }); 
+        };
+        await page.route('**/api/chat/sessions', handleSessionsList);
+        await page.route('**/api/chat/sessions?*', handleSessionsList);
+
+        let continueGenerate;
+        const generatePromise = new Promise(res => continueGenerate = res);
+        
+        await page.route('**/api/generate', async route => {
+            await generatePromise;
+            route.fulfill({ status: 200, body: '{"token":"Late"}\n', contentType: 'text/plain' }).catch(() => {});
+        });
+
+        let savedAbortedMessage = null;
+        await page.route('**/api/chat/sessions/session-new-chat-active/messages', async route => {
+            if (route.request().method() === 'POST') {
+                const body = JSON.parse(route.request().postData());
+                if (body.role === 'assistant') { savedAbortedMessage = body.content; }
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Active Session' }).click();
+
+        await page.locator('#prompt-input').fill('Tell me a long story');
+        await page.locator('#send-btn').click();
+        
+        // Wait for generation to start
+        await expect(page.locator('#stop-btn')).toBeVisible();
+
+        // Click new chat mid-generation
+        await page.locator('#new-chat-btn').click();
+        await expect(page.locator('.ai-message').first()).toContainText('System: New chat session started.');
+
+        continueGenerate();
+        await expect.poll(() => savedAbortedMessage).toContain('[Stopped]');
+    });
+
+    test('Chat UI aborts active generation and safely clears state when clearChat is clicked', async ({ page }) => {
+        const handleSessionsList = route => { 
+            route.fulfill({ status: 200, json: [{ id: 'session-clear-abort', title: 'Clear Abort Chat', updated_at: 1678886400, email: 'mock@example.com' }] }); 
+        };
+        await page.route('**/api/chat/sessions', handleSessionsList);
+        await page.route('**/api/chat/sessions?*', handleSessionsList);
+
+        let continueGenerate;
+        const generatePromise = new Promise(res => continueGenerate = res);
+        await page.route('**/api/generate', async route => {
+            await generatePromise;
+            route.fulfill({ status: 200, body: '{"token":"Late"}\n', contentType: 'text/plain' }).catch(() => {});
+        });
+
+        let deleteCalled = false;
+        await page.route('**/api/chat/sessions/session-clear-abort', async route => {
+            if (route.request().method() === 'DELETE') {
+                deleteCalled = true;
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        page.on('dialog', dialog => dialog.accept());
+
+        await page.goto('/');
+        await page.locator('.session-item', { hasText: 'Clear Abort Chat' }).click();
+
+        await page.locator('#prompt-input').fill('Tell me a story');
+        await page.locator('#send-btn').click();
+        await expect(page.locator('#stop-btn')).toBeVisible();
+
+        // Click Clear Chat mid-generation
+        await page.locator('#clear-chat-btn').click();
+        await page.locator('#delete-confirm-btn').click();
+        await expect(page.locator('.ai-message').first()).toContainText('System: New chat session started.');
+        
+        continueGenerate(); // Unblock the route to allow abort microtasks to settle
+        await expect.poll(() => deleteCalled).toBe(true);
+        await expect(page.locator('#stop-btn')).not.toBeVisible();
+    });
+
+    test('Chat UI aborts active generation and safely clears state when inline delete button is clicked', async ({ page }) => {
+        const handleSessionsList = route => { 
+            route.fulfill({ status: 200, json: [{ id: 'session-inline-abort', title: 'Inline Abort Chat', updated_at: 1678886400, email: 'mock@example.com' }] }); 
+        };
+        await page.route('**/api/chat/sessions', handleSessionsList);
+        await page.route('**/api/chat/sessions?*', handleSessionsList);
+
+        let continueGenerate;
+        const generatePromise = new Promise(res => continueGenerate = res);
+        await page.route('**/api/generate', async route => {
+            await generatePromise;
+            route.fulfill({ status: 200, body: '{"token":"Late"}\n', contentType: 'text/plain' }).catch(() => {});
+        });
+
+        let deleteCalled = false;
+        await page.route('**/api/chat/sessions/session-inline-abort', async route => {
+            if (route.request().method() === 'DELETE') {
+                deleteCalled = true;
+                await route.fulfill({ status: 200 });
+            } else { route.fallback(); }
+        });
+
+        page.on('dialog', dialog => dialog.accept());
+
+        await page.goto('/');
+        const sessionItem = page.locator('.session-item', { hasText: 'Inline Abort Chat' });
+        await sessionItem.click();
+
+        await page.locator('#prompt-input').fill('Tell me a story');
+        await page.locator('#send-btn').click();
+        await expect(page.locator('#stop-btn')).toBeVisible();
+
+        // Hover and click inline delete mid-generation
+        await sessionItem.hover();
+        await sessionItem.locator('button[title="Delete Chat"]').click();
+        await page.locator('#delete-confirm-btn').click();
+        
+        await expect(page.locator('.ai-message').first()).toContainText('System: New chat session started.');
+        
+        continueGenerate(); // Unblock the route to allow abort microtasks to settle
+        await expect.poll(() => deleteCalled).toBe(true);
+        await expect(page.locator('#stop-btn')).not.toBeVisible();
+    });
+
+    test('Chat UI alerts user and prevents message send if session creation fails', async ({ page }) => {
+        const handleSessionCreateFailRoute = async route => {
+            if (route.request().method() === 'GET') {
+                await route.fulfill({ status: 200, json: [] });
+            } else if (route.request().method() === 'POST') {
+                await route.fulfill({ status: 500, body: 'Internal Server Error' });
+            } else { await route.fallback(); }
+        };
+        await page.route('**/api/chat/sessions', handleSessionCreateFailRoute);
+        await page.route('**/api/chat/sessions?*', handleSessionCreateFailRoute);
+
+        let alertText = null;
+        page.on('dialog', dialog => { if (dialog.type() === 'alert') { alertText = dialog.message(); dialog.accept(); } });
+
+        await page.goto('/');
+        await expect(page.locator('#chat-model-select option')).not.toHaveCount(0);
+
+        const input = page.locator('#prompt-input');
+        await input.fill('Hello');
+        await page.locator('#send-btn').click();
+
+        await expect.poll(() => alertText).toContain('Failed to create a new chat session');
+        
+        await expect(page.locator('#send-btn')).toBeEnabled();
+        await expect(page.locator('.user-message')).toHaveCount(0);
     });
 });

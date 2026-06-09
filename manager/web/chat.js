@@ -368,8 +368,15 @@ function createSessionElement(s) {
         e.stopPropagation();
         const confirmed = await showDeleteModal();
         if (confirmed) {
-            await fetchWithAuth(`/api/chat/sessions/${s.id}`, { method: 'DELETE' });
-            if (currentSessionId === s.id) startNewSession();
+            if (currentSessionId === s.id) startNewSession(); // Aborts generation and clears UI state safely
+            try {
+                const res = await fetchWithAuth(`/api/chat/sessions/${s.id}`, { method: 'DELETE' });
+                if (!res.ok) throw new Error("Failed to delete chat in DB");
+            } catch (err) {
+                console.error("Failed to delete session in DB:", err);
+                alert("Failed to delete chat session. Please check your connection or try again.");
+                if (currentSessionId === "") loadSession(s.id);
+            }
             loadSessions();
         }
     };
@@ -383,7 +390,7 @@ function createSessionElement(s) {
 
 async function renameSession(id, newTitle) {
     try {
-        const res = await fetchWithAuth('/api/chat/sessions', {
+        await fetchWithAuth('/api/chat/sessions', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -391,22 +398,23 @@ async function renameSession(id, newTitle) {
                 title: newTitle
             })
         });
-        if (res.ok) {
-            if (id === currentSessionId) {
-                currentSessionTitle = newTitle;
-            }
-            const sessionEl = document.querySelector(`.session-item[data-id="${id}"]`);
-            if (sessionEl) {
-                const titleDiv = sessionEl.querySelector('.session-title');
-                if (titleDiv) titleDiv.textContent = newTitle;
-            }
-        } else {
-            console.error("Failed to rename session");
+        if (id === currentSessionId) {
+            currentSessionTitle = newTitle;
         }
-    } catch(e) { console.error("Error renaming session:", e); }
+        const sessionEl = document.querySelector(`.session-item[data-id="${id}"]`);
+        if (sessionEl) {
+            const titleDiv = sessionEl.querySelector('.session-title');
+            if (titleDiv) titleDiv.textContent = newTitle;
+        }
+    } catch(e) {
+        console.error("Error renaming session:", e);
+        alert("Failed to rename chat session. Please check your connection or try again.");
+    }
 }
 
 async function loadSession(id, skipSessionListUpdate = false) {
+    if (currentAbortController) currentAbortController.abort();
+    resetChatUI();
     chatScrollObserver.disconnect();
     chatHistory = [];
     messagesMap.clear();
@@ -415,6 +423,7 @@ async function loadSession(id, skipSessionListUpdate = false) {
     window.branchingParentId = undefined;
     hasMoreMessages = true;
     isLoadingMessages = false;
+    currentSessionId = id;
     chatContainer.innerHTML = '';
     regenBtn.style.display = 'none';
     
@@ -436,8 +445,9 @@ async function fetchMoreMessages(id, isInitialLoad = false) {
         if (!res.ok) throw new Error("Failed to fetch session messages");
         const session = await res.json();
         
+        if (currentSessionId !== id) return false; // Safely abort if the user switched contexts
+        
         if (isInitialLoad) {
-            currentSessionId = session.id;
             currentSessionTitle = session.title;
             localStorage.setItem('mini_inference_last_chat_id', currentSessionId);
         }
@@ -807,17 +817,28 @@ function renderMetadataDiv(msg) {
     let tokenCountStr = Object.entries(msg.metadata.token_counts || {}).map(([m, c]) => `${m}: ${c}`).join(', ');
     
     if (msg.role === 'user') {
-        metaDiv.innerHTML = `<strong>Tokens:</strong> ${tokenCountStr}`;
+        const strongTokens = document.createElement('strong');
+        strongTokens.textContent = 'Tokens:';
+        metaDiv.appendChild(strongTokens);
+        metaDiv.appendChild(document.createTextNode(` ${tokenCountStr}`));
         const scoreSelect = createScoreSelect(msg);
         metaDiv.appendChild(scoreSelect);
     } else {
         let timeStr = msg.metadata.generation_time_ms ? (msg.metadata.generation_time_ms / 1000).toFixed(2) + 's' : 'N/A';
         let modelStr = msg.metadata.model || 'Unknown';
-        metaDiv.innerHTML = `
-            <strong>Model:</strong> ${modelStr} | 
-            <strong>Time:</strong> ${timeStr} | 
-            <strong>Tokens:</strong> ${tokenCountStr}
-        `;
+        
+        const strongModel = document.createElement('strong');
+        strongModel.textContent = 'Model:';
+        metaDiv.appendChild(strongModel);
+        metaDiv.appendChild(document.createTextNode(` ${modelStr} | `));
+        const strongTime = document.createElement('strong');
+        strongTime.textContent = 'Time:';
+        metaDiv.appendChild(strongTime);
+        metaDiv.appendChild(document.createTextNode(` ${timeStr} | `));
+        const strongTokens = document.createElement('strong');
+        strongTokens.textContent = 'Tokens:';
+        metaDiv.appendChild(strongTokens);
+        metaDiv.appendChild(document.createTextNode(` ${tokenCountStr}`));
         
         const scoreSelect = createScoreSelect(msg);
         metaDiv.appendChild(scoreSelect);
@@ -844,7 +865,7 @@ function createScoreSelect(msg) {
     scoreSelect.onchange = async () => {
         const previousScore = msg.metadata.score;
         msg.metadata.score = parseInt(scoreSelect.value) || null;
-        const success = await appendMessageToDB(msg.role, msg.content, msg.metadata.id, msg.metadata);
+        const success = await appendMessageToDB(currentSessionId, msg.role, msg.content, msg.metadata.id, msg.metadata);
         if (!success) {
             msg.metadata.score = previousScore;
             scoreSelect.value = previousScore || "";
@@ -855,6 +876,8 @@ function createScoreSelect(msg) {
 }
 
 function startNewSession() {
+    if (currentAbortController) currentAbortController.abort();
+    resetChatUI();
     currentSessionId = "";
     currentSessionTitle = "";
     localStorage.removeItem('mini_inference_last_chat_id');
@@ -881,17 +904,21 @@ async function clearChat() {
     
     const confirmed = await showDeleteModal();
     if (confirmed) {
-        if (currentSessionId) {
+        const sessionIdToDelete = currentSessionId;
+        startNewSession(); // Aborts generation and clears UI state safely
+
+        if (sessionIdToDelete) {
             try {
-                const res = await fetchWithAuth(`/api/chat/sessions/${currentSessionId}`, { method: 'DELETE' });
+                const res = await fetchWithAuth(`/api/chat/sessions/${sessionIdToDelete}`, { method: 'DELETE' });
                 if (!res.ok) throw new Error("Failed to clear chat in DB");
             } catch (e) {
                 console.error("Failed to clear chat in DB:", e);
                 alert("Failed to delete chat session. Please check your connection or try again.");
-                return;
+                if (currentSessionId === "") {
+                    loadSession(sessionIdToDelete);
+                }
             }
         }
-        startNewSession();
         loadSessions();
     }
 }
@@ -914,7 +941,7 @@ function appendMessage(text, isUser, index = null) {
 }
 
 async function ensureSession(firstMessageText) {
-    if (currentSessionId) return;
+    if (currentSessionId) return true;
     currentSessionTitle = firstMessageText ? firstMessageText.substring(0, 30) : "New Chat";
     try {
         const res = await fetchWithAuth('/api/chat/sessions', {
@@ -929,14 +956,19 @@ async function ensureSession(firstMessageText) {
         localStorage.setItem('mini_inference_last_chat_id', currentSessionId);
         const newSessionEl = createSessionElement(saved);
         document.getElementById('session-list').prepend(newSessionEl);
-    } catch(e) { console.error("Failed to create session", e); }
+        return true;
+    } catch(e) {
+        console.error("Failed to create session", e);
+        alert("Failed to create a new chat session. Please check your connection.");
+        return false;
+    }
 }
 
-async function appendMessageToDB(role, content, id, metadata = null) {
-    if (!currentSessionId) return false;
+async function appendMessageToDB(sessionId, role, content, id, metadata = null) {
+    if (!sessionId) return false;
     try {
         const payload = {
-            session_id: currentSessionId,
+            session_id: sessionId,
             id: id,
             parent_id: metadata ? metadata.parent_id : null,
             role: role,
@@ -951,7 +983,7 @@ async function appendMessageToDB(role, content, id, metadata = null) {
             payload.score = metadata.score;
             payload.parameters = metadata.parameters;
         }
-        const res = await fetchWithAuth(`/api/chat/sessions/${currentSessionId}/messages`, {
+        const res = await fetchWithAuth(`/api/chat/sessions/${sessionId}/messages`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
@@ -1082,7 +1114,11 @@ async function sendMessage() {
 
     sendBtn.disabled = true;
 
-    await ensureSession(text);
+    const sessionCreated = await ensureSession(text);
+    if (!sessionCreated) {
+        sendBtn.disabled = false;
+        return;
+    }
 
     const newId = generateUUID();
     const parentId = window.branchingParentId !== undefined ? window.branchingParentId : currentLeafId;
@@ -1106,7 +1142,7 @@ async function sendMessage() {
     
     renderActivePath();
 
-    const success = await appendMessageToDB("user", text, newId, msgObj.metadata);
+    const success = await appendMessageToDB(currentSessionId, "user", text, newId, msgObj.metadata);
     if (!success) {
         messagesMap.delete(newId);
         if (parentId && messagesMap.has(parentId)) {
@@ -1230,27 +1266,33 @@ async function requestAiResponse() {
         const processStreamObj = (obj) => {
             if (obj.token !== undefined) {
                 fullAnswer += obj.token;
-                if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
                 aiMsgObj.content = fullAnswer;
-                chatContainer.scrollTop = chatContainer.scrollHeight;
+                if (currentSessionId === generatingSessionId) {
+                    if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                }
             } else if (obj.metadata) {
                 if (obj.metadata.generation_time_ms !== undefined || obj.metadata.model) {
                     Object.assign(aiMetadata, obj.metadata);
                     aiMetadata.id = aiMessageId;
                     aiMetadata.parent_id = parentId;
                 } else {
-                    const pMsg = messagesMap.get(parentId);
-                    if (pMsg) {
-                        pMsg.metadata = pMsg.metadata || {};
-                        Object.assign(pMsg.metadata, obj.metadata);
-                        pMsg.metadata.id = parentId;
+                    if (currentSessionId === generatingSessionId) {
+                        const pMsg = messagesMap.get(parentId);
+                        if (pMsg) {
+                            pMsg.metadata = pMsg.metadata || {};
+                            Object.assign(pMsg.metadata, obj.metadata);
+                            pMsg.metadata.id = parentId;
+                        }
                     }
                 }
             } else if (obj.error !== undefined) {
                 fullAnswer += "\nError: " + obj.error;
-                if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
                 aiMsgObj.content = fullAnswer;
-                chatContainer.scrollTop = chatContainer.scrollHeight;
+                if (currentSessionId === generatingSessionId) {
+                    if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
+                }
             }
         };
 
@@ -1269,7 +1311,9 @@ async function requestAiResponse() {
                         }
                     }
                 }
-                if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
+                if (currentSessionId === generatingSessionId) {
+                    if (aiMessageDiv) aiMessageDiv.textContent = fullAnswer;
+                }
                 aiMsgObj.content = fullAnswer;
                 break;
             }
@@ -1290,21 +1334,36 @@ async function requestAiResponse() {
         }
         
         aiMsgObj.metadata = aiMetadata;
-        renderActivePath();
+        if (currentSessionId === generatingSessionId) renderActivePath();
         updateStatus();
-        const dbSuccess = await appendMessageToDB("assistant", fullAnswer, aiMessageId, aiMetadata);
+        const dbSuccess = await appendMessageToDB(generatingSessionId, "assistant", fullAnswer, aiMessageId, aiMetadata);
         if (!dbSuccess) {
             throw new Error("DB_SAVE_FAILED");
         }
 
     } catch (err) {
         if (err.name === 'AbortError') {
-            if (aiMessageDiv) aiMessageDiv.textContent += " [Stopped]";
             aiMsgObj.content += " [Stopped]";
-            renderActivePath();
+            if (currentSessionId === generatingSessionId) {
+                if (aiMessageDiv) aiMessageDiv.textContent = aiMsgObj.content;
+                renderActivePath();
+            }
             updateStatus();
-            const dbSuccess = await appendMessageToDB("assistant", aiMsgObj.content, aiMessageId, aiMetadata);
+            const dbSuccess = await appendMessageToDB(generatingSessionId, "assistant", aiMsgObj.content, aiMessageId, aiMetadata);
             if (!dbSuccess) {
+                if (currentSessionId === generatingSessionId) {
+                    messagesMap.delete(aiMessageId);
+                    if (parentId && messagesMap.has(parentId)) {
+                        const pNode = messagesMap.get(parentId);
+                        pNode.children = pNode.children.filter(childId => childId !== aiMessageId);
+                    }
+                    currentLeafId = parentId;
+                    renderActivePath();
+                    alert("Error: Failed to save the stopped response to the database.");
+                }
+            }
+        } else {
+            if (currentSessionId === generatingSessionId) {
                 messagesMap.delete(aiMessageId);
                 if (parentId && messagesMap.has(parentId)) {
                     const pNode = messagesMap.get(parentId);
@@ -1312,26 +1371,19 @@ async function requestAiResponse() {
                 }
                 currentLeafId = parentId;
                 renderActivePath();
-                alert("Error: Failed to save the stopped response to the database.");
-            }
-        } else {
-            messagesMap.delete(aiMessageId);
-            if (parentId && messagesMap.has(parentId)) {
-                const pNode = messagesMap.get(parentId);
-                pNode.children = pNode.children.filter(childId => childId !== aiMessageId);
-            }
-            currentLeafId = parentId;
-            renderActivePath();
-            if (err.message === "DB_SAVE_FAILED") {
-                alert("Error: Failed to save AI response to the database.");
-            } else {
-                alert("Error: Failed to connect to engine or generate response.");
+                if (err.message === "DB_SAVE_FAILED") {
+                    alert("Error: Failed to save AI response to the database.");
+                } else {
+                    alert("Error: Failed to connect to engine or generate response.");
+                }
             }
         }
     }
     
-    resetChatUI();
-    inputField.focus();
+    if (currentSessionId === generatingSessionId) {
+        resetChatUI();
+        inputField.focus();
+    }
     currentAbortController = null;
     
     // Move the active session to the top of the list and update its timestamp

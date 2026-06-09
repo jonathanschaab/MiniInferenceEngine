@@ -214,7 +214,7 @@ export function setupPageErrorHandlers(page, testInfo) {
                 text.includes('Failed to fetch') ||
                 text.includes('Failed to delete branch in DB') ||
                 text.includes('Failed to clear chat in DB') ||
-                text.includes('500 (Internal Server Error)')
+                text.includes('HTTP error 500')
             ) return;
 
             console.log(`[Browser Console]: ${text}`);
