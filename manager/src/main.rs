@@ -1,3 +1,12 @@
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::indexing_slicing)]
+#![deny(clippy::out_of_bounds_indexing)]
+#![deny(clippy::panic)]
+#![deny(clippy::unreachable)]
+#![deny(clippy::todo)]
+#![deny(clippy::unimplemented)]
+
 use auth::{AuthStore, require_session};
 use axum::{
     Json,
@@ -204,6 +213,7 @@ pub(crate) async fn handle_generate(
         chat_model_id: payload.chat_model_id,
         compressor_model_id: payload.compressor_model_id,
         messages: payload.messages,
+        parent_message_id: payload.parent_message_id,
         responder: response_tx,
         force_compression: false,
         parameters: payload.parameters.unwrap_or_default(),
@@ -215,17 +225,69 @@ pub(crate) async fn handle_generate(
 
     // Map the incoming channel into an HTTP streaming body
     let stream = UnboundedReceiverStream::new(response_rx).map(|event| match event {
-        StreamEvent::Token(t) => Ok::<_, std::convert::Infallible>(Bytes::from(t)),
+        StreamEvent::Token(t) => {
+            #[derive(Serialize)]
+            struct TokenMsg<'a> {
+                token: &'a str,
+            }
+            match serde_json::to_string(&TokenMsg { token: &t }) {
+                Ok(mut s) => {
+                    s.push('\n');
+                    Ok::<_, std::convert::Infallible>(Bytes::from(s))
+                }
+                Err(err) => {
+                    error!("Failed to serialize TokenMsg: {}", err);
+                    Ok(Bytes::new())
+                }
+            }
+        }
+        StreamEvent::Metadata(m) => {
+            #[derive(Serialize)]
+            struct MetaMsg<'a> {
+                metadata: &'a manager::MessageMetadata,
+            }
+            match serde_json::to_string(&MetaMsg { metadata: &m }) {
+                Ok(mut s) => {
+                    s.push('\n');
+                    Ok(Bytes::from(s))
+                }
+                Err(err) => {
+                    error!("Failed to serialize MetaMsg: {}", err);
+                    Ok(Bytes::new())
+                }
+            }
+        }
+        StreamEvent::Error(e) => {
+            #[derive(Serialize)]
+            struct ErrorMsg<'a> {
+                error: &'a str,
+            }
+            match serde_json::to_string(&ErrorMsg { error: &e }) {
+                Ok(mut s) => {
+                    s.push('\n');
+                    Ok(Bytes::from(s))
+                }
+                Err(err) => {
+                    error!("Failed to serialize ErrorMsg: {}", err);
+                    Ok(Bytes::new())
+                }
+            }
+        }
         StreamEvent::TokenizationTime(_) => Ok(Bytes::new()),
         StreamEvent::Done => Ok(Bytes::new()),
-        StreamEvent::Error(e) => Ok(Bytes::from(format!("Error: {}", e))),
     });
 
-    axum::response::Response::builder()
+    match axum::response::Response::builder()
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header(header::TRANSFER_ENCODING, "chunked")
         .body(Body::from_stream(stream))
-        .unwrap()
+    {
+        Ok(res) => res.into_response(),
+        Err(e) => {
+            error!("Failed to build streaming response: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Server Error").into_response()
+        }
+    }
 }
 
 pub(crate) async fn get_status(State(state): State<Arc<AppState>>) -> Json<EngineStatus> {
@@ -362,11 +424,10 @@ fn is_active_temp_file(
     active_expected_bases: &std::collections::HashSet<String>,
 ) -> bool {
     for base in active_expected_bases {
-        if file_name.starts_with(base) {
-            let remainder = &file_name[base.len()..];
-            if [".tmp", ".meta", ".meta.tmp", ".corrupted", ".copy_tmp"].contains(&remainder) {
-                return true;
-            }
+        if let Some(remainder) = file_name.strip_prefix(base)
+            && [".tmp", ".meta", ".meta.tmp", ".corrupted", ".copy_tmp"].contains(&remainder)
+        {
+            return true;
         }
     }
     false
@@ -797,7 +858,9 @@ pub(crate) async fn trigger_benchmark(
                             messages: vec![Message {
                                 role: "user".to_string(),
                                 content: prompt_instruction,
+                                metadata: None,
                             }],
+                            parent_message_id: None,
                             responder: seed_tx,
                             force_compression: false,
                             parameters: params.clone(),
@@ -815,6 +878,7 @@ pub(crate) async fn trigger_benchmark(
                                 break;
                             }
                             StreamEvent::TokenizationTime(_) => {} // Ignore for seed generation
+                            StreamEvent::Metadata(_) => {}         // Ignore for seed generation
                         }
                     }
 
@@ -868,8 +932,14 @@ pub(crate) async fn trigger_benchmark(
                         }
 
                         while current_tokens < size {
-                            let ev = events[counter % events.len()];
-                            let st = statuses[(counter / 3) % statuses.len()];
+                            let ev = events
+                                .get(counter % events.len())
+                                .copied()
+                                .unwrap_or("UNKNOWN");
+                            let st = statuses
+                                .get((counter / 3) % statuses.len())
+                                .copied()
+                                .unwrap_or("UNKNOWN");
                             let session_id = uuid::Uuid::new_v4();
 
                             let log_line = format!(
@@ -903,7 +973,10 @@ pub(crate) async fn trigger_benchmark(
 
                         if let Ok(final_encoding) = tokenizer.encode(synthetic_data, true) {
                             let safe_size = size.min(final_encoding.get_ids().len());
-                            let exact_slice = &final_encoding.get_ids()[0..safe_size];
+                            let exact_slice = final_encoding
+                                .get_ids()
+                                .get(0..safe_size)
+                                .unwrap_or_default();
 
                             if let Ok(decoded) = tokenizer.decode(exact_slice, true) {
                                 final_content = decoded;
@@ -973,7 +1046,9 @@ pub(crate) async fn trigger_benchmark(
                             messages: vec![Message {
                                 role: "user".to_string(),
                                 content: exact_prompt.clone(),
+                                metadata: None,
                             }],
+                            parent_message_id: None,
                             responder: response_tx,
                             force_compression: false,
                             parameters: params.clone(),
@@ -1032,7 +1107,9 @@ pub(crate) async fn trigger_benchmark(
                             messages: vec![Message {
                                 role: "user".to_string(),
                                 content: exact_prompt.clone(),
+                                metadata: None,
                             }],
+                            parent_message_id: None,
                             responder: response_tx,
                             force_compression: true,
                             parameters: params.clone(),
@@ -1213,7 +1290,10 @@ pub(crate) async fn list_chat_sessions(
         .bind(("limit", limit))
         .bind(("offset", offset))
         .await.map_err(|e| { error!("DB List Error: {}", e); StatusCode::INTERNAL_SERVER_ERROR })?;
-    let sessions: Vec<manager::ChatSessionSummary> = response.take(0).unwrap_or_default();
+    let sessions: Vec<manager::ChatSessionSummary> = response.take(0).map_err(|e| {
+        error!("DB Parse Error (chat_sessions): {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok(Json(sessions))
 }
 
@@ -1285,8 +1365,7 @@ pub(crate) async fn get_chat_session(
 
     let mut response = state
                 .db
-                // Order DESC to get the latest messages first, then we'll reverse them
-                .query("SELECT role, content, message_index FROM chat_messages WHERE session_id = $session_id ORDER BY message_index DESC LIMIT $limit START $offset")
+                .query("SELECT type::string(meta::id(id)) AS id, session_id, parent_id, role, content, timestamp, model, generation_time_ms, token_counts, score, parameters FROM chat_messages WHERE session_id = $session_id ORDER BY timestamp DESC LIMIT $limit START $offset")
                 .bind(("session_id", id.clone()))
                 .bind(("limit", limit))
                 .bind(("offset", offset))
@@ -1296,15 +1375,40 @@ pub(crate) async fn get_chat_session(
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
-    let mut db_messages: Vec<manager::Message> = response.take(0).unwrap_or_default();
-    db_messages.reverse(); // Reverse back to chronological order
+    let mut db_messages: Vec<manager::ChatMessageRecord> = response.take(0).map_err(|e| {
+        error!("DB Parse Error (chat_messages): {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    db_messages.reverse(); // Reverse back to chronological order for the frontend
+
+    let messages = db_messages
+        .into_iter()
+        .map(|m| {
+            let metadata = Some(manager::MessageMetadata {
+                id: m.id,
+                parent_id: m.parent_id,
+                timestamp: m.timestamp.unwrap_or_default(),
+                model: m.model,
+                generation_time_ms: m.generation_time_ms,
+                token_counts: m.token_counts.unwrap_or_default(),
+                score: m.score,
+                parameters: m.parameters,
+            });
+
+            manager::Message {
+                role: m.role,
+                content: m.content,
+                metadata,
+            }
+        })
+        .collect();
 
     Ok(Json(manager::ChatSession {
         id: s.id,
         email: s.email,
         updated_at: s.updated_at,
         title: s.title,
-        messages: db_messages,
+        messages,
     }))
 }
 
@@ -1384,34 +1488,39 @@ pub(crate) async fn append_chat_message(
 ) -> Result<StatusCode, StatusCode> {
     verify_session_ownership(&state.db, &id, &user.email).await?;
 
-    let mut last_msg_response = state
-        .db
-        .query("SELECT * FROM chat_messages WHERE session_id = $session_id ORDER BY message_index DESC LIMIT 1")
-        .bind(("session_id", id.clone()))
-        .await
-        .map_err(|e| {
-            error!("DB Query Error (last message): {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    let last_msg: Option<manager::ChatMessageRecord> =
-        last_msg_response.take(0).unwrap_or_default();
-    let expected_index = last_msg.map(|m| m.message_index + 1).unwrap_or(0);
-
-    if payload.message_index > expected_index {
-        error!(
-            "Invalid message_index for session {}: expected <= {}, got {}",
-            id, expected_index, payload.message_index
-        );
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
     payload.session_id = id.clone();
-    let message_id = format!("{}_{}", id, payload.message_index);
+    if payload.id.is_empty() {
+        payload.id = uuid::Uuid::new_v4().to_string();
+    }
+    let message_id = payload.id.clone();
+
     if let Err(e) = state
         .db
-        .upsert::<Option<manager::ChatMessageRecord>>(("chat_messages", &message_id))
-        .content(payload)
+        .query(
+            "UPSERT type::thing('chat_messages', $id) MERGE {
+                session_id: $session_id,
+                parent_id: $parent_id,
+                role: $role,
+                content: $content,
+                timestamp: $timestamp,
+                model: $model,
+                generation_time_ms: $generation_time_ms,
+                token_counts: $token_counts,
+                score: $score,
+                parameters: $parameters
+            }",
+        )
+        .bind(("id", message_id))
+        .bind(("session_id", payload.session_id))
+        .bind(("parent_id", payload.parent_id))
+        .bind(("role", payload.role))
+        .bind(("content", payload.content))
+        .bind(("timestamp", payload.timestamp))
+        .bind(("model", payload.model))
+        .bind(("generation_time_ms", payload.generation_time_ms))
+        .bind(("token_counts", payload.token_counts))
+        .bind(("score", payload.score))
+        .bind(("parameters", payload.parameters))
         .await
     {
         error!("DB Upsert Error (chat_messages): {}", e);
@@ -1423,24 +1532,64 @@ pub(crate) async fn append_chat_message(
     Ok(StatusCode::OK)
 }
 
-pub(crate) async fn truncate_chat_messages(
+#[derive(Deserialize)]
+pub struct DeleteMessagesRequest {
+    pub message_ids: Vec<String>,
+}
+
+pub(crate) async fn delete_chat_messages(
     user: auth::CurrentUser,
-    Path((id, index)): Path<(String, usize)>,
+    Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
+    Json(payload): Json<DeleteMessagesRequest>,
 ) -> Result<StatusCode, StatusCode> {
     verify_session_ownership(&state.db, &id, &user.email).await?;
 
-    if let Err(e) = state
-        .db
-        .query(
-            "DELETE FROM chat_messages WHERE session_id = $session_id AND message_index >= $index",
-        )
-        .bind(("session_id", id.clone()))
-        .bind(("index", index))
-        .await
+    let msg_things: Vec<surrealdb::sql::Thing> = payload
+        .message_ids
+        .into_iter()
+        .map(|msg_id| surrealdb::sql::Thing::from(("chat_messages".to_string(), msg_id)))
+        .collect();
+
+    if !msg_things.is_empty() {
+        #[derive(Deserialize)]
+        struct MessageParentCheck {
+            parent_id: Option<String>,
+        }
+
+        // Prevent pruning root messages to avoid breaking the session tree
+        let mut response = state
+            .db
+            .query("SELECT parent_id FROM chat_messages WHERE session_id = $session_id AND id IN $msg_ids")
+            .bind(("session_id", id.clone()))
+            .bind(("msg_ids", msg_things.clone()))
+            .await
+            .map_err(|e| {
+                error!("DB Query Error: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        let messages: Vec<MessageParentCheck> = response.take(0).map_err(|e| {
+            error!("DB Parse Error (chat_messages): {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        for m in messages {
+            if m.parent_id.is_none() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
+    if !msg_things.is_empty()
+        && let Err(e) = state
+            .db
+            .query("DELETE chat_messages WHERE session_id = $session_id AND id IN $msg_ids")
+            .bind(("session_id", id.clone()))
+            .bind(("msg_ids", msg_things))
+            .await
     {
-        error!("DB Delete Error (truncate chat_messages): {}", e);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        error!("DB Delete Error (delete chat_messages): {}", e);
     }
 
     touch_session_updated_at(&state.db, &id).await;
@@ -1583,7 +1732,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vram_tracker_gpu_idx = config.gpu_device_index;
     tokio::spawn(async move {
         let mut sys = System::new_all();
-        let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
+        let pid_opt = sysinfo::get_current_pid()
+            .inspect_err(|e| {
+                error!("Failed to get current PID for memory tracking: {}", e);
+            })
+            .ok();
         let nvml = nvml_wrapper::Nvml::init().ok();
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(VRAM_TRACKER_INTERVAL_SECS));
@@ -1591,18 +1744,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interval.tick().await;
 
             sys.refresh_memory();
-            sys.refresh_process(pid);
 
             let mut s = manager::lock_status(&status_for_nvml);
 
-            if let Some(process) = sys.process(pid) {
-                s.update_sysinfo(
-                    sys.total_memory(),
-                    sys.used_memory(),
-                    sys.free_memory(),
-                    process.memory(),
-                );
+            let mut proc_memory = 0;
+            if let Some(pid) = pid_opt {
+                sys.refresh_process(pid);
+                if let Some(process) = sys.process(pid) {
+                    proc_memory = process.memory();
+                }
             }
+            s.update_sysinfo(
+                sys.total_memory(),
+                sys.used_memory(),
+                sys.free_memory(),
+                proc_memory,
+            );
 
             if let Some((used, total, free)) =
                 manager::get_vram_info(nvml.as_ref(), vram_tracker_gpu_idx)
@@ -1645,7 +1802,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut store = TelemetryStore::load_from_db(&db_client).await;
+    let mut store = TelemetryStore::load_from_db(&db_client).await?;
     store.writer_tx = Some(telemetry_tx); // Wire the channel into the store
     let telemetry = Arc::new(Mutex::new(store));
 
@@ -1963,9 +2120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(axum::middleware::from_fn(csp_middleware));
 
     // Start listening on port 3000
-    let listener = tokio::net::TcpListener::bind(&config.bind_address)
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(&config.bind_address).await?;
     info!("🚀 Server safely listening on {}", config.bind_address);
 
     let (force_tx, force_rx) = tokio::sync::oneshot::channel();
@@ -1983,17 +2138,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn wait_for_termination_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!("Failed to install Ctrl+C handler: {}", e);
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                error!("Failed to install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -2024,6 +2185,12 @@ async fn shutdown_signal(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
     use tracing_subscriber::fmt::MakeWriter;
@@ -2054,10 +2221,13 @@ mod tests {
             // Dropping the writer triggers the flush to the shared buffer
         }
 
-        let guard = buffer.0.lock().unwrap();
+        let guard = buffer.0.lock().expect("Mutex poisoned");
         assert_eq!(guard.0, 1010); // Verifies the total emitted cursor is intact
         assert_eq!(guard.1.len(), 1000); // Verifies the circular truncation works
-        assert_eq!(guard.1.front().unwrap(), "Log line 10"); // Oldest retained
+        assert_eq!(
+            guard.1.front().expect("Buffer should not be empty"),
+            "Log line 10"
+        ); // Oldest retained
     }
 
     #[test]
@@ -2067,17 +2237,19 @@ mod tests {
             let mut writer = buffer.make_writer();
             let _ = std::io::Write::write(&mut writer, b"   \n"); // Just whitespace
         }
-        let guard = buffer.0.lock().unwrap();
+        let guard = buffer.0.lock().expect("Mutex poisoned");
         assert_eq!(guard.0, 0); // Should not increment cursor for empty/whitespace logs
         assert!(guard.1.is_empty());
     }
 
     #[test]
     fn test_log_query_deserialization() {
-        let query: LogQuery = serde_json::from_str(r#"{}"#).unwrap();
+        let query: LogQuery =
+            serde_json::from_str(r#"{}"#).expect("Failed to deserialize empty LogQuery");
         assert_eq!(query.since, None);
 
-        let query: LogQuery = serde_json::from_str(r#"{"since": 42}"#).unwrap();
+        let query: LogQuery = serde_json::from_str(r#"{"since": 42}"#)
+            .expect("Failed to deserialize LogQuery with since field");
         assert_eq!(query.since, Some(42));
     }
 
@@ -2106,10 +2278,14 @@ mod tests {
     #[tokio::test]
     async fn test_sweep_temp_files_disabled_when_retention_zero() {
         let temp_dir = std::env::temp_dir().join("test_sweep_temp_disabled");
-        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        tokio::fs::create_dir_all(&temp_dir)
+            .await
+            .expect("Failed to create temp dir");
 
         let tmp_file = temp_dir.join("model.safetensors.tmp");
-        tokio::fs::write(&tmp_file, "dummy").await.unwrap();
+        tokio::fs::write(&tmp_file, "dummy")
+            .await
+            .expect("Failed to write tmp file");
 
         // Ensure the file is at least 1 second old so that if the sweep mistakenly runs,
         // the age check `age.as_secs() > 0` evaluates to true and deletes it.
@@ -2142,31 +2318,38 @@ mod tests {
         let (telemetry_tx, _) = mpsc::unbounded_channel();
         let (auth_tx, _) = tokio::sync::mpsc::unbounded_channel();
 
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select test namespace and DB");
 
         // Ensure tables exist for testing purposes
         db.query("DEFINE TABLE chat_sessions SCHEMALESS;")
             .await
-            .unwrap();
+            .expect("Failed to define chat_sessions table");
         db.query("DEFINE TABLE chat_messages SCHEMALESS;")
             .await
-            .unwrap();
+            .expect("Failed to define chat_messages table");
         db.query("DEFINE TABLE auth_keys SCHEMALESS;")
             .await
-            .unwrap();
+            .expect("Failed to define auth_keys table");
         db.query("DEFINE INDEX chat_sessions_email_idx ON TABLE chat_sessions COLUMNS email;")
             .await
-            .unwrap();
-        db.query("DEFINE INDEX chat_messages_session_idx ON TABLE chat_messages COLUMNS session_id, message_index;")
-            .await
-            .unwrap();
+            .expect("Failed to define chat_sessions index");
+        db.query(
+            "DEFINE INDEX chat_messages_session_timestamp_idx ON TABLE chat_messages COLUMNS session_id, timestamp;",
+        )
+        .await
+        .expect("Failed to define chat_messages index");
         db.query("DEFINE INDEX telemetry_loads_timestamp_idx ON TABLE telemetry_loads COLUMNS timestamp;")
             .await
-            .unwrap();
+                .expect("Failed to define telemetry_loads index");
         db.query("DEFINE INDEX telemetry_generations_timestamp_idx ON TABLE telemetry_generations COLUMNS timestamp;")
             .await
-            .unwrap();
+                .expect("Failed to define telemetry_generations index");
 
         let (_, log_reload_handle) =
             tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
@@ -2194,7 +2377,7 @@ mod tests {
                 "https://oauth2.googleapis.com/token",
             )
             .await
-            .unwrap(), // Dummy client
+            .expect("Failed to build dummy OAuth client"),
             config: Arc::new(AppConfig::default()),
             log_buffer: SharedLogBuffer(Arc::new(Mutex::new((
                 0,
@@ -2242,7 +2425,7 @@ mod tests {
             "Failed to save new session: {:?}",
             response.err()
         ); // Enhance assertion message
-        let new_session = response.unwrap().0;
+        let new_session = response.expect("Failed to unwrap session response").0;
         assert!(!new_session.id.is_empty());
         assert_eq!(new_session.title, "First Session");
         let session_id = new_session.id.clone();
@@ -2257,7 +2440,7 @@ mod tests {
             State(state.clone()),
         )
         .await
-        .unwrap()
+        .expect("Failed to list chat sessions")
         .0;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session_id);
@@ -2279,16 +2462,25 @@ mod tests {
             "Failed to get session details: {:?}",
             session_detail_res.err()
         );
-        let session_detail = session_detail_res.unwrap().0;
+        let session_detail = session_detail_res
+            .expect("Failed to unwrap session detail")
+            .0;
         assert_eq!(session_detail.id, session_id);
         assert!(session_detail.messages.is_empty());
 
         // 4. Append a message
         let message_payload = manager::ChatMessageRecord {
+            id: "msg1".to_string(),
             session_id: session_id.clone(),
-            message_index: 0,
+            parent_id: None,
             role: "user".to_string(),
             content: "Hello AI".to_string(),
+            timestamp: None,
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
         let append_res = append_chat_message(
             user.clone(),
@@ -2301,10 +2493,17 @@ mod tests {
 
         // 5. Append another message
         let message_payload_2 = manager::ChatMessageRecord {
+            id: "msg2".to_string(),
             session_id: session_id.clone(),
-            message_index: 1,
+            parent_id: Some("msg1".to_string()),
             role: "assistant".to_string(),
             content: "Hello human".to_string(),
+            timestamp: None,
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
         let append_res_2 = append_chat_message(
             user.clone(),
@@ -2326,20 +2525,23 @@ mod tests {
             State(state.clone()),
         )
         .await
-        .unwrap()
+        .expect("Failed to get truncated session")
         .0;
         assert_eq!(session_detail_with_msgs.messages.len(), 2);
         assert_eq!(session_detail_with_msgs.messages[0].content, "Hello AI");
         assert_eq!(session_detail_with_msgs.messages[1].content, "Hello human");
 
-        // 7. Truncate messages (e.g., regenerate from a point)
-        let truncate_res = truncate_chat_messages(
+        // 7. Delete message (e.g., prune a branch)
+        let delete_res = delete_chat_messages(
             user.clone(),
-            Path((session_id.clone(), 1)),
+            Path(session_id.clone()),
             State(state.clone()),
+            Json(DeleteMessagesRequest {
+                message_ids: vec!["msg2".to_string()],
+            }),
         )
         .await;
-        assert_eq!(truncate_res, Ok(StatusCode::OK));
+        assert_eq!(delete_res, Ok(StatusCode::OK));
 
         // 8. Verify truncation
         let session_after_truncate = get_chat_session(
@@ -2352,7 +2554,7 @@ mod tests {
             State(state.clone()),
         )
         .await
-        .unwrap()
+        .expect("Failed to fetch session after truncate")
         .0;
         assert_eq!(session_after_truncate.messages.len(), 1);
         assert_eq!(session_after_truncate.messages[0].content, "Hello AI");
@@ -2370,7 +2572,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            other_user_session_get_res.unwrap_err(),
+            other_user_session_get_res.expect_err("Expected FORBIDDEN error"),
             StatusCode::FORBIDDEN
         );
 
@@ -2387,9 +2589,79 @@ mod tests {
         )
         .await;
         assert_eq!(
-            other_user_session_update_res.unwrap_err(),
+            other_user_session_update_res.expect_err("Expected FORBIDDEN error"),
             StatusCode::FORBIDDEN
         ); // Expect a FORBIDDEN status
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
+    async fn test_append_chat_message_generates_id() {
+        let state = create_test_app_state().await;
+        let user_email = "test@example.com";
+        let user = mock_user(user_email, false);
+
+        let new_session_payload = manager::ChatSessionRecord {
+            id: "".to_string(),
+            email: user_email.to_string(),
+            updated_at: 0,
+            title: "Auto-ID Test Session".to_string(),
+        };
+        let response = save_chat_session(
+            user.clone(),
+            State(state.clone()),
+            Json(new_session_payload),
+        )
+        .await;
+        let session_id = response.expect("Failed to save session").0.id;
+
+        let msg = manager::ChatMessageRecord {
+            id: "".to_string(),
+            session_id: session_id.clone(),
+            parent_id: None,
+            role: "user".to_string(),
+            content: "Generate my ID please".to_string(),
+            timestamp: None,
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
+        };
+        let res = append_chat_message(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(msg),
+        )
+        .await;
+        assert_eq!(res, Ok(StatusCode::OK));
+
+        let session_detail = get_chat_session(
+            user.clone(),
+            Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("Failed to fetch session")
+        .0;
+
+        assert_eq!(session_detail.messages.len(), 1);
+        let generated_id = session_detail.messages[0]
+            .metadata
+            .as_ref()
+            .expect("Message should have metadata")
+            .id
+            .clone();
+        assert!(!generated_id.is_empty());
+        assert!(
+            uuid::Uuid::parse_str(&generated_id).is_ok(),
+            "Generated ID should be a valid UUID"
+        );
     }
 
     #[tokio::test]
@@ -2413,7 +2685,7 @@ mod tests {
         )
         .await;
 
-        let new_session = response.unwrap().0;
+        let new_session = response.expect("Failed to unwrap new session").0;
         let session_id = new_session.id.clone();
         assert_eq!(new_session.title, "Original Title");
 
@@ -2426,7 +2698,7 @@ mod tests {
         };
         let rename_response =
             save_chat_session(user.clone(), State(state.clone()), Json(rename_payload)).await;
-        let renamed_session = rename_response.unwrap().0;
+        let renamed_session = rename_response.expect("Failed to unwrap renamed session").0;
 
         assert_eq!(
             renamed_session.id, session_id,
@@ -2447,7 +2719,7 @@ mod tests {
             State(state.clone()),
         )
         .await
-        .unwrap()
+        .expect("Failed to list chat sessions")
         .0;
         assert_eq!(sessions.len(), 1, "There should still only be one session.");
         assert_eq!(sessions[0].id, session_id);
@@ -2456,7 +2728,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "Requires Oauth Token (Suite 2)"]
-    async fn test_chat_session_gap_rejection() {
+    async fn test_chat_session_branching_and_pruning() {
         let state = create_test_app_state().await;
         let user_email = "test@example.com";
         let user = mock_user(user_email, false);
@@ -2465,7 +2737,7 @@ mod tests {
             id: "".to_string(),
             email: user_email.to_string(),
             updated_at: 0,
-            title: "Gap Test Session".to_string(),
+            title: "Branching Test Session".to_string(),
         };
         let response = save_chat_session(
             user.clone(),
@@ -2473,30 +2745,44 @@ mod tests {
             Json(new_session_payload),
         )
         .await;
-        let session_id = response.unwrap().0.id;
+        let session_id = response.expect("Failed to save session").0.id;
 
-        // 1. Append message 0 (Valid)
-        let msg0 = manager::ChatMessageRecord {
+        // 1. Append message 1 (Root)
+        let msg1 = manager::ChatMessageRecord {
+            id: "msg1".to_string(),
             session_id: session_id.clone(),
-            message_index: 0,
+            parent_id: None,
             role: "user".to_string(),
-            content: "Message 0".to_string(),
+            content: "Root message".to_string(),
+            timestamp: Some(1000),
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
-        let res0 = append_chat_message(
+        let res1 = append_chat_message(
             user.clone(),
             Path(session_id.clone()),
             State(state.clone()),
-            Json(msg0),
+            Json(msg1),
         )
         .await;
-        assert_eq!(res0, Ok(StatusCode::OK));
+        assert_eq!(res1, Ok(StatusCode::OK));
 
-        // 2. Append message 2 (Invalid Gap -> Should return BAD_REQUEST)
+        // 2. Append message 2 (Branch A)
         let msg2 = manager::ChatMessageRecord {
+            id: "msg2".to_string(),
             session_id: session_id.clone(),
-            message_index: 2,
-            role: "user".to_string(),
-            content: "Message 2".to_string(),
+            parent_id: Some("msg1".to_string()),
+            role: "assistant".to_string(),
+            content: "Branch A".to_string(),
+            timestamp: Some(1001),
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
         let res2 = append_chat_message(
             user.clone(),
@@ -2505,33 +2791,93 @@ mod tests {
             Json(msg2),
         )
         .await;
-        assert_eq!(res2, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(res2, Ok(StatusCode::OK));
 
-        // 3. Append message 1 (Valid sequence)
-        let msg1 = manager::ChatMessageRecord {
+        // 3. Append message 3 (Branch B)
+        let msg3 = manager::ChatMessageRecord {
+            id: "msg3".to_string(),
             session_id: session_id.clone(),
-            message_index: 1,
+            parent_id: Some("msg1".to_string()),
             role: "assistant".to_string(),
-            content: "Message 1".to_string(),
+            content: "Branch B".to_string(),
+            timestamp: Some(1002),
+            model: None,
+            generation_time_ms: None,
+            token_counts: None,
+            score: None,
+            parameters: None,
         };
-        let res1 = append_chat_message(
+        let res3 = append_chat_message(
             user.clone(),
             Path(session_id.clone()),
             State(state.clone()),
-            Json(msg1.clone()),
+            Json(msg3),
         )
         .await;
-        assert_eq!(res1, Ok(StatusCode::OK));
+        assert_eq!(res3, Ok(StatusCode::OK));
 
-        // 4. Retry appending message 1 (Valid Overwrite/Upsert)
-        let res1_retry = append_chat_message(
+        // 4. Fetch session to verify branching
+        let session_detail = get_chat_session(
+            user.clone(),
+            Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("Failed to fetch session after deletion")
+        .0;
+
+        assert_eq!(session_detail.messages.len(), 3);
+
+        // Ensure chronological sorting works correctly
+        assert_eq!(session_detail.messages[0].content, "Root message");
+        assert_eq!(session_detail.messages[1].content, "Branch A");
+        assert_eq!(session_detail.messages[2].content, "Branch B");
+
+        // 5. Delete Branch A
+        let delete_res = delete_chat_messages(
             user.clone(),
             Path(session_id.clone()),
             State(state.clone()),
-            Json(msg1),
+            Json(DeleteMessagesRequest {
+                message_ids: vec!["msg2".to_string()],
+            }),
         )
         .await;
-        assert_eq!(res1_retry, Ok(StatusCode::OK));
+        assert_eq!(delete_res, Ok(StatusCode::OK));
+
+        // 6. Verify Branch A is removed
+        let session_after = get_chat_session(
+            user.clone(),
+            Path(session_id.clone()),
+            axum::extract::Query(MessageQuery {
+                limit: None,
+                offset: None,
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("Failed to fetch session after deletion")
+        .0;
+
+        assert_eq!(session_after.messages.len(), 2);
+        assert_eq!(session_after.messages[0].content, "Root message");
+        assert_eq!(session_after.messages[1].content, "Branch B");
+
+        // 7. Attempt to delete the root message (msg1) -> Should return BAD_REQUEST
+        let delete_root_res = delete_chat_messages(
+            user.clone(),
+            Path(session_id.clone()),
+            State(state.clone()),
+            Json(DeleteMessagesRequest {
+                message_ids: vec!["msg1".to_string()],
+            }),
+        )
+        .await;
+        assert_eq!(delete_root_res, Err(StatusCode::BAD_REQUEST));
     }
 
     #[tokio::test]
@@ -2545,7 +2891,7 @@ mod tests {
 
         // Insert mock progress
         {
-            let mut dl = state.active_downloads.lock().unwrap();
+            let mut dl = state.active_downloads.lock().expect("Mutex poisoned");
             dl.insert(
                 "test-model".to_string(),
                 DownloadStatus {
@@ -2561,7 +2907,7 @@ mod tests {
         // Fetch again and verify
         let Json(progress) = get_download_progress(State(state.clone())).await;
         assert_eq!(progress.len(), 1);
-        let status = progress.get("test-model").unwrap();
+        let status = progress.get("test-model").expect("Download status missing");
         assert_eq!(status.bytes_transferred, 50);
         assert_eq!(status.total_bytes, 100);
     }
@@ -2599,7 +2945,7 @@ mod tests {
 
         // 3. Admin requesting an already active download should fail (409)
         {
-            let mut dl = state.active_downloads.lock().unwrap();
+            let mut dl = state.active_downloads.lock().expect("Mutex poisoned");
             dl.insert("llama-3.1-8b".to_string(), DownloadStatus::default());
         }
         let res = trigger_download(
@@ -2643,7 +2989,7 @@ mod tests {
             }
         });
         {
-            let mut tasks = state.download_tasks.lock().unwrap();
+            let mut tasks = state.download_tasks.lock().expect("Mutex poisoned");
             tasks.insert("model1".to_string(), (tx1, task1));
             tasks.insert("model2".to_string(), (tx2, task2));
         }
@@ -2654,7 +3000,7 @@ mod tests {
             .into_response();
         assert_eq!(res.status(), StatusCode::OK);
 
-        let tasks = state.download_tasks.lock().unwrap();
+        let tasks = state.download_tasks.lock().expect("Mutex poisoned");
         assert!(
             tasks.is_empty(),
             "All download tasks should be removed from the map"
@@ -2768,7 +3114,7 @@ mod tests {
 
         // 3. Spawn the model downloader
         {
-            let mut dl = state.active_downloads.lock().unwrap();
+            let mut dl = state.active_downloads.lock().expect("Mutex poisoned");
             dl.insert("test-model".to_string(), DownloadStatus::default());
         }
         let state_clone = state.clone();
@@ -2789,7 +3135,7 @@ mod tests {
         let mut downloaded_bytes = 0;
         for i in 0..50 {
             let active = {
-                let dl = state.active_downloads.lock().unwrap();
+                let dl = state.active_downloads.lock().expect("Mutex poisoned");
                 dl.get("test-model").cloned()
             };
             if let Some(dl) = active {
@@ -2964,7 +3310,7 @@ mod tests {
 
         // 3. Spawn the model downloader
         {
-            let mut dl = state.active_downloads.lock().unwrap();
+            let mut dl = state.active_downloads.lock().expect("Mutex poisoned");
             dl.insert("test-model-cancel".to_string(), DownloadStatus::default());
         }
         let state_clone = state.clone();
@@ -2985,7 +3331,7 @@ mod tests {
         let mut downloaded_bytes = 0;
         for i in 0..50 {
             let active = {
-                let dl = state.active_downloads.lock().unwrap();
+                let dl = state.active_downloads.lock().expect("Mutex poisoned");
                 dl.get("test-model-cancel").cloned()
             };
             if let Some(dl) = active {
@@ -3061,7 +3407,9 @@ mod tests {
         let nested_dir = limit_dir.join("a").join("b").join("c");
 
         // Create the nested structure
-        tokio::fs::create_dir_all(&nested_dir).await.unwrap();
+        tokio::fs::create_dir_all(&nested_dir)
+            .await
+            .expect("Failed to create nested directories");
 
         // Target file path inside 'c'
         let file_path = nested_dir.join("dummy.txt");
@@ -3090,8 +3438,12 @@ mod tests {
         let out_of_bounds = temp_dir.join("oob");
         let nested_oob = out_of_bounds.join("x").join("y");
 
-        tokio::fs::create_dir_all(&safe_dir).await.unwrap();
-        tokio::fs::create_dir_all(&nested_oob).await.unwrap();
+        tokio::fs::create_dir_all(&safe_dir)
+            .await
+            .expect("Failed to create safe dir");
+        tokio::fs::create_dir_all(&nested_oob)
+            .await
+            .expect("Failed to create out-of-bounds dir");
 
         let file_path = nested_oob.join("dummy.txt");
 
@@ -3103,5 +3455,89 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires Oauth Token (Suite 2)"]
+    async fn test_stream_serialization_no_panic() {
+        let (queue_tx, mut queue_rx) = mpsc::channel(1);
+        let state = create_test_app_state().await;
+
+        // Reconstruct AppState to intercept the queue_tx
+        let state_with_rx = Arc::new(AppState {
+            queue_tx,
+            engine_status: state.engine_status.clone(),
+            telemetry: state.telemetry.clone(),
+            auth_store: state.auth_store.clone(),
+            reqwest_client: state.reqwest_client.clone(),
+            oauth_client: state.oauth_client.clone(),
+            config: state.config.clone(),
+            log_buffer: state.log_buffer.clone(),
+            log_reload_handle: state.log_reload_handle.clone(),
+            current_log_level: state.current_log_level.clone(),
+            active_downloads: state.active_downloads.clone(),
+            download_tasks: state.download_tasks.clone(),
+            download_semaphore: state.download_semaphore.clone(),
+            db: state.db.clone(),
+            shutdown_tx: state.shutdown_tx.clone(),
+        });
+
+        let payload = manager::ApiRequest {
+            chat_model_id: "test-model".to_string(),
+            compressor_model_id: "test-compressor".to_string(),
+            messages: vec![],
+            parent_message_id: None,
+            parameters: None,
+            target_backend: None,
+        };
+
+        let handle = tokio::spawn(async move {
+            handle_generate(State(state_with_rx), Json(payload))
+                .await
+                .into_response()
+        });
+
+        let user_request = queue_rx
+            .recv()
+            .await
+            .expect("Failed to receive UserRequest");
+
+        // Send a poisoned MetaMsg with NaN floats to trigger serialization failure
+        let poisoned_meta = Box::new(manager::MessageMetadata {
+            id: "test".to_string(),
+            parent_id: None,
+            timestamp: 0,
+            model: None,
+            generation_time_ms: None,
+            token_counts: std::collections::HashMap::new(),
+            score: None,
+            parameters: Some(manager::GenerationParameters {
+                temperature: Some(f32::NAN),
+                ..Default::default()
+            }),
+        });
+
+        assert!(
+            user_request
+                .responder
+                .send(StreamEvent::Metadata(poisoned_meta))
+                .is_ok()
+        );
+        assert!(user_request.responder.send(StreamEvent::Done).is_ok());
+
+        drop(user_request); // Close the channel so the stream terminates!
+
+        let response = handle
+            .await
+            .expect("Handler panicked during stream processing!");
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("Failed to extract body bytes");
+        let body_str = String::from_utf8_lossy(&body_bytes);
+
+        assert!(
+            body_str.is_empty() || body_str.contains("\"metadata\""),
+            "Stream should gracefully drop invalid serialization or serialize to null without panicking"
+        );
     }
 }

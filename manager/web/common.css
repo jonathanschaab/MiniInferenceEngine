@@ -74,6 +74,7 @@ th { background: #11111b; font-weight: bold; color: #89b4fa; }
 }
 
 /* Layout & Typography Overrides */
+.app-main { display: flex; flex-direction: column; flex: 1; overflow: hidden; width: 100%; }
 .control-bar { background: #181825; padding: 10px 20px; border-bottom: 1px solid #313244; display: flex; gap: 15px; align-items: center; justify-content: space-between; }
 .control-group { display: flex; gap: 15px; align-items: center; }
 .control-select { background: #313244; color: white; border: none; padding: 5px; border-radius: 4px; }
@@ -118,7 +119,7 @@ th { background: #11111b; font-weight: bold; color: #89b4fa; }
 /* Text colors & formatting */
 .text-subtext0 { color: #a6adc8; }
 .text-subtext1 { color: #bac2de; }
-.text-overlay0 { color: #6c7086; }
+.text-overlay0 { color: #8a92b2; }
 .text-peach { color: #fab387; }
 .text-yellow { color: #f9e2af; }
 .text-green { color: #a6e3a1; }
@@ -160,8 +161,8 @@ th { background: #11111b; font-weight: bold; color: #89b4fa; }
 .log-trace { color: #cba6f7; font-weight: bold; }
 .benchmark-banner { display: none; background: #f38ba8; color: #11111b; padding: 12px; text-align: center; border-radius: 8px; margin-bottom: 20px; font-weight: bold; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
 .incompatible-warning { display: none; color: #f38ba8; margin-left: auto; font-size: 0.85em; font-style: italic; }
-.chat-sentinel { padding: 10px; text-align: center; color: #6c7086; font-size: 0.9rem; }
-.session-sentinel { padding: 10px; text-align: center; color: #6c7086; font-size: 0.85rem; }
+.chat-sentinel { padding: 10px; text-align: center; color: #8a92b2; font-size: 0.9rem; }
+.session-sentinel { padding: 10px; text-align: center; color: #8a92b2; font-size: 0.85rem; }
 
 /* Dynamic Download UI */
 .dl-bar-wrapper { width: 100%; max-width: 300px; background: #313244; border-radius: 4px; overflow: hidden; border: 1px solid #45475a; }
@@ -174,6 +175,23 @@ th { background: #11111b; font-weight: bold; color: #89b4fa; }
 .dl-cancel-btn { padding: 4px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold; }
 .dl-pause-btn-sm { padding: 3px 8px; background: #f9e2af; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold; }
 .dl-cancel-btn-sm { padding: 3px 8px; background: #f38ba8; color: #11111b; border: none; border-radius: 4px; cursor: pointer; font-size: 0.75rem; font-weight: bold; }
+
+/* Branch Controls */
+.branch-controls {
+    display: flex;
+    align-items: center;
+    user-select: none;
+}
+.branch-controls span {
+    padding: 0 5px;
+    cursor: pointer;
+}
+.branch-controls span:hover {
+    color: #cdd6f4;
+}
+.split-container { display: flex; gap: 15px; overflow-x: auto; width: 100%; padding-bottom: 10px; }
+.split-item { flex: 0 0 350px; border: 1px solid #45475a; border-radius: 8px; padding: 10px; background: #181825; cursor: pointer; }
+.split-item.active-split { border: 2px solid #89b4fa; }
 
 /* --- index.html (Chat) --- */
 body.chat-layout { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
@@ -192,7 +210,7 @@ body.chat-layout { display: flex; flex-direction: column; height: 100vh; overflo
 .session-item.generating { animation: session-pulse 1.5s infinite; }
 .session-info { overflow: hidden; display: flex; flex-direction: column; flex: 1; }
 .session-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-date { font-size: 0.75rem; color: #6c7086; margin-top: 2px; font-weight: normal; }
+.session-date { font-size: 0.75rem; color: #8a92b2; margin-top: 2px; font-weight: normal; }
 .session-action-btn { cursor: pointer; border: none; background: none; font-size: 1.1rem; padding: 0 4px; display: none; color: #a6adc8; }
 .session-action-btn:hover { color: #cdd6f4; }
 .session-action-btn.delete-btn:hover { color: #f38ba8; }
@@ -263,7 +281,7 @@ textarea:focus { border-color: #89b4fa; }
 .model-card h3 { margin: 0 0 15px 0; font-size: 1.1rem; color: #89b4fa; }
 .model-stat { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 0.9rem; }
 .status-active { color: #a6e3a1; font-weight: bold; }
-.status-idle { color: #6c7086; font-style: italic; }
+.status-idle { color: #8a92b2; font-style: italic; }
 .memory-table { margin-top: 40px; }
 .memory-table td { font-family: monospace; }
 .memory-table th { text-transform: uppercase; font-size: 0.85rem; }

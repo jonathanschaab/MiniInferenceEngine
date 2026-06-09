@@ -262,10 +262,29 @@ pub struct DownloadStatus {
     pub state: String,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct MessageMetadata {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_time_ms: Option<u64>,
+    #[serde(default)]
+    pub token_counts: std::collections::HashMap<String, usize>,
+    #[serde(default)]
+    pub score: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<GenerationParameters>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MessageMetadata>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -301,10 +320,24 @@ pub struct ChatSessionRecord {
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ChatMessageRecord {
+    #[serde(default)]
+    pub id: String,
     pub session_id: String,
-    pub message_index: usize,
+    pub parent_id: Option<String>,
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub generation_time_ms: Option<u64>,
+    #[serde(default)]
+    pub token_counts: Option<std::collections::HashMap<String, usize>>,
+    #[serde(default)]
+    pub score: Option<u8>,
+    #[serde(default)]
+    pub parameters: Option<GenerationParameters>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
@@ -314,7 +347,7 @@ pub enum MemoryStrategy {
     Compress,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct GenerationParameters {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -346,6 +379,7 @@ pub struct ApiRequest {
     pub chat_model_id: String,
     pub compressor_model_id: String,
     pub messages: Vec<Message>,
+    pub parent_message_id: Option<String>,
     pub parameters: Option<GenerationParameters>,
     pub target_backend: Option<String>,
 }
@@ -363,12 +397,14 @@ pub enum StreamEvent {
     TokenizationTime(u128),
     Done,
     Error(String),
+    Metadata(Box<MessageMetadata>),
 }
 
 pub struct UserRequest {
     pub chat_model_id: String,
     pub compressor_model_id: String,
     pub messages: Vec<Message>,
+    pub parent_message_id: Option<String>,
     pub responder: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
     pub force_compression: bool,
     pub parameters: GenerationParameters,
@@ -388,6 +424,12 @@ pub fn resolve_absolute_path<P: AsRef<Path>>(path: P) -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
 
@@ -490,7 +532,7 @@ mod tests {
             .models_vram
             .iter()
             .find(|m| m.id == "dynamic_model")
-            .unwrap();
+            .expect("dynamic_model missing from vram list");
         assert_eq!(dyn_model.kv_cache, 1000);
     }
 
@@ -499,6 +541,23 @@ mod tests {
         let mut status = EngineStatus::default();
         status.update_sysinfo(16000, 8000, 8000, 2000);
         assert_eq!(status.ram_other_processes, 6000); // 8000 used - 2000 engine process
+    }
+
+    #[test]
+    fn test_update_sysinfo_process_lost() {
+        let mut status = EngineStatus::default();
+
+        // Simulate the case where the PID fails to resolve, yielding 0 for process_used.
+        // The overall system totals should remain accurate.
+        status.update_sysinfo(16000, 8000, 8000, 0);
+        assert_eq!(status.ram_total, 16000);
+        assert_eq!(status.ram_used, 8000);
+        assert_eq!(status.ram_free, 8000);
+        assert_eq!(status.ram_process_used, 0);
+        assert_eq!(
+            status.ram_other_processes, 8000,
+            "All used RAM should gracefully fallback to other processes"
+        );
     }
 
     #[test]
@@ -524,9 +583,11 @@ mod tests {
     #[test]
     fn test_memory_strategy_serde() {
         // Tests #[serde(rename_all = "lowercase")] ensuring UI compatibility
-        let json = serde_json::to_string(&MemoryStrategy::Offload).unwrap();
+        let json = serde_json::to_string(&MemoryStrategy::Offload)
+            .expect("Failed to serialize MemoryStrategy");
         assert_eq!(json, "\"offload\"");
-        let strategy: MemoryStrategy = serde_json::from_str("\"compress\"").unwrap();
+        let strategy: MemoryStrategy =
+            serde_json::from_str("\"compress\"").expect("Failed to deserialize MemoryStrategy");
         assert_eq!(strategy, MemoryStrategy::Compress);
     }
 
@@ -537,7 +598,7 @@ mod tests {
         // Poison the mutex on purpose inside a separate thread
         let status_clone = status.clone();
         let _ = std::thread::spawn(move || {
-            let mut guard = status_clone.lock().unwrap();
+            let mut guard = status_clone.lock().expect("Mutex poisoned");
             guard.benchmark_running = true;
             panic!("Intentional panic to poison the mutex");
         })
@@ -577,8 +638,24 @@ mod tests {
         let absolute = resolve_absolute_path(relative);
         assert!(absolute.is_absolute());
 
-        let already_absolute = std::env::current_dir().unwrap().join("test");
+        let already_absolute = std::env::current_dir()
+            .expect("Failed to get current directory")
+            .join("test");
         let still_absolute = resolve_absolute_path(&already_absolute);
         assert_eq!(already_absolute, still_absolute);
+    }
+
+    #[test]
+    fn test_chat_message_record_missing_id_deserialization() {
+        let json = r#"{
+            "session_id": "test_session",
+            "parent_id": null,
+            "role": "user",
+            "content": "test content"
+        }"#;
+
+        let record: ChatMessageRecord =
+            serde_json::from_str(json).expect("Failed to deserialize ChatMessageRecord");
+        assert_eq!(record.id, "");
     }
 }

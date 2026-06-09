@@ -59,7 +59,7 @@ pub struct TelemetryStore {
 }
 
 impl TelemetryStore {
-    pub async fn load_from_db(db: &Surreal<Any>) -> Self {
+    pub async fn load_from_db(db: &Surreal<Any>) -> Result<Self, surrealdb::Error> {
         let loads_future =
             db.query("SELECT * FROM telemetry_loads ORDER BY timestamp DESC LIMIT 100");
         let generations_future =
@@ -67,37 +67,21 @@ impl TelemetryStore {
 
         let (loads_res, generations_res) = tokio::join!(loads_future, generations_future);
 
-        let mut loads = VecDeque::new();
-        match loads_res {
-            Ok(mut response) => {
-                let mut temp: Vec<LoadMetric> = response.take(0).unwrap_or_else(|e| {
-                    error!("Failed to parse telemetry_loads from database: {}", e);
-                    Vec::new()
-                });
-                temp.reverse();
-                loads = temp.into();
-            }
-            Err(e) => error!("Failed to query telemetry_loads from database: {}", e),
-        }
+        let mut loads_response = loads_res?;
+        let mut loads_temp: Vec<LoadMetric> = loads_response.take(0)?;
+        loads_temp.reverse();
+        let loads = loads_temp.into();
 
-        let mut generations = VecDeque::new();
-        match generations_res {
-            Ok(mut response) => {
-                let mut temp: Vec<GenerationMetric> = response.take(0).unwrap_or_else(|e| {
-                    error!("Failed to parse telemetry_generations from database: {}", e);
-                    Vec::new()
-                });
-                temp.reverse();
-                generations = temp.into();
-            }
-            Err(e) => error!("Failed to query telemetry_generations from database: {}", e),
-        }
+        let mut gen_response = generations_res?;
+        let mut gen_temp: Vec<GenerationMetric> = gen_response.take(0)?;
+        gen_temp.reverse();
+        let generations = gen_temp.into();
 
-        TelemetryStore {
+        Ok(TelemetryStore {
             loads,
             generations,
             writer_tx: None,
-        }
+        })
     }
 
     pub fn record_load(&mut self, model_id: String, backend: String, load_time_ms: u64) {
@@ -176,7 +160,9 @@ pub async fn cleanup_telemetry(db: &Surreal<Any>, retention_days: u64) -> Result
         );
 
         let mut response = db.query(&query).await.map_err(|e| e.to_string())?;
-        let groups: Vec<serde_json::Value> = response.take(0).unwrap_or_default();
+        let groups: Vec<serde_json::Value> = response
+            .take(0)
+            .map_err(|e| format!("DB Parse Error (telemetry aggregations): {}", e))?;
 
         for group in groups {
             if let (Some(model_id), Some(backend), Some(max_ts)) = (
@@ -204,6 +190,12 @@ pub async fn cleanup_telemetry(db: &Surreal<Any>, retention_days: u64) -> Result
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
     use crate::types::GenerationParameters;
@@ -232,7 +224,8 @@ mod tests {
     #[test]
     fn test_load_metric_default_backend() {
         let json = r#"{"timestamp": 123, "model_id": "test", "load_time_ms": 456}"#;
-        let metric: LoadMetric = serde_json::from_str(json).unwrap();
+        let metric: LoadMetric =
+            serde_json::from_str(json).expect("Failed to deserialize LoadMetric");
         assert_eq!(metric.backend, "Unknown");
     }
 
@@ -246,8 +239,13 @@ mod tests {
     #[tokio::test]
     async fn test_telemetry_surrealdb_flow() {
         // Spin up an isolated, in-memory SurrealDB instance for testing
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to set DB namespace");
 
         let mut store = TelemetryStore::default();
         store.record_load("db_model".into(), "Candle".into(), 123);
@@ -258,9 +256,11 @@ mod tests {
             .content(store.loads[0].clone())
             .await;
 
-        assert!(res.is_ok(), "DB Update Failed: {:?}", res.unwrap_err());
+        res.expect("Background task DB Update Failed");
 
-        let loaded_store = TelemetryStore::load_from_db(&db).await;
+        let loaded_store = TelemetryStore::load_from_db(&db)
+            .await
+            .expect("Failed to load TelemetryStore from DB");
         assert_eq!(loaded_store.loads.len(), 1);
         assert_eq!(loaded_store.loads[0].model_id, "db_model");
     }

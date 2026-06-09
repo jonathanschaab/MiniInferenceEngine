@@ -1337,6 +1337,12 @@ async fn finalize_download(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1347,7 +1353,8 @@ mod tests {
         hasher1.update(b"hello");
         let state_hex = serialize_hasher(&hasher1);
 
-        let mut hasher2 = deserialize_hasher(&state_hex).expect("Failed to deserialize");
+        let mut hasher2 =
+            deserialize_hasher(&state_hex).expect("Failed to deserialize hasher state");
         hasher2.update(b" world");
 
         let result = hex::encode(hasher2.finalize());
@@ -1375,16 +1382,27 @@ mod tests {
         let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
 
         // Create dummy tmp and meta files
-        let _ = tokio::fs::write(&tmp_file_path, "dummy data").await;
-        let _ = tokio::fs::write(&meta_file_path, "{}").await;
+        tokio::fs::write(&tmp_file_path, "dummy data")
+            .await
+            .expect("Failed to write tmp dummy data");
+        tokio::fs::write(&meta_file_path, "{}")
+            .await
+            .expect("Failed to write empty JSON meta");
 
         // Force both `rename` and `copy` to fail by creating a directory at `file_path`.
-        let _ = tokio::fs::create_dir(&file_path).await;
+        tokio::fs::create_dir(&file_path)
+            .await
+            .expect("Failed to create interfering directory");
 
         let (queue_tx, _) = tokio::sync::mpsc::channel(1);
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to mem db");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to use db");
 
         let _state = Arc::new(crate::AppState {
             queue_tx,
@@ -1395,7 +1413,8 @@ mod tests {
             oauth_client: oauth2::basic::BasicClient::new(
                 oauth2::ClientId::new("dummy".to_string()),
                 None,
-                oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+                oauth2::AuthUrl::new("http://localhost".to_string())
+                    .expect("Failed to build AuthUrl"),
                 None,
             ),
             config: Arc::new(crate::AppConfig::default()),
@@ -1446,7 +1465,9 @@ mod tests {
         let tmp_file_path = temp_dir.join("model.tmp");
         let meta_file_path = temp_dir.join("model.meta");
 
-        let _ = tokio::fs::write(&tmp_file_path, "dummy data").await;
+        tokio::fs::write(&tmp_file_path, "dummy data")
+            .await
+            .expect("Failed to write tmp data");
 
         // Write metadata with an incompatible hasher_version (e.g., 999)
         let meta_json = serde_json::json!({
@@ -1458,13 +1479,20 @@ mod tests {
             }],
             "hasher_version": 999
         });
-        let _ = tokio::fs::write(&meta_file_path, meta_json.to_string()).await;
+        tokio::fs::write(&meta_file_path, meta_json.to_string())
+            .await
+            .expect("Failed to write meta JSON");
 
         // Create dummy AppState
         let (queue_tx, _) = tokio::sync::mpsc::channel(1);
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select namespace and DB");
 
         let state = Arc::new(crate::AppState {
             queue_tx,
@@ -1475,7 +1503,8 @@ mod tests {
             oauth_client: oauth2::basic::BasicClient::new(
                 oauth2::ClientId::new("dummy".to_string()),
                 None,
-                oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+                oauth2::AuthUrl::new("http://localhost".to_string())
+                    .expect("Failed to parse dummy AuthUrl"),
                 None,
             ),
             config: Arc::new(crate::AppConfig::default()),
@@ -1798,9 +1827,13 @@ mod tests {
         let meta_file_path = downloads_dir.join(format!("{}.meta", filename));
 
         // 1. Create and open the file, explicitly mimicking the stream behavior
-        let mut file = tokio::fs::File::create(&tmp_file_path).await.unwrap();
-        file.write_all(b"test data").await.unwrap();
-        file.sync_all().await.unwrap();
+        let mut file = tokio::fs::File::create(&tmp_file_path)
+            .await
+            .expect("Failed to create tmp file");
+        file.write_all(b"test data")
+            .await
+            .expect("Failed to write test data");
+        file.sync_all().await.expect("Failed to sync file to disk");
 
         // 2. EXPLICITLY DROP THE FILE HANDLE.
         // This acts as a regression check ensuring the file lock is released on Windows
@@ -1832,7 +1865,9 @@ mod tests {
         );
         assert!(file_path.exists(), "Target file should exist.");
         assert_eq!(
-            tokio::fs::read_to_string(&file_path).await.unwrap(),
+            tokio::fs::read_to_string(&file_path)
+                .await
+                .expect("Failed to read final file"),
             "test data"
         );
 
@@ -1854,11 +1889,12 @@ mod tests {
 
                 if has_range {
                     res = res.status(axum::http::StatusCode::PARTIAL_CONTENT);
-                    res.body(axum::body::Body::from("partial")).unwrap()
+                    res.body(axum::body::Body::from("partial"))
+                        .expect("Failed to build response")
                 } else {
                     res = res.status(axum::http::StatusCode::OK);
                     res.body(axum::body::Body::from("full new content"))
-                        .unwrap()
+                        .expect("Failed to build response")
                 }
             })
             .head(|_req: axum::extract::Request| async move {
@@ -1866,12 +1902,17 @@ mod tests {
                     .header("ETag", "\"new_etag\"")
                     .header(axum::http::header::CONTENT_LENGTH, "16")
                     .body(axum::body::Body::empty())
-                    .unwrap()
+                    .expect("Failed to build response body")
             }),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener
+            .local_addr()
+            .expect("Failed to retrieve port")
+            .port();
         tokio::spawn(async move {
             let _ = axum::serve(listener, mock_app).await;
         });
@@ -1891,7 +1932,9 @@ mod tests {
         let final_file_path = temp_dir.join("model.safetensors");
 
         let old_content = b"old dummy content";
-        tokio::fs::write(&tmp_file_path, old_content).await.unwrap();
+        tokio::fs::write(&tmp_file_path, old_content)
+            .await
+            .expect("Failed to write old content");
 
         let mut hasher = Sha256::new();
         hasher.update(old_content);
@@ -1909,12 +1952,17 @@ mod tests {
         });
         tokio::fs::write(&meta_file_path, meta_json.to_string())
             .await
-            .unwrap();
+            .expect("Failed to write mock meta json");
 
         // 3. Initialize AppState
         let (queue_tx, _) = tokio::sync::mpsc::channel(1);
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select namespace and DB");
         let (_, log_reload_handle) =
             tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
@@ -1922,7 +1970,8 @@ mod tests {
         let oauth_client = oauth2::basic::BasicClient::new(
             oauth2::ClientId::new("dummy".to_string()),
             None,
-            oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+            oauth2::AuthUrl::new("http://localhost".to_string())
+                .expect("Failed to parse dummy AuthUrl"),
             None,
         );
         let state = Arc::new(crate::AppState {
@@ -1947,7 +1996,7 @@ mod tests {
         });
 
         {
-            let mut dl = state.active_downloads.lock().unwrap();
+            let mut dl = state.active_downloads.lock().expect("Mutex poisoned");
             dl.insert("test-model".to_string(), crate::DownloadStatus::default());
         }
 
@@ -2004,40 +2053,46 @@ mod tests {
                                 vec![0u8; 500],
                             )))
                             .await;
-                        // Keep the stream open a bit longer so the test polling loop can intercept the active state
                         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        let _ = tx
+                            .send(Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                vec![0u8; 500],
+                            )))
+                            .await;
                     });
                     axum::response::Response::builder()
-                        .header(axum::http::header::CONTENT_LENGTH, "1000")
+                        .header(axum::http::header::CONTENT_LENGTH, "1500")
                         .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
-                        .unwrap()
+                        .expect("Failed to build response")
                 } else {
                     axum::response::Response::builder()
                         .status(axum::http::StatusCode::NOT_FOUND)
                         .header(axum::http::header::CONTENT_LENGTH, "500") // Error page size
-                        .body(axum::body::Body::from("404 Not Found error page body..."))
-                        .unwrap()
+                        .body(axum::body::Body::from(vec![0u8; 500]))
+                        .expect("Failed to build response")
                 }
             })
             .head(|req: axum::extract::Request| async move {
                 let uri = req.uri().to_string();
                 if uri.contains("00001") {
                     axum::response::Response::builder()
-                        .header(axum::http::header::CONTENT_LENGTH, "1000")
+                        .header(axum::http::header::CONTENT_LENGTH, "1500")
                         .body(axum::body::Body::empty())
-                        .unwrap()
+                        .expect("Failed to build response")
                 } else {
                     axum::response::Response::builder()
                         .status(axum::http::StatusCode::NOT_FOUND)
                         .header(axum::http::header::CONTENT_LENGTH, "500") // Error page size
                         .body(axum::body::Body::empty())
-                        .unwrap()
+                        .expect("Failed to build response")
                 }
             }),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener.local_addr().expect("Failed to get port").port();
         tokio::spawn(async move {
             let _ = axum::serve(listener, mock_app).await;
         });
@@ -2054,8 +2109,13 @@ mod tests {
 
         // 2. Setup isolated AppState
         let (queue_tx, _) = tokio::sync::mpsc::channel(1);
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select namespace and DB");
         let (_, log_reload_handle) =
             tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
@@ -2069,7 +2129,8 @@ mod tests {
             oauth_client: oauth2::basic::BasicClient::new(
                 oauth2::ClientId::new("dummy".to_string()),
                 None,
-                oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+                oauth2::AuthUrl::new("http://localhost".to_string())
+                    .expect("Failed to parse dummy AuthUrl"),
                 None,
             ),
             config: Arc::new(config),
@@ -2087,7 +2148,7 @@ mod tests {
         });
 
         {
-            let mut dl = state.active_downloads.lock().unwrap();
+            let mut dl = state.active_downloads.lock().expect("Mutex poisoned");
             dl.insert("test-model".to_string(), crate::DownloadStatus::default());
         }
 
@@ -2111,7 +2172,7 @@ mod tests {
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let active = {
-                let dl = state.active_downloads.lock().unwrap();
+                let dl = state.active_downloads.lock().expect("Mutex poisoned");
                 dl.get("test-model").cloned()
             };
             if let Some(dl) = active
@@ -2126,8 +2187,8 @@ mod tests {
 
         // 4. Assert that the total bytes size is exactly the size of the valid 1st chunk, completely ignoring the 404 page's 500-byte length
         assert_eq!(
-            total_bytes_observed, 1000,
-            "Total bytes should be exactly 1000, ignoring the 500 byte error page body."
+            total_bytes_observed, 1500,
+            "Total bytes should be exactly 1500, ignoring the 500 byte error page body."
         );
 
         let _ = tokio::fs::remove_dir_all(temp_dir).await;
@@ -2147,12 +2208,14 @@ mod tests {
                 axum::response::Response::builder()
                     .status(axum::http::StatusCode::OK)
                     .body(axum::body::Body::from("too late"))
-                    .unwrap()
+                    .expect("Failed to build response")
             }),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener.local_addr().expect("Failed to get port").port();
         tokio::spawn(async move {
             let _ = axum::serve(listener, mock_app).await;
         });
@@ -2205,18 +2268,20 @@ mod tests {
                 axum::response::Response::builder()
                     .status(axum::http::StatusCode::OK)
                     .body(axum::body::Body::from("actual file content"))
-                    .unwrap()
+                    .expect("Failed to build response")
             })
             .head(|_req: axum::extract::Request| async move {
                 axum::response::Response::builder()
                     .header(axum::http::header::CONTENT_LENGTH, "19")
                     .body(axum::body::Body::empty())
-                    .unwrap()
+                    .expect("Failed to build response")
             }),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener.local_addr().expect("Failed to get port").port();
         tokio::spawn(async move {
             let _ = axum::serve(listener, mock_app).await;
         });
@@ -2232,12 +2297,19 @@ mod tests {
 
         // 2. Pre-create the 0-byte final file to simulate an aborted setup / touched file
         let final_file_path = temp_dir.join("model.safetensors");
-        tokio::fs::write(&final_file_path, "").await.unwrap();
+        tokio::fs::write(&final_file_path, "")
+            .await
+            .expect("Failed to write dummy 0-byte file");
 
         // 3. Initialize AppState
         let (queue_tx, _) = tokio::sync::mpsc::channel(1);
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select namespace and DB");
         let (_, log_reload_handle) =
             tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
@@ -2245,7 +2317,8 @@ mod tests {
         let oauth_client = oauth2::basic::BasicClient::new(
             oauth2::ClientId::new("dummy".to_string()),
             None,
-            oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+            oauth2::AuthUrl::new("http://localhost".to_string())
+                .expect("Failed to parse dummy AuthUrl"),
             None,
         );
 
@@ -2271,7 +2344,7 @@ mod tests {
         });
 
         {
-            let mut dl = state.active_downloads.lock().unwrap();
+            let mut dl = state.active_downloads.lock().expect("Mutex poisoned");
             dl.insert(
                 "test-model-zero-byte".to_string(),
                 crate::DownloadStatus::default(),
@@ -2352,7 +2425,7 @@ mod tests {
                         .status(axum::http::StatusCode::OK)
                         .header(axum::http::header::CONTENT_LENGTH, "1000")
                         .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
-                        .unwrap()
+                            .expect("Failed to build response")
                 } else {
                     // Second attempt: Should resume with RANGE
                     tracing::info!("Mock Server (Attempt 1): Resuming with remaining 500 bytes...");
@@ -2375,7 +2448,7 @@ mod tests {
                         .header(axum::http::header::CONTENT_LENGTH, "500") // Remaining size
                         .header("Content-Range", "bytes 500-999/1000")
                         .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
-                        .unwrap()
+                            .expect("Failed to build response")
                 }
             })
             .head(|_req: axum::extract::Request| async move {
@@ -2383,12 +2456,14 @@ mod tests {
                 axum::response::Response::builder()
                     .status(axum::http::StatusCode::OK)
                     .body(axum::body::Body::empty())
-                    .unwrap()
+                        .expect("Failed to build response")
             }),
         );
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock server");
+        let port = listener.local_addr().expect("Failed to get port").port();
         tokio::spawn(async move {
             let _ = axum::serve(listener, mock_app).await;
         });
@@ -2407,8 +2482,13 @@ mod tests {
 
         // 2. Setup isolated AppState
         let (queue_tx, _) = tokio::sync::mpsc::channel(1);
-        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
-        db.use_ns("test").use_db("test").await.unwrap();
+        let db = surrealdb::engine::any::connect("mem://")
+            .await
+            .expect("Failed to connect to in-memory DB");
+        db.use_ns("test")
+            .use_db("test")
+            .await
+            .expect("Failed to select namespace and DB");
         let (_, log_reload_handle) =
             tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(16);
@@ -2422,7 +2502,8 @@ mod tests {
             oauth_client: oauth2::basic::BasicClient::new(
                 oauth2::ClientId::new("dummy".to_string()),
                 None,
-                oauth2::AuthUrl::new("http://localhost".to_string()).unwrap(),
+                oauth2::AuthUrl::new("http://localhost".to_string())
+                    .expect("Failed to parse dummy AuthUrl"),
                 None,
             ),
             config: Arc::new(config),
@@ -2440,7 +2521,7 @@ mod tests {
         });
 
         {
-            let mut dl = state.active_downloads.lock().unwrap();
+            let mut dl = state.active_downloads.lock().expect("Mutex poisoned");
             dl.insert("test-model".to_string(), crate::DownloadStatus::default());
         }
 
@@ -2464,7 +2545,7 @@ mod tests {
         for _ in 0..50 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let active = {
-                let dl = state.active_downloads.lock().unwrap();
+                let dl = state.active_downloads.lock().expect("Mutex poisoned");
                 dl.get("test-model").cloned()
             };
             if let Some(dl) = active {

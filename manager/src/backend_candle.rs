@@ -249,7 +249,10 @@ where
 
     if tokens.len() > 1 {
         // Generalize using Rust's native slice chunks iterator
-        for chunk in tokens[..tokens.len().saturating_sub(1)].chunks(prefill_chunk_size) {
+        let prefill_tokens = tokens
+            .get(..tokens.len().saturating_sub(1))
+            .unwrap_or_default();
+        for chunk in prefill_tokens.chunks(prefill_chunk_size) {
             let input_tensor = Tensor::new(chunk, device)
                 .map_err(|e| e.to_string())?
                 .unsqueeze(0)
@@ -277,7 +280,7 @@ where
         };
         let start_pos = tokens.len().saturating_sub(context_size);
 
-        let input_tensor = Tensor::new(&tokens[start_pos..], device)
+        let input_tensor = Tensor::new(tokens.get(start_pos..).unwrap_or_default(), device)
             .map_err(|e| e.to_string())?
             .unsqueeze(0)
             .map_err(|e| e.to_string())?
@@ -312,8 +315,12 @@ where
         let mut piece_bytes = Vec::new();
         if let Some(t_str) = tokenizer.id_to_token(next_token) {
             if t_str.starts_with("<0x") && t_str.ends_with('>') && t_str.len() == 6 {
-                if let Ok(b) = u8::from_str_radix(&t_str[3..5], 16) {
-                    piece_bytes.push(b);
+                if let Some(hex_str) = t_str.get(3..5) {
+                    if let Ok(b) = u8::from_str_radix(hex_str, 16) {
+                        piece_bytes.push(b);
+                    } else {
+                        piece_bytes.extend_from_slice(t_str.as_bytes());
+                    }
                 } else {
                     piece_bytes.extend_from_slice(t_str.as_bytes());
                 }
@@ -351,7 +358,7 @@ where
     }
 
     let final_text = tokenizer
-        .decode(&tokens[prompt_length..], true)
+        .decode(tokens.get(prompt_length..).unwrap_or_default(), true)
         .map_err(|e| e.to_string())?;
     Ok((final_text, tok_time))
 }
@@ -446,7 +453,12 @@ pub async fn compress_text(
             let probs_vec = probs_f32.to_vec2::<f32>().map_err(|e| e.to_string())?;
 
             for (i, token) in chunk.iter().enumerate() {
-                token_scores.push((global_idx, *token, probs_vec[i][1]));
+                let score = probs_vec
+                    .get(i)
+                    .and_then(|v| v.get(1))
+                    .copied()
+                    .unwrap_or(0.0);
+                token_scores.push((global_idx, *token, score));
                 global_idx += 1;
             }
             tokio::task::yield_now().await;
@@ -649,6 +661,12 @@ impl InferenceBackend for CandleEngine {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
 

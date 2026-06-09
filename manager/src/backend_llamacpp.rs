@@ -243,7 +243,9 @@ impl LlamaCppEngine {
                     b
                 }
                 None => {
-                    let _guard = LLAMA_BACKEND_INIT_MUTEX.lock().unwrap();
+                    let _guard = LLAMA_BACKEND_INIT_MUTEX
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     match LLAMA_BACKEND.get() {
                         Some(b) => {
                             let _ = init_tx.send(Ok(()));
@@ -676,6 +678,12 @@ impl InferenceBackend for LlamaCppEngine {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::indexing_slicing)]
+#[allow(clippy::panic)]
+#[allow(clippy::unreachable)]
+#[allow(clippy::todo)]
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
 
